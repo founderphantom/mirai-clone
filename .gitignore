@@ -8,8 +8,20 @@
 
 # Environment variables
 .env
+.dev.vars
 .env.local
 .env.*.local
+config/secrets/
+
+# Node and build outputs
+node_modules/
+dist/
+.wrangler/
+coverage/
+
+# Cloudflare local state
+.mf/
+
 /.agents/
 /.claude-flow/
 /.idea/
