@@ -18,6 +18,8 @@ node_modules/
 dist/
 .wrangler/
 coverage/
+__pycache__/
+*.pyc
 
 # Cloudflare local state
 .mf/

@@ -20,6 +20,8 @@ import json
 import os
 import random
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -141,8 +143,14 @@ def _fetch_otp_from_gmail(poll_interval: int = 10, max_attempts: int = 12) -> st
     Polls every poll_interval seconds for up to max_attempts tries (~2 minutes).
     Set HIGGSFIELD_AUTO_OTP=1 to activate this path instead of stdin input.
     """
-    # $GAPI may be a multi-word string like "python3 /path/to/gapi.py" — split it
-    gapi = os.environ.get("GAPI", "gapi").split()
+    # $GAPI may be a multi-word string like "python /path/to/gapi.py".
+    gapi = shlex.split(os.environ.get("GAPI", "gapi"))
+    if not gapi or (shutil.which(gapi[0]) is None and not Path(gapi[0]).exists()):
+        raise RuntimeError(
+            "Auto-OTP is enabled, but the Gmail helper command was not found. "
+            "Set GAPI to the full command or unset HIGGSFIELD_AUTO_OTP to enter the code manually."
+        )
+
     _log(f"Auto-OTP: polling Gmail every {poll_interval}s (up to {max_attempts} attempts)...")
     for attempt in range(1, max_attempts + 1):
         time.sleep(poll_interval)
@@ -165,8 +173,13 @@ def _fetch_otp_from_gmail(poll_interval: int = 10, max_attempts: int = 12) -> st
             match = re.search(r'\b(\d{6})\b', body)
             if match:
                 code = match.group(1)
-                _log(f"  OTP found: {code}")
+                _log("  OTP found.")
                 return code
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "Auto-OTP Gmail command was not found. Set GAPI to the full command "
+                "or unset HIGGSFIELD_AUTO_OTP to enter the code manually."
+            ) from exc
         except Exception as exc:
             _log(f"  Gmail check failed: {exc}")
     raise RuntimeError("Auto-OTP: no verification email found in Gmail after 2 minutes")
@@ -210,7 +223,13 @@ def login_full(email: str, password: str) -> str:
 
         # Step 3: submit OTP — auto-fetch from Gmail or prompt stdin
         if os.environ.get("HIGGSFIELD_AUTO_OTP"):
-            code = _fetch_otp_from_gmail()
+            try:
+                code = _fetch_otp_from_gmail()
+            except RuntimeError as exc:
+                if os.environ.get("HIGGSFIELD_OTP_FALLBACK_MANUAL", "1") == "0":
+                    raise
+                _log(str(exc))
+                code = input("Enter the verification code: ").strip()
         else:
             code = input("Enter the verification code: ").strip()
         _log("Submitting verification code...")

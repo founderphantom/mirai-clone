@@ -123,7 +123,7 @@ def publish_wrangler_secrets(session: dict[str, str], wrangler_env: str | None) 
         command = [npx, "wrangler", "secret", "put", key]
         if wrangler_env:
             command.extend(["--env", wrangler_env])
-        subprocess.run(command, input=session[session_key], text=True, check=True)
+        subprocess.run(command, input=f"{session[session_key]}\n", text=True, check=True)
 
 
 def format_env_line(key: str, value: str) -> str:

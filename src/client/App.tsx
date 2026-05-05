@@ -20,6 +20,7 @@ type Clone = {
   handle: string;
   persona: string;
   style_prompt: string;
+  provider_config_json?: string;
   reference_count?: number;
   generation_count?: number;
 };
@@ -42,6 +43,7 @@ type Job = {
   prompt: string;
   updated_at: string;
   output_count?: number;
+  preview_media_id?: string | null;
 };
 
 type Account = {
@@ -195,22 +197,34 @@ function AuthPanel({ onDone }: { onDone: () => void }) {
 
 function ClonesPage({ clones, reload }: { clones: Clone[]; reload: () => Promise<void> }) {
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
   async function createClone(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const formElement = event.currentTarget;
     setBusy(true);
-    const form = new FormData(event.currentTarget);
-    await api("/api/clones", {
-      method: "POST",
-      body: JSON.stringify({
-        name: form.get("name"),
-        handle: form.get("handle"),
-        persona: form.get("persona"),
-        stylePrompt: form.get("stylePrompt")
-      })
-    });
-    event.currentTarget.reset();
-    setBusy(false);
-    await reload();
+    setError("");
+    try {
+      const form = new FormData(formElement);
+      const customReferenceId = String(form.get("customReferenceId") || "").trim();
+      const handle = String(form.get("handle") || "").trim();
+      await api("/api/clones", {
+        method: "POST",
+        body: JSON.stringify({
+          name: form.get("name"),
+          ...(handle ? { handle } : {}),
+          persona: form.get("persona"),
+          stylePrompt: form.get("stylePrompt"),
+          providerConfig: customReferenceId ? { customReferenceId } : undefined
+        })
+      });
+      formElement.reset();
+      await reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create clone.");
+      await reload().catch(() => undefined);
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -221,6 +235,8 @@ function ClonesPage({ clones, reload }: { clones: Clone[]; reload: () => Promise
         <input name="handle" placeholder="Handle" />
         <textarea name="persona" placeholder="Identity" rows={5} />
         <textarea name="stylePrompt" placeholder="Visual style" rows={5} />
+        <input name="customReferenceId" placeholder="Higgsfield Soul-ID" />
+        {error && <p className="error">{error}</p>}
         <button className="primary" disabled={busy}>Create clone</button>
       </form>
       <div className="grid-list">
@@ -290,13 +306,50 @@ function DiscoveryPage({
       <div className="masonry">
         {items.map((item) => (
           <button className="image-tile" key={item.id} onClick={() => onChoose(item)}>
-            <img src={item.image_url || item.thumbnail_url || ""} alt={item.title || item.platform} />
+            <DiscoveryTileImage item={item} />
             <span>{item.author_handle || item.platform}</span>
           </button>
         ))}
       </div>
     </div>
   );
+}
+
+function DiscoveryTileImage({ item }: { item: DiscoveryItem }) {
+  const primary = item.image_url || item.thumbnail_url || "";
+  const [src, setSrc] = useState(primary);
+
+  useEffect(() => {
+    setSrc(primary);
+  }, [primary]);
+
+  if (!src) return <div className="image-placeholder" aria-hidden="true" />;
+
+  return (
+    <img
+      src={src}
+      alt={item.title || item.platform}
+      onError={() => setSrc(fallbackDiscoveryImageSrc(src, item) || "")}
+    />
+  );
+}
+
+function fallbackDiscoveryImageSrc(current: string, item: DiscoveryItem): string | null {
+  const candidates = [item.thumbnail_url, youtubeThumbnailFallback(current)];
+  return candidates.find((candidate) => candidate && candidate !== current) || null;
+}
+
+function youtubeThumbnailFallback(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (!url.hostname.endsWith("img.youtube.com") || !url.pathname.endsWith("/maxresdefault.jpg")) {
+      return null;
+    }
+    url.pathname = url.pathname.replace(/\/maxresdefault\.jpg$/, "/hqdefault.jpg");
+    return url.toString();
+  } catch {
+    return null;
+  }
 }
 
 function GeneratePage({
@@ -309,36 +362,53 @@ function GeneratePage({
   onSubmitted: () => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!clone || !inspiration) return;
     setBusy(true);
+    setError("");
+    setNotice("");
     const form = new FormData(event.currentTarget);
-    await api("/api/generations", {
-      method: "POST",
-      body: JSON.stringify({
-        cloneId: clone.id,
-        prompt: form.get("prompt"),
-        inspirationAssetId: inspiration.type === "asset" ? inspiration.id : undefined,
-        discoveryItemId: inspiration.type === "discovery" ? inspiration.id : undefined,
-        quality: form.get("quality"),
-        batchSize: Number(form.get("batchSize") || 4)
-      })
-    });
-    setBusy(false);
-    await onSubmitted();
+    const prompt = String(form.get("prompt") || "").trim();
+    try {
+      await api("/api/generations", {
+        method: "POST",
+        body: JSON.stringify({
+          cloneId: clone.id,
+          ...(prompt ? { prompt } : {}),
+          inspirationAssetId: inspiration.type === "asset" ? inspiration.id : undefined,
+          discoveryItemId: inspiration.type === "discovery" ? inspiration.id : undefined,
+          quality: form.get("quality"),
+          batchSize: Number(form.get("batchSize") || 4)
+        })
+      });
+      setNotice("Generation queued.");
+      await onSubmitted();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not queue generation.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
     <div className="split">
       <form className="panel form-grid" onSubmit={submit}>
         <h2>{clone?.name || "Select a clone"}</h2>
-        <textarea name="prompt" placeholder="Prompt" rows={6} />
+        <details className="advanced-field">
+          <summary>Prompt override</summary>
+          <textarea name="prompt" placeholder="Optional prompt" rows={4} />
+        </details>
         <select name="quality" defaultValue="1080p">
           <option value="1080p">1080p</option>
           <option value="2K">2K</option>
         </select>
         <input name="batchSize" type="number" min={1} max={4} defaultValue={4} />
+        {error && <p className="error">{error}</p>}
+        {notice && <p className="notice">{notice}</p>}
         <button className="primary" disabled={!clone || !inspiration || busy}>
           {busy && <Loader2 className="spin" size={16} />}
           Generate
@@ -356,6 +426,9 @@ function HistoryPage({ jobs, reload }: { jobs: Job[]; reload: () => Promise<void
       <div className="grid-list">
         {jobs.map((job) => (
           <article className="item-card" key={job.id}>
+            {job.preview_media_id && (
+              <img className="history-preview" src={`/api/media/${job.preview_media_id}`} alt={`${job.clone_name || "Clone"} output`} />
+            )}
             <h3>{job.clone_name || job.clone_id}</h3>
             <p>{job.prompt || "No prompt"}</p>
             <footer>{job.status} · {job.output_count || 0} outputs · {new Date(job.updated_at).toLocaleString()}</footer>
@@ -384,6 +457,14 @@ function AccountPage({ account }: { account: Account }) {
 }
 
 function ClonePicker({ clones, selected, onSelect }: { clones: Clone[]; selected: string; onSelect: (id: string) => void }) {
+  if (clones.length === 0) {
+    return (
+      <select disabled>
+        <option>No clones</option>
+      </select>
+    );
+  }
+
   return (
     <select value={selected} onChange={(event) => onSelect(event.target.value)}>
       {clones.map((clone) => <option key={clone.id} value={clone.id}>{clone.name}</option>)}

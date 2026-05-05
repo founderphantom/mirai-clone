@@ -8,6 +8,7 @@
 - Generate Better Auth tables with the current Better Auth migration flow for D1.
 - Configure Worker secrets: `BETTER_AUTH_SECRET`, `SCRAPECREATORS_API_KEY`, `POLAR_ACCESS_TOKEN`, `POLAR_WEBHOOK_SECRET`, and temporary Higgsfield session/JWT secrets.
 - Run `npm run higgsfield:session` from an admin environment to refresh the shared Higgsfield service session. Use `HIGGSFIELD_AUTO_OTP=1` plus `GAPI` when email-code verification is needed.
+- Configure GitHub repository secrets for `.github/workflows/higgsfield-session-refresh.yml` so the shared Higgsfield session is refreshed automatically in production.
 
 ## Phase 2: Auth And Billing
 

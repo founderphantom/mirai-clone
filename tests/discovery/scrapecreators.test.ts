@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { normalizeItems } from "../../src/server/discovery/scrapecreators";
 import { DISCOVERY_SOURCES } from "../../src/server/discovery/sources";
+import { discoveryImageCandidates } from "../../src/server/services/media";
 
 describe("ScrapeCreators discovery normalization", () => {
   it("maps YouTube Shorts thumbnails into inspiration items", () => {
@@ -42,5 +43,17 @@ describe("ScrapeCreators discovery normalization", () => {
 
     expect(items[0].imageUrl).toBe("https://cdn.example/tik.jpg");
     expect(items[0].authorHandle).toBe("creator");
+  });
+
+  it("adds lower-resolution YouTube fallbacks for broken maxres thumbnails", () => {
+    expect(
+      discoveryImageCandidates({
+        image_url: null,
+        thumbnail_url: "https://img.youtube.com/vi/short-1/maxresdefault.jpg"
+      })
+    ).toEqual([
+      "https://img.youtube.com/vi/short-1/maxresdefault.jpg",
+      "https://img.youtube.com/vi/short-1/hqdefault.jpg"
+    ]);
   });
 });

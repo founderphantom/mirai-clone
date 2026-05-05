@@ -71,6 +71,8 @@ Cache flow:
 
 `scripts/higgsfield_session.py` is the admin-owned session bootstrapper. It validates the existing `~/.higgsfield_session` cache, performs the Clerk email-code login only when the cache is missing or expired, and can write or publish the resulting `HIGGSFIELD_SESSION_ID` and `HIGGSFIELD_CLIENT_COOKIE` for all Worker generation jobs. This is a shared provider service session for Mirai, not an end-user credential flow.
 
+Production refresh is handled by `.github/workflows/higgsfield-session-refresh.yml`. The workflow runs every 12 hours, restores the Higgsfield session cache, refreshes/publishes Worker secrets through Wrangler, then saves the cache for the next run. The Higgsfield account password and Gmail OTP access stay in GitHub Actions secrets and are not available to the Worker runtime.
+
 The future Soul-v2-style in-house system should implement the same provider interface and can add a video provider next to image providers without changing user-facing job/history tables.
 
 ## Route Structure

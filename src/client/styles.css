@@ -85,6 +85,7 @@ textarea { resize: vertical; }
 
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 .error { color: #b3261e; margin: 0; }
+.notice { color: #176b43; margin: 0; }
 .spin { animation: spin 900ms linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -141,6 +142,24 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 
 .form-grid h2, .account-panel h2 { margin: 0; }
+.advanced-field {
+  border: 1px solid #d8d2c8;
+  border-radius: 6px;
+  background: #fffdf9;
+}
+.advanced-field summary {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  color: #41464f;
+  cursor: pointer;
+}
+.advanced-field textarea {
+  border: 0;
+  border-top: 1px solid #e5ded2;
+  border-radius: 0 0 6px 6px;
+}
 .grid-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -160,6 +179,13 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .item-card h3 { margin: 0; font-size: 18px; letter-spacing: 0; }
 .item-card p { margin: 0; color: #59616d; }
 .item-card footer { margin-top: auto; color: #7a4f16; font-size: 14px; }
+.history-preview {
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #111318;
+}
 
 .stack { display: grid; gap: 16px; align-content: start; }
 .toolbar {
@@ -197,6 +223,11 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   width: 100%;
   height: auto;
   object-fit: cover;
+}
+.image-placeholder {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #ebe6da;
 }
 .image-tile span {
   display: block;

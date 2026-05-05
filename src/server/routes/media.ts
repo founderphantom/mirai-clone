@@ -48,9 +48,13 @@ mediaRoutes.get("/:id", async (c) => {
   if (asset.storage_key) {
     const object = await c.env.MEDIA.get(asset.storage_key);
     if (!object) throw new HttpError(404, "Media object was not found in storage.", "media_object_missing");
+    const contentType = normalizeContentType(
+      object.httpMetadata?.contentType || asset.content_type,
+      asset.storage_key
+    );
     return new Response(object.body, {
       headers: {
-        "content-type": object.httpMetadata?.contentType || asset.content_type || "application/octet-stream",
+        "content-type": contentType,
         "cache-control": "private, max-age=300"
       }
     });
@@ -62,4 +66,15 @@ mediaRoutes.get("/:id", async (c) => {
 
 function stringValue(value: FormDataEntryValue | null): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeContentType(contentType: string | null | undefined, path: string): string {
+  if (contentType && contentType !== "binary/octet-stream" && contentType !== "application/octet-stream") {
+    return contentType;
+  }
+  const lowerPath = path.toLowerCase();
+  if (lowerPath.endsWith(".png")) return "image/png";
+  if (lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")) return "image/jpeg";
+  if (lowerPath.endsWith(".webp")) return "image/webp";
+  return "application/octet-stream";
 }

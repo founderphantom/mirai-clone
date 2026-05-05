@@ -101,11 +101,25 @@ export async function materializeDiscoveryItem(
   );
   if (!item) throw new HttpError(404, "Discovery item was not found.", "discovery_not_found");
 
-  const remoteUrl = item.image_url || item.thumbnail_url;
-  if (!remoteUrl) throw new HttpError(422, "Discovery item has no image URL.", "missing_image");
+  const remoteUrls = discoveryImageCandidates(item);
+  if (remoteUrls.length === 0) throw new HttpError(422, "Discovery item has no image URL.", "missing_image");
 
-  const response = await fetch(remoteUrl);
-  if (!response.ok) {
+  let remoteUrl = "";
+  let response: Response | null = null;
+  for (const candidate of remoteUrls) {
+    try {
+      const candidateResponse = await fetch(candidate);
+      if (candidateResponse.ok) {
+        remoteUrl = candidate;
+        response = candidateResponse;
+        break;
+      }
+    } catch {
+      // Try the next candidate before failing the selected discovery item.
+    }
+  }
+
+  if (!response) {
     throw new HttpError(502, "Could not fetch the selected discovery image.", "image_fetch_failed");
   }
 
@@ -152,6 +166,31 @@ export async function materializeDiscoveryItem(
   );
 
   return mustGetAsset(env, user.id, id);
+}
+
+export function discoveryImageCandidates(item: Pick<DiscoveryItemRow, "image_url" | "thumbnail_url">): string[] {
+  const candidates: string[] = [];
+  addCandidate(candidates, item.image_url);
+  addCandidate(candidates, item.thumbnail_url);
+  for (const candidate of [...candidates]) addCandidate(candidates, youtubeThumbnailFallback(candidate));
+  return candidates;
+}
+
+function addCandidate(candidates: string[], value: string | null | undefined) {
+  if (value && !candidates.includes(value)) candidates.push(value);
+}
+
+function youtubeThumbnailFallback(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (!url.hostname.endsWith("img.youtube.com") || !url.pathname.endsWith("/maxresdefault.jpg")) {
+      return null;
+    }
+    url.pathname = url.pathname.replace(/\/maxresdefault\.jpg$/, "/hqdefault.jpg");
+    return url.toString();
+  } catch {
+    return null;
+  }
 }
 
 export async function mustGetAsset(env: Env, userId: string, assetId: string): Promise<MediaAssetRow> {

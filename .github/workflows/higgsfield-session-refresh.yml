@@ -1,0 +1,95 @@
+name: Refresh Higgsfield Session
+
+on:
+  schedule:
+    - cron: "17 */12 * * *"
+  workflow_dispatch:
+    inputs:
+      force_login:
+        description: "Ignore cached session and request a new Higgsfield email code"
+        required: false
+        default: false
+        type: boolean
+      wrangler_env:
+        description: "Optional Wrangler environment name"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HIGGSFIELD_EMAIL: ${{ secrets.HIGGSFIELD_EMAIL }}
+      HIGGSFIELD_PASSWORD: ${{ secrets.HIGGSFIELD_PASSWORD }}
+      HIGGSFIELD_AUTO_OTP: "1"
+      GAPI: ${{ secrets.GAPI_COMMAND }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore Higgsfield session cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.higgsfield_session
+          key: higgsfield-session-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            higgsfield-session-${{ runner.os }}-
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          missing=0
+          for name in HIGGSFIELD_EMAIL HIGGSFIELD_PASSWORD GAPI CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing required repository secret for $name"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          python -m pip install --upgrade pip
+          python -m pip install "curl_cffi>=0.7.0" python-dotenv Pillow
+
+      - name: Refresh and publish session
+        shell: bash
+        run: |
+          args=(--publish-wrangler --json)
+
+          if [ "${{ inputs.force_login }}" = "true" ]; then
+            args+=(--force-login)
+          fi
+
+          if [ -n "${{ inputs.wrangler_env }}" ]; then
+            args+=(--wrangler-env "${{ inputs.wrangler_env }}")
+          fi
+
+          python scripts/higgsfield_session.py "${args[@]}"
+
+      - name: Save Higgsfield session cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.higgsfield_session
+          key: higgsfield-session-${{ runner.os }}-${{ github.run_id }}

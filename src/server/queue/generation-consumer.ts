@@ -141,7 +141,10 @@ async function persistOutputs(env: Env, job: GenerationJobRow, outputs: Provider
     if (!response.ok) throw new Error(`Could not fetch generated output ${output.providerAssetId}.`);
 
     const bytes = await response.arrayBuffer();
-    const contentType = response.headers.get("content-type") || output.contentType || "image/png";
+    const contentType = normalizeImageContentType(
+      response.headers.get("content-type") || output.contentType,
+      output.rawUrl
+    );
     const extension = contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" : "png";
     const mediaId = createId("media");
     const storageKey = [
@@ -247,4 +250,14 @@ async function markFailed(env: Env, jobId: string, message: string) {
 
 function retryDelay(attempts: number): number {
   return Math.min(300, 30 * Math.max(1, attempts));
+}
+
+function normalizeImageContentType(contentType: string | null | undefined, url: string): string {
+  if (contentType && contentType !== "binary/octet-stream" && contentType !== "application/octet-stream") {
+    return contentType;
+  }
+  const lowerUrl = url.toLowerCase();
+  if (lowerUrl.includes(".jpg") || lowerUrl.includes(".jpeg")) return "image/jpeg";
+  if (lowerUrl.includes(".webp")) return "image/webp";
+  return "image/png";
 }

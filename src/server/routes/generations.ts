@@ -24,7 +24,12 @@ generationRoutes.get("/", async (c) => {
   const rows = await all(
     c.env.DB,
     `SELECT gj.*, cp.name AS clone_name,
-      (SELECT COUNT(*) FROM generation_outputs go WHERE go.job_id = gj.id) AS output_count
+      (SELECT COUNT(*) FROM generation_outputs go WHERE go.job_id = gj.id) AS output_count,
+      (SELECT go.media_asset_id
+       FROM generation_outputs go
+       WHERE go.job_id = gj.id
+       ORDER BY go.output_index ASC
+       LIMIT 1) AS preview_media_id
      FROM generation_jobs gj
      JOIN clone_profiles cp ON cp.id = gj.clone_id
      WHERE gj.user_id = ?
