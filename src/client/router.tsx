@@ -9,6 +9,7 @@ import { BlitzScreen } from "./screens/BlitzScreen";
 import { ClonesScreen } from "./screens/ClonesScreen";
 import { CreateScreen } from "./screens/CreateScreen";
 import { InboxScreen } from "./screens/InboxScreen";
+import { LandingPage } from "./screens/landing/LandingPage";
 import { LibraryScreen } from "./screens/LibraryScreen";
 import { MeScreen } from "./screens/MeScreen";
 import { OnboardingScreen } from "./screens/OnboardingScreen";
@@ -22,11 +23,16 @@ function routeFromHash(): AppRoute {
   return "blitz";
 }
 
+function isAuthHash(): boolean {
+  return window.location.hash.replace(/^#\/?/, "") === "auth";
+}
+
 export function AppRouter() {
   const [route, setRoute] = useState<AppRoute>(() => routeFromHash());
   const [data, setData] = useState<AppData | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [selectedCloneId, setSelectedCloneId] = useState("");
+  const [showAuth, setShowAuth] = useState(() => isAuthHash());
 
   async function loadAll() {
     const [account, cloneData, jobData] = await Promise.all([
@@ -47,7 +53,10 @@ export function AppRouter() {
   }, []);
 
   useEffect(() => {
-    const onHash = () => setRoute(routeFromHash());
+    const onHash = () => {
+      setRoute(routeFromHash());
+      setShowAuth(isAuthHash());
+    };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -64,6 +73,16 @@ export function AppRouter() {
     setRoute(next);
   }
 
+  function openAuth() {
+    window.location.hash = "auth";
+    setShowAuth(true);
+  }
+
+  function closeAuth() {
+    window.location.hash = "";
+    setShowAuth(false);
+  }
+
   if (authLoading) {
     return (
       <main className="auth-screen">
@@ -73,7 +92,21 @@ export function AppRouter() {
   }
 
   if (!data) {
-    return <AuthScreen onDone={() => loadAll().finally(() => setAuthLoading(false))} />;
+    return (
+      <>
+        <LandingPage onGetStarted={openAuth} />
+        {showAuth && (
+          <div
+            onClick={closeAuth}
+            style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center" }}
+          >
+            <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 460, padding: "0 16px" }}>
+              <AuthScreen onDone={() => { closeAuth(); loadAll(); }} />
+            </div>
+          </div>
+        )}
+      </>
+    );
   }
 
   return (
