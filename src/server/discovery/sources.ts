@@ -30,7 +30,7 @@ export const DISCOVERY_SOURCES: DiscoverySourceConfig[] = [
     id: "instagram-reels",
     label: "Instagram Reels",
     platform: "instagram",
-    defaultEndpoint: "/v1/instagram/search/reels",
+    defaultEndpoint: "/v2/instagram/reels/search",
     defaultParams: { query: "fashion editorial", trim: "true" },
     notes: "Search-based source until an explicit trending Reels endpoint is enabled."
   }

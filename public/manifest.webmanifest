@@ -1,0 +1,29 @@
+{
+  "name": "Mirai",
+  "short_name": "Mirai",
+  "description": "Daily AI clone studio for creator visuals.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#101318",
+  "theme_color": "#101318",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icons/mirai-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Blitz",
+      "url": "/#/blitz"
+    },
+    {
+      "name": "Create",
+      "url": "/#/create"
+    }
+  ]
+}

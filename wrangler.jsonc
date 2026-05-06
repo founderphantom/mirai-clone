@@ -20,7 +20,8 @@
     "HIGGSFIELD_DEFAULT_CHARACTER_ID": "f457e2ec-a3d9-4699-97dd-0cbc4d9fe1a4",
     "HIGGSFIELD_DEFAULT_STYLE_ID": "3db34ab5-3439-4317-9e03-08dc30852e69",
     "SCRAPECREATORS_CACHE_TTL_SECONDS": "1800",
-    "DISCOVERY_DEFAULT_REGION": "US"
+    "DISCOVERY_DEFAULT_REGION": "US",
+    "ANTHROPIC_PERSONA_MODEL": "claude-haiku-4-5-20251001"
   },
   "d1_databases": [
     {
@@ -41,6 +42,10 @@
       {
         "binding": "GENERATION_QUEUE",
         "queue": "mirai-generation"
+      },
+      {
+        "binding": "ONBOARDING_QUEUE",
+        "queue": "mirai-onboarding"
       }
     ],
     "consumers": [
@@ -50,6 +55,13 @@
         "max_batch_timeout": 10,
         "max_retries": 3,
         "dead_letter_queue": "mirai-generation-dlq"
+      },
+      {
+        "queue": "mirai-onboarding",
+        "max_batch_size": 4,
+        "max_batch_timeout": 10,
+        "max_retries": 3,
+        "dead_letter_queue": "mirai-onboarding-dlq"
       }
     ]
   }

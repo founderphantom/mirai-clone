@@ -86,6 +86,88 @@ export async function storeUpload(
   return mustGetAsset(env, user.id, id);
 }
 
+export async function storeRemoteReference(
+  env: Env,
+  user: AuthUser,
+  input: {
+    url: string;
+    cloneId?: string | null;
+    kind?: string;
+    source?: string;
+    pathPrefix?: string;
+    metadata?: Record<string, unknown>;
+  }
+): Promise<MediaAssetRow> {
+  let response: Response;
+  try {
+    response = await fetch(input.url);
+  } catch {
+    throw new HttpError(502, "Could not fetch the remote image.", "remote_image_fetch_failed");
+  }
+
+  if (!response.ok) {
+    throw new HttpError(502, `Remote image returned ${response.status}.`, "remote_image_fetch_failed");
+  }
+
+  const contentType = normalizeImageContentType(
+    response.headers.get("content-type"),
+    input.url
+  );
+  if (!contentType) {
+    throw new HttpError(422, "Remote media is not an image.", "invalid_remote_image");
+  }
+
+  const bytes = await response.arrayBuffer();
+  if (bytes.byteLength < 12 * 1024) {
+    throw new HttpError(422, "Remote image is too small to use as a reference.", "remote_image_too_small");
+  }
+  if (bytes.byteLength > 15 * 1024 * 1024) {
+    throw new HttpError(413, "Remote image must be 15 MB or smaller.", "remote_image_too_large");
+  }
+
+  const id = createId("media");
+  const digest = await sha256Hex(bytes);
+  const extension = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
+  const storageKey = [
+    "users",
+    safeR2Segment(user.id),
+    input.pathPrefix ? safeR2Segment(input.pathPrefix) : "remote",
+    `${id}.${extension}`
+  ].join("/");
+
+  await env.MEDIA.put(storageKey, bytes, {
+    httpMetadata: { contentType },
+    customMetadata: { userId: user.id, mediaId: id, source: input.source ?? "remote" }
+  });
+
+  const createdAt = nowIso();
+  await run(
+    env.DB,
+    `INSERT INTO media_assets
+      (id, user_id, clone_id, kind, source, storage_key, content_type, bytes,
+       width, height, remote_url, sha256, metadata_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      user.id,
+      input.cloneId ?? null,
+      input.kind ?? "reference",
+      input.source ?? "remote",
+      storageKey,
+      contentType,
+      bytes.byteLength,
+      null,
+      null,
+      input.url,
+      digest,
+      toJson(input.metadata ?? {}),
+      createdAt
+    ]
+  );
+
+  return mustGetAsset(env, user.id, id);
+}
+
 export async function materializeDiscoveryItem(
   env: Env,
   user: AuthUser,
@@ -190,6 +272,25 @@ function youtubeThumbnailFallback(value: string): string | null {
     return url.toString();
   } catch {
     return null;
+  }
+}
+
+function normalizeImageContentType(contentType: string | null, url: string): string | null {
+  const lower = (contentType || "").toLowerCase();
+  if (lower.startsWith("image/")) return lower.split(";")[0];
+
+  const pathname = safeUrlPath(url);
+  if (pathname.endsWith(".png")) return "image/png";
+  if (pathname.endsWith(".webp")) return "image/webp";
+  if (pathname.endsWith(".jpg") || pathname.endsWith(".jpeg")) return "image/jpeg";
+  return null;
+}
+
+function safeUrlPath(value: string): string {
+  try {
+    return new URL(value).pathname.toLowerCase();
+  } catch {
+    return value.toLowerCase();
   }
 }
 

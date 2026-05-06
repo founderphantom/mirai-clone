@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Mirai">
+  <rect width="512" height="512" rx="112" fill="#101318"/>
+  <path d="M116 340V172h62l78 94 78-94h62v168h-60V258l-62 74h-36l-62-74v82h-60Z" fill="#F5F7EF"/>
+  <circle cx="372" cy="140" r="34" fill="#4FD1A5"/>
+  <circle cx="122" cy="390" r="24" fill="#FF7A59"/>
+</svg>

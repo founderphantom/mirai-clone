@@ -11,10 +11,20 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   if (!response.ok) {
     const body = await response.json().catch(() => null) as unknown;
     const message = readApiErrorMessage(body);
-    throw new Error(message || `Request failed with ${response.status}`);
+    throw new ApiError(response.status, message || `Request failed with ${response.status}`);
   }
 
   return (await response.json()) as T;
+}
+
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
 }
 
 function readApiErrorMessage(body: unknown): string | null {

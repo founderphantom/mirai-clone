@@ -1,0 +1,97 @@
+import { all, first, parseJson } from "../db";
+import type { AuthUser, Env } from "../env";
+import { HttpError } from "../http/errors";
+import { createOnboardingClone } from "./onboarding-clones";
+
+export type StarterCharacter = {
+  id: string;
+  slug: string;
+  name: string;
+  persona: string;
+  style_prompt: string;
+  hero_media_id: string | null;
+  provider_config_json: string;
+  sort: number;
+  status: string;
+};
+
+export const STARTER_CHARACTER_TEMPLATES: StarterCharacter[] = [
+  starter("starter_sky_soft_glam", "sky-soft-glam", "Sky - Soft Glam", "soft glam lifestyle creator", 10),
+  starter("starter_marina_coastal", "marina-coastal", "Marina - Coastal", "coastal lifestyle creator", 20),
+  starter("starter_aiden_streetwear", "aiden-streetwear", "Aiden - Streetwear", "streetwear fashion creator", 30),
+  starter("starter_noor_editorial", "noor-editorial", "Noor - Editorial", "bold editorial creator", 40),
+  starter("starter_juno_fitness", "juno-fitness", "Juno - Fitness", "wellness and fitness creator", 50),
+  starter("starter_valentin_luxury_travel", "valentin-luxury-travel", "Valentin - Luxury Travel", "luxury travel creator", 60),
+  starter("starter_sienna_cottagecore", "sienna-cottagecore", "Sienna - Cottagecore", "cottagecore lifestyle creator", 70),
+  starter("starter_kai_cyber_night", "kai-cyber-night", "Kai - Cyber Night", "neon nightlife creator", 80),
+  starter("starter_maya_minimal_clean", "maya-minimal-clean", "Maya - Minimal Clean", "minimal clean lifestyle creator", 90),
+  starter("starter_rio_festival", "rio-festival", "Rio - Festival", "festival and nightlife creator", 100)
+];
+
+export async function listStarterCharacters(env: Env): Promise<StarterCharacter[]> {
+  try {
+    const rows = await all<StarterCharacter>(
+      env.DB,
+      `SELECT id, slug, name, persona, style_prompt, hero_media_id, provider_config_json, sort, status
+       FROM starter_characters
+       ORDER BY sort ASC`
+    );
+    return rows.length > 0 ? rows : STARTER_CHARACTER_TEMPLATES;
+  } catch {
+    return STARTER_CHARACTER_TEMPLATES;
+  }
+}
+
+export async function adoptStarterCharacter(env: Env, user: AuthUser, starterId: string) {
+  const starter = await getStarterCharacter(env, starterId);
+  const clone = await createOnboardingClone(env, user, {
+    name: starter.name,
+    handleBase: starter.slug,
+    persona: starter.persona,
+    stylePrompt: starter.style_prompt,
+    source: "starter",
+    starterCharacterId: starter.id,
+    providerConfig: parseJson(starter.provider_config_json, {}),
+    sourceSnapshot: {
+      starterCharacterId: starter.id,
+      starterSlug: starter.slug,
+      starterStatus: starter.status,
+      note: "Starter Soul provider assets will be wired when the preset Souls are set up."
+    },
+    soulStatus: hasProviderCharacter(starter.provider_config_json) ? "ready" : "pending_script"
+  });
+
+  return { clone, starter };
+}
+
+async function getStarterCharacter(env: Env, starterId: string): Promise<StarterCharacter> {
+  const byDb = await first<StarterCharacter>(
+    env.DB,
+    `SELECT id, slug, name, persona, style_prompt, hero_media_id, provider_config_json, sort, status
+     FROM starter_characters
+     WHERE id = ? OR slug = ?`,
+    [starterId, starterId]
+  );
+  const starter = byDb ?? STARTER_CHARACTER_TEMPLATES.find((item) => item.id === starterId || item.slug === starterId);
+  if (!starter) throw new HttpError(404, "Starter Soul was not found.", "starter_not_found");
+  return starter;
+}
+
+function hasProviderCharacter(providerConfigJson: string): boolean {
+  const config = parseJson<Record<string, unknown>>(providerConfigJson, {});
+  return typeof config.characterId === "string" || typeof config.soulCharacterId === "string";
+}
+
+function starter(id: string, slug: string, name: string, persona: string, sort: number): StarterCharacter {
+  return {
+    id,
+    slug,
+    name,
+    persona,
+    style_prompt: `${persona}, social-first composition, trend-ready lifestyle image`,
+    hero_media_id: null,
+    provider_config_json: "{}",
+    sort,
+    status: "setup_pending"
+  };
+}

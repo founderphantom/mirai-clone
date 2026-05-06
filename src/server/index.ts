@@ -8,8 +8,11 @@ import { cloneRoutes } from "./routes/clones";
 import { discoveryRoutes } from "./routes/discovery";
 import { generationRoutes } from "./routes/generations";
 import { mediaRoutes } from "./routes/media";
+import { onboardingRoutes } from "./routes/onboarding";
+import { telemetryRoutes } from "./routes/telemetry";
 import { handleGenerationBatch } from "./queue/generation-consumer";
-import type { GenerationQueueMessage } from "./queue/messages";
+import { handleOnboardingBatch } from "./queue/onboarding-consumer";
+import { isOnboardingQueueMessage, type AppQueueMessage, type GenerationQueueMessage, type OnboardingQueueMessage } from "./queue/messages";
 
 const app = new Hono<AppBindings>();
 
@@ -54,7 +57,8 @@ app.get("/api/health", (c) =>
     bindings: {
       d1: Boolean(c.env.DB),
       r2: Boolean(c.env.MEDIA),
-      queues: Boolean(c.env.GENERATION_QUEUE)
+      queues: Boolean(c.env.GENERATION_QUEUE),
+      onboardingQueue: Boolean(c.env.ONBOARDING_QUEUE)
     }
   })
 );
@@ -67,6 +71,8 @@ app.route("/api/clones", cloneRoutes);
 app.route("/api/discovery", discoveryRoutes);
 app.route("/api/generations", generationRoutes);
 app.route("/api/media", mediaRoutes);
+app.route("/api/onboarding", onboardingRoutes);
+app.route("/api/telemetry", telemetryRoutes);
 
 app.onError((error, c) => errorResponse(c, error));
 
@@ -80,6 +86,11 @@ app.notFound((c) => {
 export default {
   fetch: app.fetch,
   queue: async (batch, env, _ctx) => {
-    await handleGenerationBatch(batch, env);
+    const firstMessage = batch.messages[0]?.body;
+    if (firstMessage && isOnboardingQueueMessage(firstMessage)) {
+      await handleOnboardingBatch(batch as MessageBatch<OnboardingQueueMessage>, env);
+      return;
+    }
+    await handleGenerationBatch(batch as MessageBatch<GenerationQueueMessage>, env);
   }
-} satisfies ExportedHandler<Env, GenerationQueueMessage>;
+} satisfies ExportedHandler<Env, AppQueueMessage>;
