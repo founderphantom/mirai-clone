@@ -42,7 +42,7 @@ function DeckCard({
       animate={position !== 0 ? { rotate: position * 3 - 3, y: position * 8 } : undefined}
       transition={{ type: 'spring', stiffness: 300, damping: 30 }}
     >
-      <img src={src} alt={label} loading="lazy" />
+      <img src={src} alt={label} loading="eager" />
     </motion.div>
   );
 }
