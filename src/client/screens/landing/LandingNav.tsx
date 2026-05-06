@@ -34,7 +34,7 @@ export function LandingNav({ onGetStarted }: LandingNavProps) {
             <li><a href="#pricing" onClick={(e) => handleAnchor(e, '#pricing')}>Pricing</a></li>
           </ul>
           <div className="lp-nav__right">
-            <a className="lp-nav__signin" href="/#auth">Sign in</a>
+            <a className="lp-nav__signin" href="/login">Sign in</a>
             <button className="lp-btn-primary lp-nav__cta" onClick={onGetStarted}>Get started free</button>
           </div>
           <button className="lp-nav__hamburger" onClick={() => setDrawerOpen(true)} aria-label="Open menu">
@@ -51,7 +51,7 @@ export function LandingNav({ onGetStarted }: LandingNavProps) {
               <li><a href="#gallery" onClick={(e) => handleAnchor(e, '#gallery')}>Gallery</a></li>
               <li><a href="#pricing" onClick={(e) => handleAnchor(e, '#pricing')}>Pricing</a></li>
             </ul>
-            <a className="lp-nav__signin" href="/#auth" onClick={() => setDrawerOpen(false)}>Sign in</a>
+            <a className="lp-nav__signin" href="/login" onClick={() => setDrawerOpen(false)}>Sign in</a>
             <button className="lp-btn-primary" onClick={() => { setDrawerOpen(false); onGetStarted(); }}>Get started free</button>
           </div>
         </div>

@@ -15,6 +15,13 @@ export function BlitzScreen({ jobs }: { jobs: Job[] }) {
 
   return (
     <div className="screen-stack">
+      <section className="app-hero compact">
+        <div>
+          <span className="app-kicker">Daily Blitz</span>
+          <h2>Swipe through your freshest clone ideas.</h2>
+          <p>Saved cards become your creator library. Tomorrow's deck will learn from what you keep.</p>
+        </div>
+      </section>
       <section className="daily-strip">
         <Sparkles size={18} />
         <span>{cards.length || 0} ready</span>

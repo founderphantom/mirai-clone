@@ -4,6 +4,9 @@ export type Clone = {
   handle: string;
   persona: string;
   style_prompt: string;
+  soul_source?: "instagram" | "manual_upload" | "starter" | "manual";
+  soul_status?: "pending_script" | "ready" | "failed";
+  starter_character_id?: string | null;
   provider_config_json?: string;
   reference_count?: number;
   generation_count?: number;
@@ -49,6 +52,45 @@ export type Account = {
 export type Inspiration =
   | { type: "discovery"; id: string; imageUrl: string }
   | { type: "asset"; id: string; imageUrl: string };
+
+export type StarterCharacter = {
+  id: string;
+  slug: string;
+  name: string;
+  persona: string;
+  style_prompt: string;
+  hero_media_id: string | null;
+  sort?: number;
+  status: string;
+};
+
+export type InspirationBubble = {
+  id: string;
+  slug: string;
+  title: string;
+  vibe_summary: string;
+  searchQueries: string[];
+  selected: number;
+};
+
+export type InstagramHarvestJob = {
+  id: string;
+  handle: string;
+  status: string;
+  candidate_count: number;
+  accepted_count: number;
+  fail_reason: string | null;
+  clone_id: string | null;
+};
+
+export type OnboardingState = {
+  clones: Clone[];
+  activeClone: Clone | null;
+  latestHarvest: InstagramHarvestJob | null;
+  bubbles: InspirationBubble[];
+  inspirationPoolCount: number;
+  starters: StarterCharacter[];
+};
 
 export type AppRoute =
   | "blitz"

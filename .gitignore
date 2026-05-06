@@ -6,6 +6,15 @@
 .claude-flow/data/
 .claude-flow/logs/
 
+# Local agent/runtime state
+.claude/memory.db
+.claude/memory.db-*
+.claude/settings.local.json
+agentdb.rvf
+agentdb.rvf.lock
+ruvector.db
+ruvector.db-*
+
 # Environment variables
 .env
 .dev.vars
@@ -28,3 +37,5 @@ __pycache__/
 /.claude-flow/
 /.idea/
 /.swarm/
+/.claude/
+/.github/

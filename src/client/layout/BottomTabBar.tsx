@@ -1,4 +1,5 @@
 import { Bell, Images, Sparkles, UserRound, Zap } from "lucide-react";
+import { motion } from "motion/react";
 import type { AppRoute } from "../types";
 
 const tabs = [
@@ -19,16 +20,17 @@ export function BottomTabBar({
   return (
     <nav className="bottom-tabs" aria-label="Primary">
       {tabs.map(([id, Icon, label]) => (
-        <button
+        <motion.button
           aria-current={route === id ? "page" : undefined}
           className={route === id ? "active" : ""}
           key={id}
           onClick={() => onRoute(id)}
           title={label}
+          whileTap={{ scale: 0.94 }}
         >
           <Icon size={20} />
           <span>{label}</span>
-        </button>
+        </motion.button>
       ))}
     </nav>
   );

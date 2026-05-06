@@ -7,9 +7,9 @@ import { createId, nowIso, run, toJson } from "./db";
 type PolarPluginUse = Parameters<typeof polar>[0]["use"];
 type UnknownRecord = Record<string, unknown>;
 
-export function createAuth(env: Env) {
+export function createAuth(env: Env, requestOrigin?: string) {
   const plugins: any[] = [];
-  const appUrl = env.APP_URL || "http://localhost:5173";
+  const appUrl = resolveAppUrl(env.APP_URL, requestOrigin);
   const isLocal = appUrl.includes("localhost") || appUrl.includes("127.0.0.1");
 
   if (env.POLAR_ACCESS_TOKEN) {
@@ -59,7 +59,10 @@ export function createAuth(env: Env) {
     plugins.push(
       polar({
         client: polarClient,
-        createCustomerOnSignUp: true,
+        // Polar's built-in hook hard-fails auth if a customer with the same
+        // email already has a different externalId. Phase 2 will replace this
+        // with an idempotent, non-blocking customer sync tied to credits.
+        createCustomerOnSignUp: false,
         use: polarUse
       })
     );
@@ -79,8 +82,31 @@ export function createAuth(env: Env) {
     emailAndPassword: {
       enabled: true
     },
+    socialProviders: resolveSocialProviders(env, appUrl),
     plugins
   });
+}
+
+function resolveAppUrl(configuredUrl?: string, requestOrigin?: string) {
+  const fallback = "http://localhost:5173";
+  const configured = configuredUrl || fallback;
+  if (!requestOrigin) return configured;
+
+  const configuredIsLocal = configured.includes("localhost") || configured.includes("127.0.0.1");
+  const requestIsLocal = requestOrigin.includes("localhost") || requestOrigin.includes("127.0.0.1");
+  return configuredIsLocal && !requestIsLocal ? requestOrigin : configured;
+}
+
+function resolveSocialProviders(env: Env, appUrl: string) {
+  const socialProviders: Record<string, unknown> = {};
+  if (env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET) {
+    socialProviders.google = {
+      clientId: env.GOOGLE_CLIENT_ID,
+      clientSecret: env.GOOGLE_CLIENT_SECRET,
+      redirectURI: `${appUrl}/api/auth/callback/google`
+    };
+  }
+  return socialProviders;
 }
 
 function extractPolarUserId(payload: { data?: unknown }): string | null {

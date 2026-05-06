@@ -29,7 +29,7 @@ app.use(
 );
 
 app.use("*", async (c, next) => {
-  const auth = createAuth(c.env);
+  const auth = createAuth(c.env, new URL(c.req.url).origin);
   c.set("auth", auth);
 
   if (c.req.path.startsWith("/api/auth") || c.req.path.startsWith("/polar/webhooks")) {

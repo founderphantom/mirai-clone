@@ -80,6 +80,13 @@ export function CreateScreen({
 
   return (
     <div className="create-layout">
+      <section className="app-hero compact">
+        <div>
+          <span className="app-kicker">Create</span>
+          <h2>Pull a trend, add your Soul, queue the clone.</h2>
+          <p>Use discovery when you want speed, or upload a reference when you have a specific post in mind.</p>
+        </div>
+      </section>
       <section className="composer">
         <div className="source-toolbar">
           <select value={source} onChange={(event) => setSource(event.target.value)}>

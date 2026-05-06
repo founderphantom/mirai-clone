@@ -6,6 +6,8 @@ import { initAnalytics } from "./lib/analytics";
 import { initErrorTracking } from "./lib/sentry";
 import "./styles.css";
 import "./mobile.css";
+import "./app-ui.css";
+import "./auth.css";
 
 initErrorTracking();
 initAnalytics();

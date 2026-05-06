@@ -15,24 +15,56 @@ import { MeScreen } from "./screens/MeScreen";
 import { OnboardingScreen } from "./screens/OnboardingScreen";
 import type { Account, AppData, AppRoute, Clone, Job } from "./types";
 
-function routeFromHash(): AppRoute {
-  const value = window.location.hash.replace(/^#\/?/, "");
-  if (["blitz", "create", "inbox", "library", "me", "clones", "onboarding"].includes(value)) {
-    return value as AppRoute;
+type AuthMode = "signin" | "signup";
+
+const APP_ROUTES: AppRoute[] = ["blitz", "create", "inbox", "library", "me", "clones", "onboarding"];
+
+function routeFromLocation(): AppRoute {
+  const hashValue = window.location.hash.replace(/^#\/?/, "");
+  if (APP_ROUTES.includes(hashValue as AppRoute)) {
+    return hashValue as AppRoute;
   }
+
+  const pathValue = window.location.pathname.replace(/^\/+/, "").replace(/\/$/, "");
+  if (APP_ROUTES.includes(pathValue as AppRoute)) {
+    return pathValue as AppRoute;
+  }
+
+  const legacyValue = hashValue === "auth" ? "" : hashValue;
+  if (APP_ROUTES.includes(legacyValue as AppRoute)) {
+    return legacyValue as AppRoute;
+  }
+
   return "blitz";
 }
 
-function isAuthHash(): boolean {
-  return window.location.hash.replace(/^#\/?/, "") === "auth";
+function appPath(route: AppRoute): string {
+  return `/${route}`;
+}
+
+function normalizedPath(): string {
+  return window.location.pathname.replace(/^\/+/, "").replace(/\/$/, "");
+}
+
+function isAppRoutePath() {
+  const pathValue = normalizedPath();
+  return APP_ROUTES.includes(pathValue as AppRoute);
+}
+
+function authModeFromLocation(): AuthMode | null {
+  const pathValue = normalizedPath();
+  if (pathValue === "signup") return "signup";
+  if (pathValue === "login") return "signin";
+  if (window.location.hash.replace(/^#\/?/, "") === "auth") return "signup";
+  return null;
 }
 
 export function AppRouter() {
-  const [route, setRoute] = useState<AppRoute>(() => routeFromHash());
+  const [route, setRoute] = useState<AppRoute>(() => routeFromLocation());
   const [data, setData] = useState<AppData | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [selectedCloneId, setSelectedCloneId] = useState("");
-  const [showAuth, setShowAuth] = useState(() => isAuthHash());
+  const [authMode, setAuthMode] = useState<AuthMode | null>(() => authModeFromLocation());
 
   async function loadAll() {
     const [account, cloneData, jobData] = await Promise.all([
@@ -53,13 +85,25 @@ export function AppRouter() {
   }, []);
 
   useEffect(() => {
-    const onHash = () => {
-      setRoute(routeFromHash());
-      setShowAuth(isAuthHash());
+    const onLocation = () => {
+      setRoute(routeFromLocation());
+      setAuthMode(authModeFromLocation());
     };
-    window.addEventListener("hashchange", onHash);
-    return () => window.removeEventListener("hashchange", onHash);
+    window.addEventListener("hashchange", onLocation);
+    window.addEventListener("popstate", onLocation);
+    return () => {
+      window.removeEventListener("hashchange", onLocation);
+      window.removeEventListener("popstate", onLocation);
+    };
   }, []);
+
+  useEffect(() => {
+    if (!data || !authMode) return;
+    const nextRoute = data.clones.length === 0 ? "onboarding" : "blitz";
+    window.history.replaceState(null, "", appPath(nextRoute));
+    setRoute(nextRoute);
+    setAuthMode(null);
+  }, [authMode, data]);
 
   const effectiveRoute = useMemo<AppRoute>(() => {
     if (!data) return route;
@@ -69,18 +113,30 @@ export function AppRouter() {
 
   function navigate(next: AppRoute) {
     track("screen_view", { route: next });
-    window.location.hash = `/${next}`;
+    window.history.pushState(null, "", appPath(next));
     setRoute(next);
   }
 
   function openAuth() {
-    window.location.hash = "auth";
-    setShowAuth(true);
+    window.history.pushState(null, "", "/signup");
+    setAuthMode("signup");
   }
 
-  function closeAuth() {
-    window.location.hash = "";
-    setShowAuth(false);
+  function changeAuthMode(next: AuthMode) {
+    window.history.pushState(null, "", next === "signup" ? "/signup" : "/login");
+    setAuthMode(next);
+  }
+
+  async function completeAuth() {
+    setAuthLoading(true);
+    window.history.replaceState(null, "", appPath("onboarding"));
+    setRoute("onboarding");
+    try {
+      await loadAll();
+      setAuthMode(null);
+    } finally {
+      setAuthLoading(false);
+    }
   }
 
   if (authLoading) {
@@ -92,20 +148,16 @@ export function AppRouter() {
   }
 
   if (!data) {
+    if (isAppRoutePath()) {
+      return <AuthScreen initialMode="signin" onDone={completeAuth} onModeChange={changeAuthMode} />;
+    }
+
+    if (authMode) {
+      return <AuthScreen initialMode={authMode} onDone={completeAuth} onModeChange={changeAuthMode} />;
+    }
+
     return (
-      <>
-        <LandingPage onGetStarted={openAuth} />
-        {showAuth && (
-          <div
-            onClick={closeAuth}
-            style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center" }}
-          >
-            <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 460, padding: "0 16px" }}>
-              <AuthScreen onDone={() => { closeAuth(); loadAll(); }} />
-            </div>
-          </div>
-        )}
-      </>
+      <LandingPage onGetStarted={openAuth} />
     );
   }
 
@@ -126,7 +178,7 @@ export function AppRouter() {
       )}
       {effectiveRoute === "inbox" && <InboxScreen jobs={data.jobs} />}
       {effectiveRoute === "library" && <LibraryScreen jobs={data.jobs} onRefresh={loadAll} />}
-      {effectiveRoute === "me" && <MeScreen account={data.account} />}
+      {effectiveRoute === "me" && <MeScreen account={data.account} onSignedOut={() => setData(null)} />}
       {effectiveRoute === "clones" && <ClonesScreen clones={data.clones} onCreated={loadAll} />}
     </MobileShell>
   );
