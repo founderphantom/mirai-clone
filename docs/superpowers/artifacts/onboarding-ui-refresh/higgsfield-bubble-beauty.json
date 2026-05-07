@@ -1,0 +1,37 @@
+[
+  {
+    "id": "1b26b3fe-12bb-4bb7-b835-ad5be23d7b53",
+    "status": "completed",
+    "display_name": "GPT Image 2",
+    "job_set_type": "imagegen_2_0",
+    "result_url": "https://d8j0ntlcm91z4.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/hf_20260507_190030_1b26b3fe-12bb-4bb7-b835-ad5be23d7b53.png",
+    "created_at": 1778180430.841557,
+    "params": {
+      "width": 2048,
+      "height": 2048,
+      "prompt": "Square aesthetic background image for a circular inspiration bubble in a premium AI creator app. Niche: beauty. Dewy skincare, soft glam makeup, beauty tools and glossy highlights, premium creator taste, rich but clean composition, darker center contrast for white UI label overlay, no text, no logos, no watermark, consistent with mint #4fd1a5 and charcoal #111318 Mirai design context.",
+      "medias": [
+        {
+          "data": {
+            "id": "1173cb81-6395-4b95-86a9-4fb7d6eed8d5",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/1173cb81-6395-4b95-86a9-4fb7d6eed8d5.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        },
+        {
+          "data": {
+            "id": "76a7f21e-6cc6-4593-a202-58b72c748c6d",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/76a7f21e-6cc6-4593-a202-58b72c748c6d.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        }
+      ],
+      "aspect_ratio": "1:1",
+      "quality": "high",
+      "resolution": "2k",
+      "model": "videotape-alpha"
+    }
+  }
+]

@@ -1,0 +1,45 @@
+[
+  {
+    "id": "183d0a7b-5ed5-4a03-becc-74672d2507b9",
+    "status": "completed",
+    "display_name": "GPT Image 2",
+    "job_set_type": "imagegen_2_0",
+    "result_url": "https://d8j0ntlcm91z4.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/hf_20260507_185712_183d0a7b-5ed5-4a03-becc-74672d2507b9.png",
+    "created_at": 1778180232.41748,
+    "params": {
+      "width": 1520,
+      "height": 2688,
+      "prompt": "Mobile /onboarding screen for Mirai, a premium AI creator app. Use the supplied screenshots as design-token context. Strong /me-page inspired account hero, mint #4fd1a5 accent, charcoal #111318 premium panel, fashion beauty travel content creator aesthetic, source picker cards, image-filled inspiration bubbles with centered readable labels, polished iOS mobile product UI, no marketing hero, no fake browser chrome.",
+      "medias": [
+        {
+          "data": {
+            "id": "a7104874-183b-4d83-aac8-620204d1cf65",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/a7104874-183b-4d83-aac8-620204d1cf65.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        },
+        {
+          "data": {
+            "id": "5dd69532-ae17-4a65-8a4c-4cfd5654d629",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/5dd69532-ae17-4a65-8a4c-4cfd5654d629.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        },
+        {
+          "data": {
+            "id": "897717fe-80e6-4e61-9fe4-fae84374ddfb",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/897717fe-80e6-4e61-9fe4-fae84374ddfb.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        }
+      ],
+      "aspect_ratio": "9:16",
+      "quality": "high",
+      "resolution": "2k",
+      "model": "videotape-alpha"
+    }
+  }
+]

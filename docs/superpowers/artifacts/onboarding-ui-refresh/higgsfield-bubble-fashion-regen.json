@@ -1,0 +1,37 @@
+[
+  {
+    "id": "6b2da476-9698-4278-80ea-92b26c02e408",
+    "status": "completed",
+    "display_name": "GPT Image 2",
+    "job_set_type": "imagegen_2_0",
+    "result_url": "https://d8j0ntlcm91z4.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/hf_20260507_190455_6b2da476-9698-4278-80ea-92b26c02e408.png",
+    "created_at": 1778180695.870464,
+    "params": {
+      "width": 2048,
+      "height": 2048,
+      "prompt": "Square abstract editorial background for a circular inspiration bubble in a premium AI creator app. Niche: fashion. Close-up of layered fabric textures, chrome accessories, hangers, runway lights implied only, no people, no body parts, clean luxury wardrobe mood, darker center contrast for white UI label overlay, no text, no logos, no watermark, mint #4fd1a5 and charcoal #111318 compatible.",
+      "medias": [
+        {
+          "data": {
+            "id": "8c954057-555c-427e-b752-03fee3c445f6",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/8c954057-555c-427e-b752-03fee3c445f6.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        },
+        {
+          "data": {
+            "id": "37c2e9af-5c33-4a43-bf6f-d5c304dd110d",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/37c2e9af-5c33-4a43-bf6f-d5c304dd110d.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        }
+      ],
+      "aspect_ratio": "1:1",
+      "quality": "high",
+      "resolution": "2k",
+      "model": "videotape-alpha"
+    }
+  }
+]

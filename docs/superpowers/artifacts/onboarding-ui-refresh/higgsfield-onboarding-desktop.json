@@ -1,0 +1,45 @@
+[
+  {
+    "id": "ea8b5c7c-524d-4ebb-b7f3-f647811444fd",
+    "status": "completed",
+    "display_name": "GPT Image 2",
+    "job_set_type": "imagegen_2_0",
+    "result_url": "https://d8j0ntlcm91z4.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/hf_20260507_190034_ea8b5c7c-524d-4ebb-b7f3-f647811444fd.png",
+    "created_at": 1778180434.496883,
+    "params": {
+      "width": 2688,
+      "height": 1520,
+      "prompt": "Desktop /onboarding app screen for Mirai after login. Use supplied screenshots as design-token context. Preserve sidebar app shell, create a premium onboarding workspace with /me-page inspired status hero, source selection cards, starter creator grid, large visual bubble picker, fashion beauty vibes travel content niches, mint accent, charcoal premium surfaces, crisp Inter typography, real SaaS dashboard density, no fake browser chrome.",
+      "medias": [
+        {
+          "data": {
+            "id": "6fa4f92a-5e98-4b9b-a9dd-c445efaf4270",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/6fa4f92a-5e98-4b9b-a9dd-c445efaf4270.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        },
+        {
+          "data": {
+            "id": "5ceb7bfd-6dc4-4a44-9b5d-35c88350b9a6",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/5ceb7bfd-6dc4-4a44-9b5d-35c88350b9a6.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        },
+        {
+          "data": {
+            "id": "e991e497-c726-4fc2-a690-f1c78e702158",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/e991e497-c726-4fc2-a690-f1c78e702158.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        }
+      ],
+      "aspect_ratio": "16:9",
+      "quality": "high",
+      "resolution": "2k",
+      "model": "videotape-alpha"
+    }
+  }
+]

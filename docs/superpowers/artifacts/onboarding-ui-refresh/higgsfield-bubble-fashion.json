@@ -1,0 +1,37 @@
+[
+  {
+    "id": "1576e476-f60e-4708-837e-942d1eed47a1",
+    "status": "nsfw",
+    "display_name": "GPT Image 2",
+    "job_set_type": "imagegen_2_0",
+    "result_url": "",
+    "created_at": 1778180431.358749,
+    "params": {
+      "width": 2048,
+      "height": 2048,
+      "prompt": "Square aesthetic background image for a circular inspiration bubble in a premium AI creator app. Niche: fashion. Glossy editorial wardrobe details, runway texture, fabric movement, luxury creator taste, rich but clean composition, darker center contrast for white UI label overlay, no text, no logos, no watermark, consistent with mint #4fd1a5 and charcoal #111318 Mirai design context.",
+      "medias": [
+        {
+          "data": {
+            "id": "6135e95c-be4a-4b24-8bab-88b71848e607",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/6135e95c-be4a-4b24-8bab-88b71848e607.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        },
+        {
+          "data": {
+            "id": "939b0161-b728-4139-b445-a674acb6c71a",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/939b0161-b728-4139-b445-a674acb6c71a.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        }
+      ],
+      "aspect_ratio": "1:1",
+      "quality": "high",
+      "resolution": "2k",
+      "model": "videotape-alpha"
+    }
+  }
+]

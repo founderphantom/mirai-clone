@@ -8,6 +8,7 @@ import "./styles.css";
 import "./mobile.css";
 import "./app-ui.css";
 import "./auth.css";
+import "./onboarding.css";
 
 initErrorTracking();
 initAnalytics();

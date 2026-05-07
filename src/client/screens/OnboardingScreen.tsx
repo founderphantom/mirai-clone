@@ -1,6 +1,7 @@
 import { AtSign, Camera, Check, Images, Loader2, Sparkles, WandSparkles } from "lucide-react";
 import { motion } from "motion/react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import type { CSSProperties, FormEvent } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
 import { track } from "../lib/analytics";
 import type {
@@ -10,6 +11,7 @@ import type {
   OnboardingState,
   StarterCharacter
 } from "../types";
+import { bubbleVisualFor } from "./onboarding-visuals";
 
 type HarvestResponse = {
   job: InstagramHarvestJob;
@@ -209,33 +211,48 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
 
   return (
     <div className="onboarding-flow">
-      <section className="app-hero onboarding-hero">
-        <div>
-          <span className="app-kicker">Create your Soul</span>
-          <h2>Start with Instagram, uploads, or a preset creator.</h2>
-          <p>
-            The real Soul creation script is still pending, so this flow prepares the eligible
-            references, clone record, and inspiration bubbles for that script to consume later.
-          </p>
+      <section className="app-hero onboarding-hero onboarding-dashboard-hero">
+        <div className="onboarding-hero-copy">
+          <span className="app-kicker">Creator setup</span>
+          <h2>Shape the first version of your creator workspace.</h2>
+          <p>Start from the source that best captures your look, then choose the visual lane Mirai should lean into first.</p>
+          <div className="onboarding-hero-pills" aria-label="Available setup steps">
+            <span>Instagram</span>
+            <span>Uploads</span>
+            <span>Starters</span>
+            <span>Bubbles</span>
+          </div>
         </div>
-        <div className="hero-preview-stack" aria-hidden="true">
-          <img src="/landing/clone-y2k-cafe.jpg" alt="" />
-          <img src="/landing/clone-tokyo-neon.jpg" alt="" />
+        <div className="onboarding-hero-visual" aria-hidden="true">
+          <img className="onboarding-hero-main" src="/landing/clone-y2k-cafe.jpg" alt="" />
+          <img className="onboarding-hero-float" src="/landing/clone-tokyo-neon.jpg" alt="" />
+          <div className="onboarding-hero-status">
+            <span>{selectedBubbles.length}/5</span>
+            <small>bubbles selected</small>
+          </div>
         </div>
       </section>
 
-      <section className="source-tabs" aria-label="Soul source">
-        <button className={mode === "instagram" ? "active" : ""} onClick={() => setMode("instagram")}>
-          <AtSign size={16} /> Instagram
+      <section className="source-tabs onboarding-source-tabs" aria-label="Soul source">
+        <button type="button" className={sourceTabClass(mode, "instagram", "source-tab-instagram")} onClick={() => setMode("instagram")}>
+          <AtSign size={18} />
+          <strong>Instagram</strong>
+          <span>Public profile</span>
         </button>
-        <button className={mode === "upload" ? "active" : ""} onClick={() => setMode("upload")}>
-          <Camera size={16} /> Upload
+        <button type="button" className={sourceTabClass(mode, "upload", "source-tab-upload")} onClick={() => setMode("upload")}>
+          <Camera size={18} />
+          <strong>Upload</strong>
+          <span>Reference photos</span>
         </button>
-        <button className={mode === "starter" ? "active" : ""} onClick={() => setMode("starter")}>
-          <Images size={16} /> Starters
+        <button type="button" className={sourceTabClass(mode, "starter", "source-tab-starter")} onClick={() => setMode("starter")}>
+          <Images size={18} />
+          <strong>Starters</strong>
+          <span>Preset creators</span>
         </button>
-        <button className={mode === "bubbles" ? "active" : ""} disabled={!canPickBubbles} onClick={() => setMode("bubbles")}>
-          <WandSparkles size={16} /> Bubbles
+        <button type="button" className={sourceTabClass(mode, "bubbles", "source-tab-bubbles")} disabled={!canPickBubbles} onClick={() => setMode("bubbles")}>
+          <WandSparkles size={18} />
+          <strong>Bubbles</strong>
+          <span>Visual direction</span>
         </button>
       </section>
 
@@ -307,18 +324,36 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
       )}
 
       {mode === "bubbles" && (
-        <motion.section className="moment-card" initial={{ y: 12, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
-          <WandSparkles size={24} />
-          <h2>Choose up to 5 inspiration bubbles</h2>
-          <p>These seed ScrapeCreators searches for your personal inspiration pool.</p>
-          <div className="bubble-grid">
+        <motion.section className="moment-card onboarding-bubbles-card" initial={{ y: 12, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
+          <div className="onboarding-card-header">
+            <div>
+              <WandSparkles size={24} />
+              <h2>Choose up to 5 inspiration bubbles</h2>
+              <p>These seed ScrapeCreators searches for your personal inspiration pool.</p>
+            </div>
+            <span>{selectedBubbles.length}/5</span>
+          </div>
+          <div className="bubble-grid onboarding-bubble-grid">
             {bubbles.map((bubble) => {
               const active = selectedBubbles.includes(bubble.id);
+              const visual = bubbleVisualFor(bubble);
+              const style = { "--bubble-image": `url(${visual.src})` } as CSSProperties;
               return (
-                <button className={active ? "bubble-chip selected" : "bubble-chip"} key={bubble.id} onClick={() => toggleBubble(bubble.id)}>
-                  {active && <Check size={14} />}
-                  <strong>{bubble.title}</strong>
-                  <span>{bubble.vibe_summary}</span>
+                <button
+                  aria-label={`${active ? "Remove" : "Select"} ${bubble.title} inspiration bubble`}
+                  aria-pressed={active}
+                  className={active ? "bubble-chip onboarding-bubble selected" : "bubble-chip onboarding-bubble"}
+                  key={bubble.id}
+                  onClick={() => toggleBubble(bubble.id)}
+                  style={style}
+                  type="button"
+                >
+                  <span className="bubble-checkmark" aria-hidden="true">{active && <Check size={14} />}</span>
+                  <span className="bubble-copy">
+                    <small>{visual.label}</small>
+                    <strong>{bubble.title}</strong>
+                    <span className="bubble-summary">{bubble.vibe_summary}</span>
+                  </span>
                 </button>
               );
             })}
@@ -348,6 +383,10 @@ function terminalHarvestStatus(status: string): boolean {
 function fallbackStarterImage(index: number) {
   const images = Object.values(starterImages);
   return images[index % images.length];
+}
+
+function sourceTabClass(mode: OnboardingMode, tab: OnboardingMode, imageClass: string) {
+  return `source-tab ${imageClass}${mode === tab ? " active" : ""}`;
 }
 
 function HarvestProgress({ job }: { job: InstagramHarvestJob }) {

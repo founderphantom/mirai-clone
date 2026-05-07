@@ -1,0 +1,37 @@
+[
+  {
+    "id": "21a12d05-2ac3-4ca3-9560-dc6e34421436",
+    "status": "completed",
+    "display_name": "GPT Image 2",
+    "job_set_type": "imagegen_2_0",
+    "result_url": "https://d8j0ntlcm91z4.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/hf_20260507_190455_21a12d05-2ac3-4ca3-9560-dc6e34421436.png",
+    "created_at": 1778180695.237414,
+    "params": {
+      "width": 2048,
+      "height": 2048,
+      "prompt": "Square aesthetic background image for a circular inspiration bubble in a premium AI creator app. Niche: vibes. Neon cafe lights, flash-photo textures, glossy night color, creator mood board energy, rich but clean composition, darker center contrast for white UI label overlay, no text, no logos, no watermark, consistent with mint #4fd1a5 and charcoal #111318 Mirai design context.",
+      "medias": [
+        {
+          "data": {
+            "id": "e68e2616-c816-4806-a6c6-9f2331d7deeb",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/e68e2616-c816-4806-a6c6-9f2331d7deeb.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        },
+        {
+          "data": {
+            "id": "ff4e75b7-b29e-45ba-b52a-24d667e6d2de",
+            "url": "https://d2ol7oe51mr4n9.cloudfront.net/user_37qkAfgwz3GdqEzgaYrhldNnp0T/ff4e75b7-b29e-45ba-b52a-24d667e6d2de.png",
+            "type": "media_input"
+          },
+          "role": "image"
+        }
+      ],
+      "aspect_ratio": "1:1",
+      "quality": "high",
+      "resolution": "2k",
+      "model": "videotape-alpha"
+    }
+  }
+]

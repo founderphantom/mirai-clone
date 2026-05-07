@@ -8,6 +8,12 @@ function useLazyImage(src: string, rootMargin = '300px') {
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
+
+    if (typeof IntersectionObserver === 'undefined') {
+      setResolvedSrc(src);
+      return;
+    }
+
     const observer = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting) {

@@ -1,5 +1,12 @@
 import { useState, useEffect } from 'react';
-import { motion, useMotionValue, useTransform, AnimatePresence } from 'motion/react';
+import {
+  motion,
+  useMotionValue,
+  useTransform,
+  AnimatePresence,
+  animate,
+  useReducedMotion,
+} from 'motion/react';
 
 const CARDS = [
   { src: '/landing/hero/hero-aesthetic-vibes.jpg',  label: 'Aesthetic Vibes' },
@@ -11,19 +18,29 @@ const CARDS = [
   { src: '/landing/hero/hero-nyc-fashion.jpg',       label: 'NYC Fashion' },
 ];
 
+type SwipeDirection = -1 | 0 | 1;
+
 function DeckCard({
   src,
   label,
   position,
   onDragEnd,
+  onDismiss,
+  reduceMotion,
 }: {
   src: string;
   label: string;
   position: number;
-  onDragEnd: (offsetX: number, velocityX: number) => void;
+  onDragEnd: (offsetX: number, velocityX: number) => SwipeDirection;
+  onDismiss: (direction: Exclude<SwipeDirection, 0>) => void;
+  reduceMotion: boolean;
 }) {
   const x = useMotionValue(0);
   const rotate = useTransform(x, [-200, 200], [-12, 12]);
+
+  useEffect(() => {
+    if (position !== 0) x.set(0);
+  }, [position, x]);
 
   return (
     <motion.div
@@ -40,7 +57,25 @@ function DeckCard({
       dragElastic={0.15}
       dragMomentum={false}
       onDragEnd={(_, info) => {
-        if (position === 0) onDragEnd(info.offset.x, info.velocity.x);
+        if (position !== 0) return;
+        const direction = onDragEnd(info.offset.x, info.velocity.x);
+        if (!direction) {
+          animate(x, 0, { type: 'spring', stiffness: 500, damping: 35 });
+          return;
+        }
+        if (reduceMotion) {
+          x.set(0);
+          onDismiss(direction);
+          return;
+        }
+        animate(x, direction * 420, {
+          type: 'spring',
+          stiffness: 360,
+          damping: 34,
+        }).then(() => {
+          x.set(0);
+          onDismiss(direction);
+        });
       }}
       animate={
         position !== 0
@@ -61,24 +96,27 @@ function DeckCard({
 
 export function SwipeDeckHero() {
   const [activeIndex, setActiveIndex] = useState(0);
+  const reduceMotion = useReducedMotion();
 
   useEffect(() => {
+    if (reduceMotion) return;
     const id = setInterval(() => {
       setActiveIndex((i) => (i + 1) % CARDS.length);
     }, 3000);
     return () => clearInterval(id);
-  }, []);
+  }, [reduceMotion]);
 
   const handleDragEnd = (offsetX: number, velocityX: number) => {
     const byVelocity = Math.abs(velocityX) > 400;
     const byOffset = Math.abs(offsetX) > 80;
-    if (byVelocity || byOffset) {
-      if (velocityX < 0 || offsetX < 0) {
-        setActiveIndex((i) => (i + 1) % CARDS.length);
-      } else {
-        setActiveIndex((i) => (i - 1 + CARDS.length) % CARDS.length);
-      }
-    }
+    if (!byVelocity && !byOffset) return 0;
+    return velocityX < 0 || offsetX < 0 ? -1 : 1;
+  };
+
+  const handleDismiss = (direction: Exclude<SwipeDirection, 0>) => {
+    setActiveIndex((i) =>
+      direction < 0 ? (i + 1) % CARDS.length : (i - 1 + CARDS.length) % CARDS.length
+    );
   };
 
   const orderedCards = [
@@ -95,6 +133,8 @@ export function SwipeDeckHero() {
           label={card.label}
           position={position}
           onDragEnd={handleDragEnd}
+          onDismiss={handleDismiss}
+          reduceMotion={Boolean(reduceMotion)}
         />
       ))}
       <AnimatePresence mode="wait">

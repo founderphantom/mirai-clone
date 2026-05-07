@@ -10,7 +10,8 @@
   --lp-banner-bg: #101318;
 }
 
-* {
+.lp-root,
+.lp-root * {
   box-sizing: border-box;
 }
 
@@ -1018,5 +1019,12 @@
   .lp-btn-ghost {
     text-align: center;
     justify-content: center;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lp-marquee__track,
+  .lp-gallery__track {
+    animation: none;
   }
 }
