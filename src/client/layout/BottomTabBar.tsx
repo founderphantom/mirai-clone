@@ -7,7 +7,7 @@ const tabs = [
   ["create", Sparkles, "Create"],
   ["inbox", Bell, "Inbox"],
   ["library", Images, "Library"],
-  ["me", UserRound, "Me"]
+  ["me", UserRound, "Account"]
 ] as const;
 
 export function BottomTabBar({

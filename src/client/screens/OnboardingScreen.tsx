@@ -19,18 +19,23 @@ type HarvestResponse = {
 
 type OnboardingMode = "instagram" | "upload" | "starter" | "bubbles";
 
-const starterImages = [
-  "/landing/clone-y2k-cafe.jpg",
-  "/landing/clone-coastal-sunset.jpg",
-  "/landing/clone-streetwear-berlin.jpg",
-  "/landing/clone-dark-academia.jpg",
-  "/landing/clone-cottagecore-picnic.jpg",
-  "/landing/clone-tokyo-neon.jpg",
-  "/landing/clone-cherry-blossom-seoul.jpg",
-  "/landing/clone-retrofuturism.jpg",
-  "/landing/clone-winter-minimalist.jpg",
-  "/landing/clone-barbiecore.jpg"
-];
+const starterImages: Record<string, string> = {
+  starter_amara_cherry_grwm: "/landing/starters/starter-amara.jpg",
+  starter_priya_resort_edit: "/landing/starters/starter-priya.jpg",
+  starter_miles_streetwear_lens: "/landing/starters/starter-miles.jpg",
+  starter_hana_seoul_skin: "/landing/starters/starter-hana.jpg",
+  starter_leila_fragrance_editorial: "/landing/starters/starter-leila.jpg",
+  starter_sky_soft_glam: "/landing/starters/starter-sky.jpg",
+  starter_marina_coastal: "/landing/starters/starter-marina.jpg",
+  starter_aiden_streetwear: "/landing/starters/starter-aiden.jpg",
+  starter_noor_editorial: "/landing/starters/starter-noor.jpg",
+  starter_juno_fitness: "/landing/starters/starter-juno.jpg",
+  starter_valentin_luxury_travel: "/landing/starters/starter-valentin.jpg",
+  starter_sienna_cottagecore: "/landing/starters/starter-sienna.jpg",
+  starter_kai_cyber_night: "/landing/starters/starter-kai.jpg",
+  starter_maya_minimal_clean: "/landing/starters/starter-maya.jpg",
+  starter_rio_festival: "/landing/starters/starter-rio.jpg"
+};
 
 export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void> }) {
   const [state, setState] = useState<OnboardingState | null>(null);
@@ -287,10 +292,14 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
           <div className="starter-grid">
             {starters.map((starter, index) => (
               <button className="starter-card" key={starter.id} onClick={() => adoptStarter(starter)} disabled={busy}>
-                <img src={starterImages[index % starterImages.length]} alt={starter.name} />
-                <span>{starter.status === "setup_pending" ? "Setup pending" : "Ready"}</span>
-                <strong>{starter.name}</strong>
-                <p>{starter.persona}</p>
+                <div className="starter-card-media">
+                  <img src={starterImages[starter.id] || starterImages[starter.slug] || fallbackStarterImage(index)} alt={starter.name} />
+                  <div className="starter-card-overlay">
+                    <span>{starter.status === "setup_pending" ? "Setup pending" : "Ready"}</span>
+                    <strong>{starter.name}</strong>
+                    <p>{starter.persona}</p>
+                  </div>
+                </div>
               </button>
             ))}
           </div>
@@ -334,6 +343,11 @@ async function loadState() {
 
 function terminalHarvestStatus(status: string): boolean {
   return ["ready_for_soul_script", "failed", "canceled"].includes(status);
+}
+
+function fallbackStarterImage(index: number) {
+  const images = Object.values(starterImages);
+  return images[index % images.length];
 }
 
 function HarvestProgress({ job }: { job: InstagramHarvestJob }) {

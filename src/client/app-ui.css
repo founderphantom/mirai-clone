@@ -13,11 +13,16 @@
 .starter-card {
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: 20px;
   background: var(--surface);
   color: var(--text);
   text-align: left;
-  box-shadow: 0 10px 24px rgba(15, 15, 15, 0.05);
+  box-shadow: 0 16px 32px rgba(15, 15, 15, 0.10);
+}
+
+/* Override the global .mirai-mobile button { border-radius: 999px } */
+.mirai-mobile .starter-card {
+  border-radius: 20px;
 }
 
 .discovery-card,
@@ -27,37 +32,67 @@
 }
 
 .discovery-card img,
-.library-item img,
-.starter-card img { aspect-ratio: 4 / 5; }
+.library-item img { aspect-ratio: 4 / 5; }
 
 .discovery-card span,
 .library-item div,
-.clone-list article,
-.starter-card strong,
-.starter-card p,
-.starter-card span {
+.clone-list article {
   display: block;
   padding: 10px 12px;
 }
 
-.starter-card span {
-  margin: 10px 10px 0;
-  width: fit-content;
-  border-radius: 999px;
-  background: var(--green-soft);
-  color: #059669;
-  padding: 4px 9px;
-  font-size: 11px;
-  font-weight: 800;
+/* Starter card — portrait with glassmorphism overlay */
+.starter-card-media {
+  position: relative;
+  aspect-ratio: 3 / 4;
 }
 
-.starter-card strong { padding-bottom: 3px; }
+.starter-card-media img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
 
-.starter-card p {
-  padding-top: 0;
-  color: var(--muted);
-  font-size: 13px;
+.starter-card-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 48px 14px 14px;
+  background: linear-gradient(180deg, transparent, rgba(16, 19, 24, 0.82));
+}
+
+.starter-card-overlay span {
+  display: inline-flex;
+  margin-bottom: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  color: #fff;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.starter-card-overlay strong {
+  display: block;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 800;
+  margin-bottom: 3px;
+}
+
+.starter-card-overlay p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
   line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .library-refresh { grid-column: 1 / -1; }
@@ -202,4 +237,19 @@
 
 @media (max-width: 420px) {
   .source-tabs button { font-size: 11px; }
+}
+
+@media (min-width: 720px) {
+  .starter-grid,
+  .discovery-grid,
+  .library-grid {
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  }
+}
+
+@media (min-width: 1180px) {
+  .starter-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+  }
 }

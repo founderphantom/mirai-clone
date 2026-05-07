@@ -11,7 +11,7 @@ const NAV_ITEMS: { id: AppRoute; Icon: LucideIcon; label: string }[] = [
   { id: "create", Icon: Sparkles, label: "Create" },
   { id: "inbox", Icon: Bell, label: "Inbox" },
   { id: "library", Icon: Images, label: "Library" },
-  { id: "me", Icon: UserRound, label: "Me" },
+  { id: "me", Icon: UserRound, label: "Account" },
 ];
 
 const titles: Record<AppRoute, string> = {
@@ -19,7 +19,7 @@ const titles: Record<AppRoute, string> = {
   create: "Create",
   inbox: "Inbox",
   library: "Library",
-  me: "Me",
+  me: "Account",
   clones: "Clones",
   onboarding: "Mirai"
 };

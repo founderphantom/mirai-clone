@@ -34,6 +34,16 @@
   border-radius: 999px;
 }
 
+/* Card-style buttons that use the card's border-radius, not the pill default */
+.mirai-mobile .starter-card { border-radius: 20px; }
+
+/* Sidebar nav items and clone buttons use rectangular radius at desktop */
+.mirai-mobile .sidebar-nav-item { border-radius: 10px; }
+.mirai-mobile .sidebar-clone-btn { border-radius: 9px; }
+.mirai-mobile .sidebar-user { border-radius: 10px; }
+.mirai-mobile .sidebar-signout { border-radius: 9px; }
+.mirai-mobile .sidebar-brand-mark { border-radius: 9px; }
+
 .mobile-topbar {
   position: sticky;
   top: max(10px, env(safe-area-inset-top));
@@ -146,6 +156,8 @@
   gap: 16px;
 }
 
+.mobile-content { padding-bottom: 96px; }
+
 .bottom-tabs {
   position: fixed;
   left: 12px;
@@ -155,9 +167,9 @@
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 4px;
-  padding: 7px;
+  padding: 5px;
   border: 1px solid rgba(229, 231, 235, 0.9);
-  border-radius: 24px;
+  border-radius: 22px;
   background: rgba(255, 255, 255, 0.94);
   backdrop-filter: blur(18px);
   box-shadow: 0 16px 44px rgba(15, 15, 15, 0.14);
@@ -165,7 +177,7 @@
 
 .bottom-tabs button {
   min-width: 0;
-  min-height: 54px;
+  min-height: 48px;
   border: 0;
   background: transparent;
   color: var(--muted);
@@ -174,24 +186,20 @@
   gap: 2px;
 }
 
-.bottom-tabs span { font-size: 11px; }
+.bottom-tabs span { font-size: 10.5px; }
 
 .bottom-tabs .active {
-  color: var(--text);
+  color: #047857;
   background: var(--green-soft);
+  border-radius: 14px;
+  font-weight: 700;
 }
 
-.floating-signout {
-  position: fixed;
-  right: 18px;
-  bottom: 96px;
-  z-index: 12;
-  width: 44px;
-  display: grid;
-  place-items: center;
-  color: var(--muted);
-  box-shadow: 0 12px 24px rgba(15, 15, 15, 0.08);
+.bottom-tabs .active span {
+  color: #047857;
 }
+
+.floating-signout { display: none; }
 
 .app-hero,
 .daily-strip,
@@ -379,8 +387,16 @@
   padding: 0 14px;
 }
 
-.swipe-actions .pass { color: var(--coral); }
-.swipe-actions .like { color: #059669; }
+.swipe-actions .pass {
+  color: var(--coral);
+  border-color: rgba(255, 122, 89, 0.28);
+}
+
+.swipe-actions .like {
+  color: #059669;
+  border-color: rgba(79, 209, 165, 0.4);
+  background: var(--green-soft);
+}
 
 .deck-empty {
   min-height: 360px;
@@ -460,6 +476,315 @@
   max-height: 260px;
   border-radius: 18px;
   border: 1px solid var(--line);
+}
+
+.account-screen { gap: 18px; }
+
+.account-hero,
+.account-card {
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 12px 32px rgba(15, 15, 15, 0.06);
+}
+
+.account-hero {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 18px;
+}
+
+.account-avatar {
+  width: 64px;
+  height: 64px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background:
+    linear-gradient(135deg, rgba(79, 209, 165, 0.24), rgba(245, 158, 11, 0.18)),
+    var(--green-soft);
+  color: #047857;
+  border: 1px solid rgba(79, 209, 165, 0.44);
+  font-size: 26px;
+  font-weight: 900;
+}
+
+.account-identity {
+  display: grid;
+  gap: 6px;
+}
+
+.account-kicker {
+  width: fit-content;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #a7f3d0;
+  border-radius: 999px;
+  background: var(--green-soft);
+  color: #047857;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.account-identity h2,
+.account-perks-card h3 {
+  margin: 0;
+  font-size: 25px;
+  line-height: 1.08;
+  letter-spacing: 0;
+}
+
+.account-identity p,
+.account-card p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.account-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.account-badges span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.account-stat-grid {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.account-stat {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface-2);
+  padding: 12px 10px;
+}
+
+.account-stat strong {
+  font-size: 19px;
+  line-height: 1;
+}
+
+.account-stat span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.account-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.account-card {
+  display: grid;
+  gap: 15px;
+  padding: 16px;
+}
+
+.account-plan-card {
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.account-plan-card .account-card-heading,
+.account-plan-card p,
+.account-plan-card .account-plan-status {
+  grid-column: 1 / -1;
+}
+
+.account-card-heading {
+  display: grid;
+  gap: 4px;
+}
+
+.account-card-heading > span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.account-card-heading strong {
+  font-size: 21px;
+  line-height: 1.1;
+}
+
+.account-plan-status,
+.account-meter > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.account-plan-status span,
+.account-meter span,
+.account-action small,
+.account-system-row small {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.account-plan-status strong { color: #047857; }
+
+.account-primary,
+.account-secondary,
+.me-signout {
+  min-height: 48px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 999px;
+  padding: 0 18px;
+  font-weight: 800;
+}
+
+.account-plan-card .account-primary,
+.account-plan-card .account-secondary {
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 8px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.account-primary {
+  border: 1px solid var(--cta);
+  background: var(--cta);
+  color: #fff;
+}
+
+.account-secondary {
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  color: var(--text);
+}
+
+.me-signout {
+  border: 1px solid rgba(220, 38, 38, 0.22);
+  background: rgba(254, 242, 242, 0.68);
+  color: #dc2626;
+}
+
+.account-meter {
+  display: grid;
+  gap: 8px;
+}
+
+.account-meter strong {
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.account-meter-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #eef2f7;
+}
+
+.account-meter-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #10b981, var(--green));
+}
+
+.account-action,
+.account-system-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.account-action > span,
+.account-system-row > span {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--green-soft);
+  color: #047857;
+}
+
+.account-action div,
+.account-system-row div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.account-action strong,
+.account-system-row strong {
+  font-size: 14px;
+}
+
+.account-system-row > span {
+  position: relative;
+}
+
+.account-system-row > span::after {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #10b981;
+}
+
+.account-perks-card {
+  background:
+    radial-gradient(circle at 100% 0%, rgba(79, 209, 165, 0.2), transparent 40%),
+    #fff;
+}
+
+.account-perks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.account-perks div {
+  min-height: 78px;
+  display: grid;
+  align-content: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface-2);
+  padding: 12px;
+  color: #047857;
+}
+
+.account-perks span {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
 }
 
 /* Sidebar and desktop header hidden by default (mobile) */
@@ -739,6 +1064,74 @@
   .swipe-deck {
     max-width: 480px;
     min-height: 0;
+  }
+
+  .account-screen {
+    max-width: 1440px;
+  }
+
+  .account-hero {
+    grid-template-columns: auto minmax(0, 1fr) minmax(360px, auto);
+    align-items: center;
+    gap: 26px;
+    padding: 28px 32px;
+  }
+
+  .account-avatar {
+    width: 92px;
+    height: 92px;
+    font-size: 34px;
+  }
+
+  .account-identity h2 {
+    font-size: 32px;
+  }
+
+  .account-stat-grid {
+    grid-column: auto;
+    min-width: 360px;
+  }
+
+  .account-grid {
+    grid-template-columns: minmax(280px, 380px) minmax(320px, 1fr) minmax(280px, 380px);
+    align-items: start;
+    gap: 24px;
+  }
+
+  .account-card {
+    padding: 28px;
+  }
+
+  .account-plan-card {
+    gap: 15px;
+    grid-template-columns: 1fr;
+  }
+
+  .account-plan-card .account-card-heading,
+  .account-plan-card p,
+  .account-plan-card .account-plan-status {
+    grid-column: auto;
+  }
+
+  .account-plan-card .account-primary,
+  .account-plan-card .account-secondary {
+    min-height: 48px;
+    padding: 0 18px;
+    font-size: 16px;
+  }
+
+  .account-plan-card {
+    grid-row: span 2;
+  }
+
+  .account-perks-card {
+    grid-column: 1 / -1;
+    grid-template-columns: minmax(220px, 1fr) 2fr;
+    align-items: center;
+  }
+
+  .account-perks {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 

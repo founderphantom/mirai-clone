@@ -1,15 +1,6 @@
-const HASHTAGS = [
-  '#Y2KCafe',
-  '#TokyoNeon',
-  '#DarkAcademia',
-  '#Cottagecore',
-  '#CoastalGirl',
-  '#Streetwear',
-  '#Barbiecore',
-  '#MoodyForest',
-  '#Retrofuturism',
-  '#GoldenHour',
-];
+import { PROOF_LABELS } from '../../../data/landing-niches';
+
+const TRIPLED = [...PROOF_LABELS, ...PROOF_LABELS, ...PROOF_LABELS];
 
 export function SocialProofStrip() {
   return (
@@ -17,8 +8,8 @@ export function SocialProofStrip() {
       <p className="lp-proof__label">Trusted by 10,000+ creators</p>
       <div className="lp-marquee">
         <div className="lp-marquee__track">
-          {[...HASHTAGS, ...HASHTAGS].map((tag, i) => (
-            <span key={i} className="lp-marquee__chip">{tag}</span>
+          {TRIPLED.map((label, i) => (
+            <span key={i} className="lp-marquee__chip">{label}</span>
           ))}
         </div>
       </div>

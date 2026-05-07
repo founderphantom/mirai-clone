@@ -1,25 +1,52 @@
-const ROW1 = [
-  { src: '/landing/clone-y2k-cafe.jpg', label: 'Y2K Cafe' },
-  { src: '/landing/clone-dark-academia.jpg', label: 'Dark Academia' },
-  { src: '/landing/clone-cottagecore-picnic.jpg', label: 'Cottagecore Picnic' },
-  { src: '/landing/clone-coastal-sunset.jpg', label: 'Coastal Sunset' },
-  { src: '/landing/clone-barbiecore.jpg', label: 'Barbiecore' },
-  { src: '/landing/clone-cherry-blossom-seoul.jpg', label: 'Cherry Blossom Seoul' },
-];
+import { useRef, useState, useEffect } from 'react';
+import { GALLERY_NICHES } from '../../../data/landing-niches';
 
-const ROW2 = [
-  { src: '/landing/clone-tokyo-neon.jpg', label: 'Tokyo Neon' },
-  { src: '/landing/clone-streetwear-berlin.jpg', label: 'Streetwear Berlin' },
-  { src: '/landing/clone-moody-forest.jpg', label: 'Moody Forest' },
-  { src: '/landing/clone-retrofuturism.jpg', label: 'Retrofuturism' },
-  { src: '/landing/clone-golden-hour-desert.jpg', label: 'Golden Hour Desert' },
-  { src: '/landing/clone-winter-minimalist.jpg', label: 'Winter Minimalist' },
-];
+function useLazyImage(src: string, rootMargin = '300px') {
+  const ref = useRef<HTMLDivElement>(null);
+  const [resolvedSrc, setResolvedSrc] = useState<string | undefined>();
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setResolvedSrc(src);
+          observer.disconnect();
+        }
+      },
+      { rootMargin }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [src, rootMargin]);
+
+  return { ref, resolvedSrc };
+}
+
+const nicheToSlug = (label: string) =>
+  label.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+
+const ROW1 = GALLERY_NICHES.filter((_, i) => i % 2 === 0).map((n) => ({
+  src: `/landing/gallery/gallery-${nicheToSlug(n.label)}.jpg`,
+  label: n.label,
+}));
+
+const ROW2 = GALLERY_NICHES.filter((_, i) => i % 2 === 1).map((n) => ({
+  src: `/landing/gallery/gallery-${nicheToSlug(n.label)}.jpg`,
+  label: n.label,
+}));
 
 function GalleryCard({ src, label }: { src: string; label: string }) {
+  const { ref, resolvedSrc } = useLazyImage(src, '300px');
+
   return (
-    <div className="lp-gallery__card">
-      <img src={src} alt={label} loading="lazy" />
+    <div className="lp-gallery__card" ref={ref}>
+      {resolvedSrc ? (
+        <img src={resolvedSrc} alt={label} loading="lazy" />
+      ) : (
+        <div className="lp-gallery__card-placeholder" aria-hidden="true" />
+      )}
       <div className="lp-gallery__card-label">{label}</div>
     </div>
   );
@@ -34,14 +61,14 @@ export function GalleryStrip() {
       <div className="lp-gallery">
         <div className="lp-gallery__row">
           <div className="lp-gallery__track">
-            {[...ROW1, ...ROW1].map((card, i) => (
+            {[...ROW1, ...ROW1, ...ROW1].map((card, i) => (
               <GalleryCard key={i} {...card} />
             ))}
           </div>
         </div>
         <div className="lp-gallery__row">
           <div className="lp-gallery__track lp-gallery__track--reverse">
-            {[...ROW2, ...ROW2].map((card, i) => (
+            {[...ROW2, ...ROW2, ...ROW2].map((card, i) => (
               <GalleryCard key={i} {...card} />
             ))}
           </div>

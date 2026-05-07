@@ -336,7 +336,8 @@
 .lp-marquee__track {
   display: flex;
   gap: 12px;
-  animation: marquee-scroll 30s linear infinite;
+  width: max-content;
+  animation: marquee-scroll 60s linear infinite;
 }
 
 .lp-marquee__chip {
@@ -354,7 +355,7 @@
 
 @keyframes marquee-scroll {
   from { transform: translateX(0); }
-  to { transform: translateX(-50%); }
+  to { transform: translateX(-33.333%); }
 }
 
 /* ── How It Works ───────────────────────────────── */
@@ -407,7 +408,8 @@
 .lp-gallery__track {
   display: flex;
   gap: 16px;
-  animation: gallery-left 40s linear infinite;
+  width: max-content;
+  animation: gallery-left 70s linear infinite;
 }
 
 .lp-gallery__track--reverse {
@@ -433,6 +435,12 @@
   object-fit: cover;
 }
 
+.lp-gallery__card-placeholder {
+  width: 100%;
+  height: 100%;
+  background: #f0f0f0;
+}
+
 .lp-gallery__card-label {
   position: absolute;
   bottom: 0;
@@ -449,7 +457,7 @@
 
 @keyframes gallery-left {
   from { transform: translateX(0); }
-  to { transform: translateX(-50%); }
+  to { transform: translateX(-33.333%); }
 }
 
 /* ── Feature Grid ───────────────────────────────── */

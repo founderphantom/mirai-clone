@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react';
-import { motion, useMotionValue, useTransform } from 'motion/react';
+import { motion, useMotionValue, useTransform, AnimatePresence } from 'motion/react';
 
 const CARDS = [
-  { src: '/landing/clone-y2k-cafe.jpg', label: 'Y2K Cafe' },
-  { src: '/landing/clone-tokyo-neon.jpg', label: 'Tokyo Neon' },
-  { src: '/landing/clone-cottagecore-picnic.jpg', label: 'Cottagecore' },
-  { src: '/landing/clone-coastal-sunset.jpg', label: 'Coastal Sunset' },
-  { src: '/landing/clone-dark-academia.jpg', label: 'Dark Academia' },
-  { src: '/landing/clone-streetwear-berlin.jpg', label: 'Streetwear Berlin' },
+  { src: '/landing/hero/hero-aesthetic-vibes.jpg',  label: 'Aesthetic Vibes' },
+  { src: '/landing/hero/hero-retro-futurism.jpg',   label: 'Retro Futurism' },
+  { src: '/landing/hero/hero-bali-vibes.jpg',        label: 'Bali Vibes' },
+  { src: '/landing/hero/hero-grwm.jpg',              label: 'GRWM' },
+  { src: '/landing/hero/hero-indie-aesthetic.jpg',   label: 'Indie Aesthetic' },
+  { src: '/landing/hero/hero-cherry-blossom.jpg',    label: 'Cherry Blossom Seoul' },
+  { src: '/landing/hero/hero-nyc-fashion.jpg',       label: 'NYC Fashion' },
 ];
 
 function DeckCard({
@@ -19,10 +20,10 @@ function DeckCard({
   src: string;
   label: string;
   position: number;
-  onDragEnd: (offset: number) => void;
+  onDragEnd: (offsetX: number, velocityX: number) => void;
 }) {
   const x = useMotionValue(0);
-  const rotate = useTransform(x, [-100, 100], [-8, 8]);
+  const rotate = useTransform(x, [-200, 200], [-12, 12]);
 
   return (
     <motion.div
@@ -35,14 +36,25 @@ function DeckCard({
         position: 'absolute',
       }}
       drag={position === 0 ? 'x' : false}
-      dragConstraints={{ left: -100, right: 100 }}
+      dragConstraints={{ left: -300, right: 300 }}
+      dragElastic={0.15}
+      dragMomentum={false}
       onDragEnd={(_, info) => {
-        if (position === 0) onDragEnd(info.offset.x);
+        if (position === 0) onDragEnd(info.offset.x, info.velocity.x);
       }}
-      animate={position !== 0 ? { rotate: position * 3 - 3, y: position * 8 } : undefined}
-      transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+      animate={
+        position !== 0
+          ? { rotate: position * 3 - 3, y: position * 8, x: 0 }
+          : undefined
+      }
+      transition={{ type: 'spring', stiffness: 400, damping: 35 }}
+      whileDrag={{ scale: 1.02, cursor: 'grabbing' }}
     >
-      <img src={src} alt={label} loading="eager" />
+      <img
+        src={src}
+        alt={label}
+        loading={position === 0 ? 'eager' : 'lazy'}
+      />
     </motion.div>
   );
 }
@@ -57,11 +69,15 @@ export function SwipeDeckHero() {
     return () => clearInterval(id);
   }, []);
 
-  const handleDragEnd = (offset: number) => {
-    if (offset < -50) {
-      setActiveIndex((i) => (i + 1) % CARDS.length);
-    } else if (offset > 50) {
-      setActiveIndex((i) => (i - 1 + CARDS.length) % CARDS.length);
+  const handleDragEnd = (offsetX: number, velocityX: number) => {
+    const byVelocity = Math.abs(velocityX) > 400;
+    const byOffset = Math.abs(offsetX) > 80;
+    if (byVelocity || byOffset) {
+      if (velocityX < 0 || offsetX < 0) {
+        setActiveIndex((i) => (i + 1) % CARDS.length);
+      } else {
+        setActiveIndex((i) => (i - 1 + CARDS.length) % CARDS.length);
+      }
     }
   };
 
@@ -81,7 +97,18 @@ export function SwipeDeckHero() {
           onDragEnd={handleDragEnd}
         />
       ))}
-      <div className="lp-deck__label">{orderedCards[0].label}</div>
+      <AnimatePresence mode="wait">
+        <motion.div
+          key={orderedCards[0].label}
+          className="lp-deck__label"
+          initial={{ opacity: 0, y: 4 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -4 }}
+          transition={{ duration: 0.2 }}
+        >
+          {orderedCards[0].label}
+        </motion.div>
+      </AnimatePresence>
     </div>
   );
 }
