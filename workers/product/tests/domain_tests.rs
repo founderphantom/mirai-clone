@@ -5,8 +5,10 @@ use mirai_product_worker::domain::media_validation::{
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
 use mirai_product_worker::services::accounts::{
-    account_entitlement_snapshot, account_usage_limits, VerifiedIdentity,
+    account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
+    account_usage_limits, VerifiedIdentity,
 };
+use serde_json::json;
 
 #[test]
 fn free_users_can_create_only_one_active_clone() {
@@ -162,4 +164,53 @@ fn account_entitlement_snapshot_preserves_verified_identity_fields() {
     assert_eq!(snapshot.max_active_clones, 7);
     assert_eq!(snapshot.generation_priority, "verified-priority");
     assert!(!snapshot.watermark_exports);
+}
+
+#[test]
+fn account_snapshots_serialize_public_json_as_camel_case() {
+    let identity = VerifiedIdentity {
+        user_id: "user_1".to_string(),
+        email: Some("creator@example.com".to_string()),
+        name: Some("Creator".to_string()),
+        plan: "free".to_string(),
+        max_active_clones: 7,
+        generation_priority: "verified-priority".to_string(),
+        watermark_exports: false,
+    };
+
+    assert_eq!(
+        serde_json::to_value(account_entitlement_snapshot(&identity)).unwrap(),
+        json!({
+            "maxActiveClones": 7,
+            "generationPriority": "verified-priority",
+            "watermarkExports": false,
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(account_usage_limits(&identity, 3)).unwrap(),
+        json!({
+            "activeClones": 3,
+            "maxActiveClones": 7,
+            "plan": "free",
+        })
+    );
+}
+
+#[test]
+fn account_billing_flags_default_false_and_follow_config() {
+    assert!(!account_checkout_enabled(None, None, None));
+    assert!(!account_portal_enabled(None, None));
+
+    assert!(account_checkout_enabled(None, Some("prod_pro"), None));
+    assert!(account_checkout_enabled(None, None, Some("prod_studio")));
+    assert!(account_checkout_enabled(Some("true"), None, None));
+    assert!(!account_checkout_enabled(
+        Some("false"),
+        Some("prod_pro"),
+        None
+    ));
+
+    assert!(account_portal_enabled(None, Some("polar_token")));
+    assert!(account_portal_enabled(Some("true"), None));
+    assert!(!account_portal_enabled(Some("false"), Some("polar_token")));
 }

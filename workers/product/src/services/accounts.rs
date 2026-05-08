@@ -15,6 +15,7 @@ pub struct VerifiedIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageLimits {
     pub active_clones: u32,
     pub max_active_clones: u32,
@@ -30,6 +31,7 @@ pub fn account_usage_limits(identity: &VerifiedIdentity, active_clones: u32) -> 
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EntitlementSnapshot {
     pub max_active_clones: u32,
     pub generation_priority: String,
@@ -42,6 +44,22 @@ pub fn account_entitlement_snapshot(identity: &VerifiedIdentity) -> EntitlementS
         generation_priority: identity.generation_priority.clone(),
         watermark_exports: identity.watermark_exports,
     }
+}
+
+pub fn account_checkout_enabled(
+    checkout_enabled: Option<&str>,
+    pro_product_id: Option<&str>,
+    studio_product_id: Option<&str>,
+) -> bool {
+    explicit_enabled(checkout_enabled)
+        .unwrap_or_else(|| has_config_value(pro_product_id) || has_config_value(studio_product_id))
+}
+
+pub fn account_portal_enabled(
+    portal_enabled: Option<&str>,
+    polar_access_token: Option<&str>,
+) -> bool {
+    explicit_enabled(portal_enabled).unwrap_or_else(|| has_config_value(polar_access_token))
 }
 
 pub async fn upsert_account_from_identity(
@@ -68,8 +86,8 @@ pub async fn upsert_account_from_identity(
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
-          email = COALESCE(excluded.email, accounts.email),
-          display_name = COALESCE(excluded.display_name, accounts.display_name),
+          email = excluded.email,
+          display_name = excluded.display_name,
           plan = excluded.plan,
           max_active_clones = excluded.max_active_clones,
           generation_priority = excluded.generation_priority,
@@ -93,4 +111,20 @@ pub async fn upsert_account_from_identity(
 
 fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
+}
+
+fn explicit_enabled(value: Option<&str>) -> Option<bool> {
+    let normalized = value?.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Some(false);
+    }
+
+    Some(!matches!(
+        normalized.as_str(),
+        "0" | "false" | "no" | "off" | "disabled"
+    ))
+}
+
+fn has_config_value(value: Option<&str>) -> bool {
+    value.map(|value| !value.trim().is_empty()).unwrap_or(false)
 }

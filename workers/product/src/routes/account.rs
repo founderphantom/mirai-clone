@@ -2,8 +2,9 @@ use crate::auth_client::verify_session;
 use crate::db;
 use crate::http::error::ApiError;
 use crate::services::accounts::{
-    account_entitlement_snapshot, account_usage_limits, upsert_account_from_identity,
-    EntitlementSnapshot, UsageLimits, VerifiedIdentity,
+    account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
+    account_usage_limits, upsert_account_from_identity, EntitlementSnapshot, UsageLimits,
+    VerifiedIdentity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -19,6 +20,7 @@ struct AccountResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AccountUser {
     id: String,
     email: Option<String>,
@@ -26,6 +28,7 @@ struct AccountUser {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BillingMetadata {
     checkout_enabled: bool,
     portal_enabled: bool,
@@ -48,7 +51,7 @@ pub async fn get_account(req: Request, ctx: RouteContext<()>) -> WorkerResult<Re
     upsert_account_from_identity(&db, &identity).await?;
 
     let active_clones = count_active_clones(&db, &identity.user_id).await?;
-    let response = build_account_response(identity, active_clones, polar_server(&ctx));
+    let response = build_account_response(identity, active_clones, billing_metadata(&ctx));
 
     Response::from_json(&response)
 }
@@ -73,7 +76,7 @@ async fn count_active_clones(db: &worker::D1Database, user_id: &str) -> WorkerRe
 fn build_account_response(
     identity: VerifiedIdentity,
     active_clones: u32,
-    billing_server: String,
+    billing: BillingMetadata,
 ) -> AccountResponse {
     let usage = account_usage_limits(&identity, active_clones);
     let entitlements = account_entitlement_snapshot(&identity);
@@ -87,11 +90,28 @@ fn build_account_response(
         plan: identity.plan,
         entitlements,
         usage,
-        billing: BillingMetadata {
-            checkout_enabled: true,
-            portal_enabled: true,
-            server: billing_server,
-        },
+        billing,
+    }
+}
+
+fn billing_metadata(ctx: &RouteContext<()>) -> BillingMetadata {
+    let checkout_enabled = env_var(ctx, "CHECKOUT_ENABLED");
+    let portal_enabled = env_var(ctx, "PORTAL_ENABLED");
+    let pro_product_id = env_var(ctx, "POLAR_PRO_PRODUCT_ID");
+    let studio_product_id = env_var(ctx, "POLAR_STUDIO_PRODUCT_ID");
+    let polar_access_token = env_var(ctx, "POLAR_ACCESS_TOKEN");
+
+    BillingMetadata {
+        checkout_enabled: account_checkout_enabled(
+            checkout_enabled.as_deref(),
+            pro_product_id.as_deref(),
+            studio_product_id.as_deref(),
+        ),
+        portal_enabled: account_portal_enabled(
+            portal_enabled.as_deref(),
+            polar_access_token.as_deref(),
+        ),
+        server: polar_server(ctx),
     }
 }
 
@@ -99,4 +119,11 @@ fn polar_server(ctx: &RouteContext<()>) -> String {
     ctx.var("POLAR_SERVER")
         .map(|value| value.to_string())
         .unwrap_or_else(|_| "sandbox".to_string())
+}
+
+fn env_var(ctx: &RouteContext<()>, name: &str) -> Option<String> {
+    ctx.var(name)
+        .ok()
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty())
 }
