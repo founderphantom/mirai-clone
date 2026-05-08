@@ -198,14 +198,32 @@ fn account_snapshots_serialize_public_json_as_camel_case() {
 
 #[test]
 fn account_billing_flags_default_false_and_follow_config() {
-    assert!(!account_checkout_enabled(None, None, None));
+    assert!(!account_checkout_enabled(None, None, None, None));
     assert!(!account_portal_enabled(None, None));
 
-    assert!(account_checkout_enabled(None, Some("prod_pro"), None));
-    assert!(account_checkout_enabled(None, None, Some("prod_studio")));
-    assert!(account_checkout_enabled(Some("true"), None, None));
+    assert!(!account_checkout_enabled(None, None, Some("prod_pro"), None));
+    assert!(!account_checkout_enabled(
+        None,
+        Some("polar_token"),
+        None,
+        None
+    ));
+    assert!(account_checkout_enabled(
+        None,
+        Some("polar_token"),
+        Some("prod_pro"),
+        None
+    ));
+    assert!(account_checkout_enabled(
+        None,
+        Some("polar_token"),
+        None,
+        Some("prod_studio")
+    ));
+    assert!(account_checkout_enabled(Some("true"), None, None, None));
     assert!(!account_checkout_enabled(
         Some("false"),
+        Some("polar_token"),
         Some("prod_pro"),
         None
     ));

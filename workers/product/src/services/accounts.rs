@@ -48,11 +48,14 @@ pub fn account_entitlement_snapshot(identity: &VerifiedIdentity) -> EntitlementS
 
 pub fn account_checkout_enabled(
     checkout_enabled: Option<&str>,
+    polar_access_token: Option<&str>,
     pro_product_id: Option<&str>,
     studio_product_id: Option<&str>,
 ) -> bool {
-    explicit_enabled(checkout_enabled)
-        .unwrap_or_else(|| has_config_value(pro_product_id) || has_config_value(studio_product_id))
+    explicit_enabled(checkout_enabled).unwrap_or_else(|| {
+        has_config_value(polar_access_token)
+            && (has_config_value(pro_product_id) || has_config_value(studio_product_id))
+    })
 }
 
 pub fn account_portal_enabled(

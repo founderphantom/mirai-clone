@@ -104,6 +104,7 @@ fn billing_metadata(ctx: &RouteContext<()>) -> BillingMetadata {
     BillingMetadata {
         checkout_enabled: account_checkout_enabled(
             checkout_enabled.as_deref(),
+            polar_access_token.as_deref(),
             pro_product_id.as_deref(),
             studio_product_id.as_deref(),
         ),
