@@ -1,7 +1,7 @@
 use mirai_product_worker::domain::entitlements::{can_create_clone, Entitlements};
 use mirai_product_worker::domain::idempotency::clone_upload_key;
 use mirai_product_worker::domain::media_validation::{
-    validate_reference_count, ReferenceCountError,
+    is_supported_reference_content_type, validate_reference_count, ReferenceCountError,
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
 
@@ -30,6 +30,25 @@ fn paid_users_can_create_up_to_five_active_clones() {
 }
 
 #[test]
+fn production_entitlement_policy_maps_free_and_paid_limits() {
+    let free = Entitlements::free();
+    let paid = Entitlements::paid();
+
+    assert_eq!(free.max_active_clones, 1);
+    assert_eq!(paid.max_active_clones, 5);
+    assert!(can_create_clone(&free, 0).is_ok());
+    assert_eq!(
+        can_create_clone(&free, 1).unwrap_err(),
+        "clone_limit_reached"
+    );
+    assert!(can_create_clone(&paid, 4).is_ok());
+    assert_eq!(
+        can_create_clone(&paid, 5).unwrap_err(),
+        "clone_limit_reached"
+    );
+}
+
+#[test]
 fn reference_count_must_match_higgsfield_range() {
     assert_eq!(
         validate_reference_count(4),
@@ -41,6 +60,33 @@ fn reference_count_must_match_higgsfield_range() {
         validate_reference_count(21),
         Err(ReferenceCountError::TooMany)
     );
+}
+
+#[test]
+fn supported_reference_content_types_match_upload_policy() {
+    for content_type in [
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+        "image/heic",
+        "image/heif",
+        "IMAGE/JPEG",
+        "Image/Png",
+        "image/jpeg; charset=binary",
+    ] {
+        assert!(
+            is_supported_reference_content_type(content_type),
+            "{content_type} should be supported"
+        );
+    }
+
+    for content_type in ["text/plain", "image/gif", "application/octet-stream"] {
+        assert!(
+            !is_supported_reference_content_type(content_type),
+            "{content_type} should be rejected"
+        );
+    }
 }
 
 #[test]
