@@ -13,16 +13,19 @@ use crate::services::media::media_storage_key;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use uuid::Uuid;
 use worker::{
-    Bucket, File, FormData, FormEntry, HttpMetadata, Request, Response, Result as WorkerResult,
-    RouteContext,
+    Bucket, Delay, File, FormData, FormEntry, HttpMetadata, Request, Response,
+    Result as WorkerResult, RouteContext,
 };
 
 const MIN_REFERENCES: usize = 5;
 const MAX_REFERENCES: usize = 20;
 const MAX_REFERENCE_BYTES: usize = 15 * 1024 * 1024;
 const FILE_FIELDS: [&str; 3] = ["photos", "files", "file"];
+const IDEMPOTENCY_REPLAY_ATTEMPTS: usize = 4;
+const IDEMPOTENCY_REPLAY_DELAY_MS: u64 = 75;
 
 #[derive(Debug, Deserialize)]
 struct CountRow {
@@ -185,6 +188,11 @@ pub async fn manual_upload(mut req: Request, ctx: RouteContext<()>) -> WorkerRes
         break;
     }
     if !clone_reserved {
+        if let Some(response) =
+            wait_for_existing_upload_response(&db, &verified.user_id, &idempotency_key).await?
+        {
+            return Ok(response);
+        }
         return clone_limit_error(&entitlements).to_response();
     }
 
@@ -567,6 +575,25 @@ async fn replay_existing_upload_response(
         .await?
         .map(existing_upload_response)
         .transpose()
+}
+
+async fn wait_for_existing_upload_response(
+    db: &worker::D1Database,
+    user_id: &str,
+    idempotency_key: &str,
+) -> WorkerResult<Option<Response>> {
+    for attempt in 0..IDEMPOTENCY_REPLAY_ATTEMPTS {
+        if attempt > 0 {
+            Delay::from(Duration::from_millis(IDEMPOTENCY_REPLAY_DELAY_MS)).await;
+        }
+        if let Some(response) =
+            replay_existing_upload_response(db, user_id, idempotency_key).await?
+        {
+            return Ok(Some(response));
+        }
+    }
+
+    Ok(None)
 }
 
 fn existing_upload_response(existing: ExistingUploadRow) -> WorkerResult<Response> {
