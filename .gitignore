@@ -18,6 +18,8 @@ dist/
 coverage/
 __pycache__/
 *.pyc
+workers/product/.cargo-bin/
+workers/product/target/
 
 # Cloudflare local state
 .mf/

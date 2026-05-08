@@ -17,6 +17,7 @@ struct HealthBindings {
     niche_research_queue: bool,
     ai: bool,
     auth_service: bool,
+    assets: bool,
 }
 
 pub async fn run(req: Request, env: Env) -> WorkerResult<Response> {
@@ -43,6 +44,34 @@ async fn health(ctx: RouteContext<()>) -> WorkerResult<Response> {
             niche_research_queue: ctx.env.queue("NICHE_RESEARCH_QUEUE").is_ok(),
             ai: ctx.env.ai("AI").is_ok(),
             auth_service: ctx.env.service("AUTH_SERVICE").is_ok(),
+            assets: ctx.env.assets("ASSETS").is_ok(),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn health_bindings_serializes_assets_status() {
+        let body = serde_json::to_value(HealthResponse {
+            ok: true,
+            app: "Mirai".to_string(),
+            bindings: HealthBindings {
+                d1: true,
+                r2: true,
+                clone_training_queue: true,
+                generation_queue: true,
+                niche_research_queue: true,
+                ai: true,
+                auth_service: true,
+                assets: true,
+            },
+        })
+        .expect("health response should serialize");
+
+        assert_eq!(body["bindings"]["assets"], json!(true));
+    }
 }

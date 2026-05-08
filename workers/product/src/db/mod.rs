@@ -1,6 +1,24 @@
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use wasm_bindgen::JsValue;
 use worker::{D1Database, Result as WorkerResult};
+
+#[derive(Debug, Clone, PartialEq)]
+enum D1Param {
+    Null,
+    String(String),
+    Number(f64),
+}
+
+impl D1Param {
+    fn into_js_value(self) -> JsValue {
+        match self {
+            Self::Null => JsValue::NULL,
+            Self::String(value) => value.into(),
+            Self::Number(value) => value.into(),
+        }
+    }
+}
 
 pub async fn first<T: DeserializeOwned>(
     db: &D1Database,
@@ -31,23 +49,57 @@ pub async fn exec(db: &D1Database, sql: &str, params: Vec<Value>) -> WorkerResul
 }
 
 fn bind_values(
-    mut stmt: worker::D1PreparedStatement,
+    stmt: worker::D1PreparedStatement,
     params: Vec<Value>,
 ) -> WorkerResult<worker::D1PreparedStatement> {
-    for value in params {
-        stmt = match value {
-            Value::Null => stmt.bind(&[wasm_bindgen::JsValue::NULL])?,
-            Value::String(value) => stmt.bind(&[value.into()])?,
+    let values = params_to_d1_params(params)
+        .into_iter()
+        .map(D1Param::into_js_value)
+        .collect::<Vec<_>>();
+    stmt.bind(&values)
+}
+
+fn params_to_d1_params(params: Vec<Value>) -> Vec<D1Param> {
+    params
+        .into_iter()
+        .map(|value| match value {
+            Value::Null => D1Param::Null,
+            Value::String(value) => D1Param::String(value),
             Value::Number(value) => {
                 if let Some(number) = value.as_f64() {
-                    stmt.bind(&[number.into()])?
+                    D1Param::Number(number)
                 } else {
-                    stmt.bind(&[value.to_string().into()])?
+                    D1Param::String(value.to_string())
                 }
             }
-            Value::Bool(value) => stmt.bind(&[(if value { 1 } else { 0 }).into()])?,
-            other => stmt.bind(&[other.to_string().into()])?,
-        };
+            Value::Bool(value) => D1Param::Number(if value { 1.0 } else { 0.0 }),
+            other => D1Param::String(other.to_string()),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn converts_all_params_to_one_ordered_parameter_list() {
+        let values = params_to_d1_params(vec![
+            Value::String("creator".to_string()),
+            Value::Number(42.into()),
+            Value::Bool(true),
+            Value::Null,
+        ]);
+
+        assert_eq!(
+            values,
+            vec![
+                D1Param::String("creator".to_string()),
+                D1Param::Number(42.0),
+                D1Param::Number(1.0),
+                D1Param::Null,
+            ]
+        );
     }
-    Ok(stmt)
 }
