@@ -4,6 +4,7 @@ use mirai_product_worker::domain::media_validation::{
     is_supported_reference_content_type, validate_reference_count, ReferenceCountError,
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
+use mirai_product_worker::services::accounts::{account_usage_limits, VerifiedIdentity};
 
 #[test]
 fn free_users_can_create_only_one_active_clone() {
@@ -123,4 +124,20 @@ fn soul_status_transitions_are_explicit() {
         SoulStatus::Ready,
         SoulStatus::Training
     ));
+}
+
+#[test]
+fn account_usage_limits_come_from_verified_identity() {
+    let identity = VerifiedIdentity {
+        user_id: "user_1".to_string(),
+        email: Some("creator@example.com".to_string()),
+        name: Some("Creator".to_string()),
+        plan: "paid".to_string(),
+        max_active_clones: 5,
+    };
+
+    let limits = account_usage_limits(&identity, 3);
+    assert_eq!(limits.active_clones, 3);
+    assert_eq!(limits.max_active_clones, 5);
+    assert_eq!(limits.plan, "paid");
 }

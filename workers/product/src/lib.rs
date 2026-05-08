@@ -1,7 +1,10 @@
-pub mod db;
+mod auth_client;
+mod db;
 pub mod domain;
-pub mod env;
-pub mod http;
+mod env;
+mod http;
+mod routes;
+pub mod services;
 
 use worker::{event, Context, Env, Request, Response, Result as WorkerResult};
 
