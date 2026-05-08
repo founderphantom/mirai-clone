@@ -31,7 +31,7 @@ pub fn normalize_extension(content_type: &str) -> &'static str {
 }
 
 pub fn safe_segment(value: &str) -> String {
-    value
+    let normalized: String = value
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
@@ -41,7 +41,13 @@ pub fn safe_segment(value: &str) -> String {
             }
         })
         .take(96)
-        .collect()
+        .collect();
+
+    if normalized.is_empty() || normalized == "." || normalized == ".." {
+        "segment".to_string()
+    } else {
+        normalized
+    }
 }
 
 #[cfg(test)]
@@ -61,5 +67,12 @@ mod tests {
         assert!(segment
             .chars()
             .all(|ch| { ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') }));
+    }
+
+    #[test]
+    fn safe_segments_have_fallbacks_for_empty_or_dot_only_values() {
+        assert_eq!(safe_segment(""), "segment");
+        assert_eq!(safe_segment("."), "segment");
+        assert_eq!(safe_segment(".."), "segment");
     }
 }

@@ -254,6 +254,9 @@ fn media_safe_segment_is_exported_deterministic_and_capped() {
     assert!(segment
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')));
+    assert_eq!(safe_segment(""), "segment");
+    assert_eq!(safe_segment("."), "segment");
+    assert_eq!(safe_segment(".."), "segment");
 }
 
 #[test]

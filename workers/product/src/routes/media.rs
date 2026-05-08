@@ -72,15 +72,54 @@ pub async fn get_media(req: Request, ctx: RouteContext<()>) -> WorkerResult<Resp
     };
 
     let headers = Headers::new();
-    headers.set("content-type", content_type(row.content_type.as_deref()))?;
+    headers.set("content-type", safe_response_content_type(row.content_type.as_deref()))?;
     headers.set("cache-control", "private, max-age=300")?;
+    headers.set("x-content-type-options", "nosniff")?;
 
     Ok(Response::from_body(body.response_body()?)?.with_headers(headers))
 }
 
-fn content_type(value: Option<&str>) -> &str {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("application/octet-stream")
+fn safe_response_content_type(value: Option<&str>) -> &'static str {
+    let Some(value) = value else {
+        return "application/octet-stream";
+    };
+    let normalized = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "image/jpeg" | "image/jpg" => "image/jpeg",
+        "image/png" => "image/png",
+        "image/webp" => "image/webp",
+        "image/heic" => "image/heic",
+        "image/heif" => "image/heif",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_response_content_type;
+
+    #[test]
+    fn response_content_type_is_allowlisted() {
+        assert_eq!(safe_response_content_type(Some("image/jpeg")), "image/jpeg");
+        assert_eq!(
+            safe_response_content_type(Some("image/png; charset=binary")),
+            "image/png"
+        );
+        assert_eq!(safe_response_content_type(Some("IMAGE/WEBP")), "image/webp");
+        assert_eq!(
+            safe_response_content_type(Some("text/html")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            safe_response_content_type(Some("image/svg+xml")),
+            "application/octet-stream"
+        );
+        assert_eq!(safe_response_content_type(None), "application/octet-stream");
+    }
 }
