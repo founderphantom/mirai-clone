@@ -1,74 +1,9 @@
 {
-	"$schema": "./node_modules/wrangler/config-schema.json",
-	"name": "mirai",
-	"main": "src/server/index.ts",
-	"compatibility_date": "2026-05-04",
-	"compatibility_flags": [
-		"nodejs_compat"
-	],
-	"assets": {
-		"directory": "./dist/client",
-		"binding": "ASSETS",
-		"not_found_handling": "single-page-application",
-		"run_worker_first": [
-			"/api/*",
-			"/polar/webhooks"
-		]
-	},
-	"observability": {
-		"enabled": true
-	},
-	"vars": {
-		"APP_NAME": "Mirai",
-		"APP_URL": "https://mirai.founder-968.workers.dev",
-		"POLAR_SERVER": "sandbox",
-		"HIGGSFIELD_DEFAULT_CHARACTER_ID": "f457e2ec-a3d9-4699-97dd-0cbc4d9fe1a4",
-		"HIGGSFIELD_DEFAULT_STYLE_ID": "3db34ab5-3439-4317-9e03-08dc30852e69",
-		"SCRAPECREATORS_CACHE_TTL_SECONDS": "1800",
-		"DISCOVERY_DEFAULT_REGION": "US",
-		"ANTHROPIC_PERSONA_MODEL": "claude-haiku-4-5-20251001"
-	},
-	"d1_databases": [
-		{
-			"binding": "DB",
-			"database_name": "mirai-db",
-			"migrations_dir": "config/d1/migrations",
-			"database_id": "d1430981-3129-47fc-8f93-4fc2696de239"
-		}
-	],
-	"r2_buckets": [
-		{
-			"binding": "MEDIA",
-			"bucket_name": "mirai-media",
-			"preview_bucket_name": "mirai-media-preview"
-		}
-	],
-	"queues": {
-		"producers": [
-			{
-				"binding": "GENERATION_QUEUE",
-				"queue": "mirai-generation"
-			},
-			{
-				"binding": "ONBOARDING_QUEUE",
-				"queue": "mirai-onboarding"
-			}
-		],
-		"consumers": [
-			{
-				"queue": "mirai-generation",
-				"max_batch_size": 4,
-				"max_batch_timeout": 10,
-				"max_retries": 3,
-				"dead_letter_queue": "mirai-generation-dlq"
-			},
-			{
-				"queue": "mirai-onboarding",
-				"max_batch_size": 4,
-				"max_batch_timeout": 10,
-				"max_retries": 3,
-				"dead_letter_queue": "mirai-onboarding-dlq"
-			}
-		]
-	}
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mirai-config-moved",
+  "main": "workers/product/build/worker/shim.mjs",
+  "compatibility_date": "2026-05-04",
+  "vars": {
+    "CONFIG_NOTE": "Use workers/product/wrangler.product.jsonc or workers/auth/wrangler.auth.jsonc"
+  }
 }

@@ -1,0 +1,77 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "mirai-product",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-05-04",
+  "assets": {
+    "directory": "../../dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/polar/webhooks"]
+  },
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "APP_NAME": "Mirai",
+    "APP_URL": "https://mirai.founder-968.workers.dev",
+    "ENVIRONMENT": "development",
+    "MODERATION_LEVEL": "4",
+    "SCRAPECREATORS_CACHE_TTL_SECONDS": "1800",
+    "DISCOVERY_DEFAULT_REGION": "US"
+  },
+  "services": [
+    {
+      "binding": "AUTH_SERVICE",
+      "service": "mirai-auth"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mirai-db",
+      "migrations_dir": "../../config/d1/migrations",
+      "database_id": "d1430981-3129-47fc-8f93-4fc2696de239"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "mirai-media",
+      "preview_bucket_name": "mirai-media-preview"
+    }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "CLONE_TRAINING_QUEUE", "queue": "mirai-clone-training" },
+      { "binding": "GENERATION_QUEUE", "queue": "mirai-generation" },
+      { "binding": "NICHE_RESEARCH_QUEUE", "queue": "mirai-niche-research" }
+    ],
+    "consumers": [
+      {
+        "queue": "mirai-clone-training",
+        "max_batch_size": 2,
+        "max_batch_timeout": 10,
+        "max_retries": 3,
+        "dead_letter_queue": "mirai-clone-training-dlq"
+      },
+      {
+        "queue": "mirai-generation",
+        "max_batch_size": 4,
+        "max_batch_timeout": 10,
+        "max_retries": 3,
+        "dead_letter_queue": "mirai-generation-dlq"
+      },
+      {
+        "queue": "mirai-niche-research",
+        "max_batch_size": 2,
+        "max_batch_timeout": 30,
+        "max_retries": 2,
+        "dead_letter_queue": "mirai-niche-research-dlq"
+      }
+    ]
+  }
+}
