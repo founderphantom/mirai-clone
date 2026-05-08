@@ -30,3 +30,22 @@ pub fn slugify_handle(value: &str) -> String {
         slug
     }
 }
+
+pub fn handle_with_suffix(base: &str, suffix: u32) -> String {
+    if suffix <= 1 {
+        return base.chars().take(48).collect();
+    }
+
+    let suffix_text = format!("-{suffix}");
+    let prefix_len = 48usize.saturating_sub(suffix_text.len());
+    let mut prefix = base.chars().take(prefix_len).collect::<String>();
+    while prefix.ends_with('-') {
+        prefix.pop();
+    }
+
+    if prefix.is_empty() {
+        format!("my-soul{suffix_text}")
+    } else {
+        format!("{prefix}{suffix_text}")
+    }
+}

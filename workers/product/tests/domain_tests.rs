@@ -8,7 +8,7 @@ use mirai_product_worker::services::accounts::{
     account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
     account_usage_limits, VerifiedIdentity,
 };
-use mirai_product_worker::services::clones::slugify_handle;
+use mirai_product_worker::services::clones::{handle_with_suffix, slugify_handle};
 use mirai_product_worker::services::media::{media_storage_key, normalize_extension, safe_segment};
 use serde_json::json;
 
@@ -273,4 +273,16 @@ fn clone_handle_slug_is_stable() {
     assert_eq!(slugify_handle("My New Soul!!"), "my-new-soul");
     assert_eq!(slugify_handle("!!My Soul"), "my-soul");
     assert_eq!(slugify_handle("   "), "my-soul");
+}
+
+#[test]
+fn clone_handle_suffix_preserves_length_limit() {
+    let base = "a".repeat(48);
+
+    assert_eq!(handle_with_suffix(&base, 1), base);
+    assert_eq!(
+        handle_with_suffix(&base, 12),
+        format!("{}-12", "a".repeat(45))
+    );
+    assert_eq!(handle_with_suffix("my-soul", 3), "my-soul-3");
 }

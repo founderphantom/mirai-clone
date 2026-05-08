@@ -42,10 +42,25 @@ pub async fn all<T: DeserializeOwned>(
 }
 
 pub async fn exec(db: &D1Database, sql: &str, params: Vec<Value>) -> WorkerResult<()> {
+    run(db, sql, params).await?;
+    Ok(())
+}
+
+pub async fn run(db: &D1Database, sql: &str, params: Vec<Value>) -> WorkerResult<worker::D1Result> {
     let stmt = db.prepare(sql);
     let stmt = bind_values(stmt, params)?;
-    stmt.run().await?;
-    Ok(())
+    stmt.run().await
+}
+
+pub async fn batch(
+    db: &D1Database,
+    statements: Vec<(&str, Vec<Value>)>,
+) -> WorkerResult<Vec<worker::D1Result>> {
+    let mut prepared = Vec::with_capacity(statements.len());
+    for (sql, params) in statements {
+        prepared.push(bind_values(db.prepare(sql), params)?);
+    }
+    db.batch(prepared).await
 }
 
 fn bind_values(
