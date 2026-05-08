@@ -24,8 +24,8 @@ const MIN_REFERENCES: usize = 5;
 const MAX_REFERENCES: usize = 20;
 const MAX_REFERENCE_BYTES: usize = 15 * 1024 * 1024;
 const FILE_FIELDS: [&str; 3] = ["photos", "files", "file"];
-const IDEMPOTENCY_REPLAY_ATTEMPTS: usize = 4;
-const IDEMPOTENCY_REPLAY_DELAY_MS: u64 = 75;
+const IDEMPOTENCY_REPLAY_ATTEMPTS: usize = 60;
+const IDEMPOTENCY_REPLAY_DELAY_MS: u64 = 500;
 
 #[derive(Debug, Deserialize)]
 struct CountRow {
@@ -196,6 +196,29 @@ pub async fn manual_upload(mut req: Request, ctx: RouteContext<()>) -> WorkerRes
         return clone_limit_error(&entitlements).to_response();
     }
 
+    if let Err(error) = reserve_training_job(
+        &db,
+        &training_job_id,
+        &verified.user_id,
+        &clone_id,
+        &idempotency_key,
+        reference_count,
+        &now,
+    )
+    .await
+    {
+        let error_message = error.to_string();
+        cleanup_upload_artifacts(&db, &bucket, &verified.user_id, &clone_id, &[]).await?;
+        if is_idempotency_unique_error(&error_message) {
+            if let Some(response) =
+                wait_for_existing_upload_response(&db, &verified.user_id, &idempotency_key).await?
+            {
+                return Ok(response);
+            }
+        }
+        return Err(error);
+    }
+
     let mut media_asset_ids = Vec::with_capacity(reference_count);
     let mut reference_asset_ids = Vec::with_capacity(reference_count);
     let mut uploaded_storage_keys = Vec::with_capacity(reference_count);
@@ -317,27 +340,16 @@ pub async fn manual_upload(mut req: Request, ctx: RouteContext<()>) -> WorkerRes
 
     d1_statements.push((
         r#"
-        INSERT INTO soul_training_jobs (
-          id,
-          user_id,
-          clone_id,
-          provider,
-          status,
-          idempotency_key,
-          reference_count,
-          request_json,
-          response_json,
-          queued_at,
-          updated_at
-        )
-        VALUES (?, ?, ?, 'higgsfield', 'queued', ?, ?, ?, '{}', ?, ?)
+        UPDATE soul_training_jobs
+        SET status = 'queued',
+            request_json = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND user_id = ?
+          AND clone_id = ?
+          AND idempotency_key = ?
         "#,
         vec![
-            json!(training_job_id),
-            json!(verified.user_id),
-            json!(clone_id),
-            json!(idempotency_key),
-            json!(reference_count),
             json!(json!({
                 "source": "manual_upload",
                 "mediaAssetIds": media_asset_ids,
@@ -345,7 +357,10 @@ pub async fn manual_upload(mut req: Request, ctx: RouteContext<()>) -> WorkerRes
             })
             .to_string()),
             json!(now),
-            json!(now),
+            json!(training_job_id),
+            json!(verified.user_id),
+            json!(clone_id),
+            json!(idempotency_key),
         ],
     ));
 
@@ -558,6 +573,7 @@ async fn find_existing_upload(
          AND cp.user_id = stj.user_id
         WHERE stj.user_id = ?
           AND stj.idempotency_key = ?
+          AND stj.status != 'preparing'
           AND cp.deleted_at IS NULL
         LIMIT 1
         "#,
@@ -648,6 +664,60 @@ async fn clone_handle_exists(
     .await?;
 
     Ok(row.map(|row| row.count).unwrap_or(0) > 0)
+}
+
+async fn reserve_training_job(
+    db: &worker::D1Database,
+    job_id: &str,
+    user_id: &str,
+    clone_id: &str,
+    idempotency_key: &str,
+    reference_count: usize,
+    now: &str,
+) -> WorkerResult<()> {
+    let result = db::run(
+        db,
+        r#"
+        INSERT INTO soul_training_jobs (
+          id,
+          user_id,
+          clone_id,
+          provider,
+          status,
+          idempotency_key,
+          reference_count,
+          request_json,
+          response_json,
+          queued_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, 'higgsfield', 'preparing', ?, ?, ?, '{}', ?, ?)
+        "#,
+        vec![
+            json!(job_id),
+            json!(user_id),
+            json!(clone_id),
+            json!(idempotency_key),
+            json!(reference_count),
+            json!(json!({
+                "source": "manual_upload",
+                "state": "preparing",
+            })
+            .to_string()),
+            json!(now),
+            json!(now),
+        ],
+    )
+    .await?;
+
+    if result.success() {
+        Ok(())
+    } else {
+        Err(result
+            .error()
+            .unwrap_or_else(|| "Failed to reserve clone training job.".to_string())
+            .into())
+    }
 }
 
 async fn reserve_clone_profile(
