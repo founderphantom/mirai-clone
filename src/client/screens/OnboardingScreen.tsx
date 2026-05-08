@@ -4,6 +4,7 @@ import type { CSSProperties, FormEvent } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
 import { track } from "../lib/analytics";
+import { UploadReferencePanel } from "./onboarding/UploadReferencePanel";
 import type {
   Clone,
   InspirationBubble,
@@ -36,7 +37,15 @@ const starterImages: Record<string, string> = {
   starter_sienna_cottagecore: "/landing/starters/starter-sienna.jpg",
   starter_kai_cyber_night: "/landing/starters/starter-kai.jpg",
   starter_maya_minimal_clean: "/landing/starters/starter-maya.jpg",
-  starter_rio_festival: "/landing/starters/starter-rio.jpg"
+  starter_rio_festival: "/landing/starters/starter-rio.jpg",
+  starter_rowan_parsons_crit: "/landing/starters/starter-rowan.jpg",
+  starter_liora_downtown_muse: "/landing/starters/starter-liora.jpg",
+  starter_dorian_experimental_dresser: "/landing/starters/starter-dorian.jpg",
+  starter_sable_form_study: "/landing/starters/starter-sable.jpg",
+  starter_vesper_goth_rap_streetwear: "/landing/starters/starter-vesper.jpg",
+  starter_niko_underground_set: "/landing/starters/starter-niko.jpg",
+  starter_ren_niche_designer: "/landing/starters/starter-ren.jpg",
+  starter_mika_archive_layers: "/landing/starters/starter-mika.jpg"
 };
 
 export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void> }) {
@@ -130,9 +139,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
     }
   }
 
-  async function uploadPhotos(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
+  async function uploadPhotos(form: FormData) {
     setBusy(true);
     setError("");
     try {
@@ -283,18 +290,8 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
       )}
 
       {mode === "upload" && (
-        <motion.section className="moment-card" initial={{ y: 12, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
-          <Camera size={24} />
-          <h2>Upload clear reference photos</h2>
-          <p>Use 5 to 15 photos with one person visible. These become identity references for the pending Soul script.</p>
-          <form className="upload-reference-form" onSubmit={uploadPhotos}>
-            <input name="name" placeholder="Soul name" defaultValue="My Soul" />
-            <input name="photos" type="file" accept="image/*" multiple required />
-            <button className="primary" disabled={busy}>
-              {busy ? <Loader2 className="spin" size={16} /> : <Camera size={16} />}
-              Create from uploads
-            </button>
-          </form>
+        <motion.section initial={{ y: 12, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
+          <UploadReferencePanel busy={busy} onSubmit={uploadPhotos} />
         </motion.section>
       )}
 

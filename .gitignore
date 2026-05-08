@@ -2,18 +2,7 @@
 # Codex local configuration
 .codex/
 
-# Claude Flow runtime data
-.claude-flow/data/
-.claude-flow/logs/
-
 # Local agent/runtime state
-.claude/memory.db
-.claude/memory.db-*
-.claude/settings.local.json
-agentdb.rvf
-agentdb.rvf.lock
-ruvector.db
-ruvector.db-*
 
 # Environment variables
 .env
@@ -33,9 +22,6 @@ __pycache__/
 # Cloudflare local state
 .mf/
 
-/.agents/
-/.claude-flow/
 /.idea/
-/.swarm/
-/.claude/
 /.github/
+/docs/

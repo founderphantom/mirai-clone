@@ -9,6 +9,7 @@ import "./mobile.css";
 import "./app-ui.css";
 import "./auth.css";
 import "./onboarding.css";
+import "./onboarding-upload.css";
 
 initErrorTracking();
 initAnalytics();

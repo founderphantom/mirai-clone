@@ -30,7 +30,15 @@ export const STARTER_CHARACTER_TEMPLATES: StarterCharacter[] = [
   starter("starter_sienna_cottagecore", "sienna-cottagecore", "Sienna - Cottagecore", "cottagecore lifestyle creator", 70),
   starter("starter_kai_cyber_night", "kai-cyber-night", "Kai - Cyber Night", "neon nightlife creator", 80),
   starter("starter_maya_minimal_clean", "maya-minimal-clean", "Maya - Minimal Clean", "minimal clean lifestyle creator", 90),
-  starter("starter_rio_festival", "rio-festival", "Rio - Festival", "festival and nightlife creator", 100)
+  starter("starter_rio_festival", "rio-festival", "Rio - Festival", "festival and nightlife creator", 100),
+  starter("starter_rowan_parsons_crit", "rowan-parsons-crit", "Rowan - Parsons Crit", "experimental art-school fashion creator with studio critiques, handmade layers, gallery stairwells, and smart downtown styling", 110),
+  starter("starter_liora_downtown_muse", "liora-downtown-muse", "Liora - Downtown Muse", "downtown fashion creator with vintage slips, sharp coats, gallery openings, mirror fit checks, and late-afternoon city light", 120),
+  starter("starter_dorian_experimental_dresser", "dorian-experimental-dresser", "Dorian - Experimental Dresser", "experimental menswear creator with sculptural outerwear, wide trousers, unusual proportions, and quiet confidence in city architecture", 130),
+  starter("starter_sable_form_study", "sable-form-study", "Sable - Form Study", "form-led fashion creator with monochrome layering, textile closeups, cropped poses, and outfit-first editorial compositions", 140),
+  starter("starter_vesper_goth_rap_streetwear", "vesper-goth-rap-streetwear", "Vesper - Goth Rap Streetwear", "goth-rap avant streetwear creator with black leather, oversized silhouettes, silver hardware, night flash, and distorted club-adjacent energy", 150),
+  starter("starter_niko_underground_set", "niko-underground-set", "Niko - Underground Set", "underground music fashion creator with basement show fits, worn denim, layered merch, film-grain flash, and post-show street portraits", 160),
+  starter("starter_ren_niche_designer", "ren-niche-designer", "Ren - Niche Designer", "niche designer fashion creator with asymmetrical cuts, technical fabrics, quiet Tokyo side streets, and collector-level wardrobe details", 170),
+  starter("starter_mika_archive_layers", "mika-archive-layers", "Mika - Archive Layers", "archive fashion creator with rare jackets, layered skirts and trousers, museum-library textures, and thoughtful outfit breakdowns", 180)
 ];
 
 export async function listStarterCharacters(env: Env): Promise<StarterCharacter[]> {
