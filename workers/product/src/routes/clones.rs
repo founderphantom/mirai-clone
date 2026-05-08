@@ -154,23 +154,37 @@ pub async fn manual_upload(mut req: Request, ctx: RouteContext<()>) -> WorkerRes
     let clone_id = prefixed_id("clone");
     let training_job_id = prefixed_id("train");
     let base_handle = slugify_handle(&display_name);
-    let handle = unique_clone_handle(&db, &verified.user_id, &base_handle).await?;
+    let mut handle = unique_clone_handle(&db, &verified.user_id, &base_handle).await?;
     let now = now_iso_string();
     let bucket = ctx.env.bucket("MEDIA")?;
     let queue = ctx.env.queue("CLONE_TRAINING_QUEUE")?;
 
-    if !reserve_clone_profile(
-        &db,
-        &clone_id,
-        &verified.user_id,
-        &display_name,
-        &handle,
-        reference_count,
-        &now,
-        entitlements.max_active_clones,
-    )
-    .await?
-    {
+    let mut clone_reserved = false;
+    for _ in 0..3 {
+        if reserve_clone_profile(
+            &db,
+            &clone_id,
+            &verified.user_id,
+            &display_name,
+            &handle,
+            reference_count,
+            &now,
+            entitlements.max_active_clones,
+        )
+        .await?
+        {
+            clone_reserved = true;
+            break;
+        }
+
+        if clone_handle_exists(&db, &verified.user_id, &handle).await? {
+            handle = unique_clone_handle(&db, &verified.user_id, &base_handle).await?;
+            continue;
+        }
+
+        break;
+    }
+    if !clone_reserved {
         return clone_limit_error(&entitlements).to_response();
     }
 
@@ -336,6 +350,25 @@ pub async fn manual_upload(mut req: Request, ctx: RouteContext<()>) -> WorkerRes
                         .unwrap_or_else(|| "D1 batch insert failed.".to_string())
                 })
             }) {
+                if is_idempotency_unique_error(&batch_error) {
+                    let cleanup_result = cleanup_upload_artifacts(
+                        &db,
+                        &bucket,
+                        &verified.user_id,
+                        &clone_id,
+                        &uploaded_storage_keys,
+                    )
+                    .await;
+                    if let Some(response) =
+                        replay_existing_upload_response(&db, &verified.user_id, &idempotency_key)
+                            .await?
+                    {
+                        cleanup_result?;
+                        return Ok(response);
+                    }
+                    cleanup_result?;
+                    return Err(batch_error.into());
+                }
                 cleanup_upload_artifacts(
                     &db,
                     &bucket,
@@ -348,6 +381,26 @@ pub async fn manual_upload(mut req: Request, ctx: RouteContext<()>) -> WorkerRes
             }
         }
         Err(error) => {
+            let error_message = error.to_string();
+            if is_idempotency_unique_error(&error_message) {
+                let cleanup_result = cleanup_upload_artifacts(
+                    &db,
+                    &bucket,
+                    &verified.user_id,
+                    &clone_id,
+                    &uploaded_storage_keys,
+                )
+                .await;
+                if let Some(response) =
+                    replay_existing_upload_response(&db, &verified.user_id, &idempotency_key)
+                        .await?
+                {
+                    cleanup_result?;
+                    return Ok(response);
+                }
+                cleanup_result?;
+                return Err(error);
+            }
             cleanup_upload_artifacts(
                 &db,
                 &bucket,
@@ -505,6 +558,36 @@ async fn find_existing_upload(
     .await
 }
 
+async fn replay_existing_upload_response(
+    db: &worker::D1Database,
+    user_id: &str,
+    idempotency_key: &str,
+) -> WorkerResult<Option<Response>> {
+    find_existing_upload(db, user_id, idempotency_key)
+        .await?
+        .map(existing_upload_response)
+        .transpose()
+}
+
+fn existing_upload_response(existing: ExistingUploadRow) -> WorkerResult<Response> {
+    Response::from_json(&ManualUploadResponse {
+        clone: CloneResponse {
+            id: existing.clone_id,
+            display_name: existing.display_name,
+            handle: existing.handle,
+            source: existing.source,
+            status: existing.status,
+            soul_status: existing.soul_status,
+            reference_count_total: existing.reference_count_total,
+        },
+        training_job: TrainingJobResponse {
+            id: existing.training_job_id,
+            status: existing.training_job_status,
+            reference_count: existing.training_job_reference_count,
+        },
+    })
+}
+
 async fn unique_clone_handle(
     db: &worker::D1Database,
     user_id: &str,
@@ -606,10 +689,18 @@ async fn cleanup_upload_artifacts(
     clone_id: &str,
     storage_keys: &[String],
 ) -> WorkerResult<()> {
+    let d1_cleanup_result = cleanup_clone_rows(db, user_id, clone_id).await;
+
     for storage_key in storage_keys {
-        bucket.delete(storage_key.clone()).await?;
+        if let Err(error) = bucket.delete(storage_key.clone()).await {
+            web_sys::console::error_1(
+                &format!("Failed to delete uploaded clone reference '{storage_key}': {error}")
+                    .into(),
+            );
+        }
     }
-    cleanup_clone_rows(db, user_id, clone_id).await
+
+    d1_cleanup_result
 }
 
 async fn cleanup_clone_rows(
@@ -617,29 +708,44 @@ async fn cleanup_clone_rows(
     user_id: &str,
     clone_id: &str,
 ) -> WorkerResult<()> {
-    db::batch(
-        db,
-        vec![
-            (
-                "DELETE FROM clone_reference_assets WHERE user_id = ? AND clone_id = ?",
-                vec![json!(user_id), json!(clone_id)],
-            ),
-            (
-                "DELETE FROM soul_training_jobs WHERE user_id = ? AND clone_id = ?",
-                vec![json!(user_id), json!(clone_id)],
-            ),
-            (
-                "DELETE FROM media_assets WHERE user_id = ? AND clone_id = ?",
-                vec![json!(user_id), json!(clone_id)],
-            ),
-            (
-                "DELETE FROM clone_profiles WHERE user_id = ? AND id = ?",
-                vec![json!(user_id), json!(clone_id)],
-            ),
-        ],
-    )
-    .await?;
-    Ok(())
+    let cleanup_statements = [
+        (
+            "clone_reference_assets",
+            "DELETE FROM clone_reference_assets WHERE user_id = ? AND clone_id = ?",
+        ),
+        (
+            "soul_training_jobs",
+            "DELETE FROM soul_training_jobs WHERE user_id = ? AND clone_id = ?",
+        ),
+        (
+            "media_assets",
+            "DELETE FROM media_assets WHERE user_id = ? AND clone_id = ?",
+        ),
+        (
+            "clone_profiles",
+            "DELETE FROM clone_profiles WHERE user_id = ? AND id = ?",
+        ),
+    ];
+    let mut errors = Vec::new();
+
+    for (table, sql) in cleanup_statements {
+        match db::run(db, sql, vec![json!(user_id), json!(clone_id)]).await {
+            Ok(result) if result.success() => {}
+            Ok(result) => errors.push(format!(
+                "{table}: {}",
+                result
+                    .error()
+                    .unwrap_or_else(|| "D1 cleanup statement failed".to_string())
+            )),
+            Err(error) => errors.push(format!("{table}: {error}")),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("Failed to clean clone upload rows: {}", errors.join("; ")).into())
+    }
 }
 
 fn display_name_from_form(form: &FormData) -> String {
@@ -678,10 +784,35 @@ fn clone_limit_error(entitlements: &Entitlements) -> ApiError {
     )
 }
 
+fn is_idempotency_unique_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("idempotency_key")
+        && (normalized.contains("unique") || normalized.contains("constraint"))
+}
+
 fn prefixed_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4().simple())
 }
 
 fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_idempotency_unique_errors_conservatively() {
+        assert!(is_idempotency_unique_error(
+            "D1_ERROR: UNIQUE constraint failed: soul_training_jobs.idempotency_key"
+        ));
+        assert!(is_idempotency_unique_error(
+            "constraint failed on idempotency_key"
+        ));
+        assert!(!is_idempotency_unique_error(
+            "UNIQUE constraint failed: clone_profiles.user_id, clone_profiles.handle"
+        ));
+        assert!(!is_idempotency_unique_error("network error"));
+    }
 }
