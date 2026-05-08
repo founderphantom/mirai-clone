@@ -30,7 +30,7 @@ pub fn normalize_extension(content_type: &str) -> &'static str {
     }
 }
 
-fn safe_segment(value: &str) -> String {
+pub fn safe_segment(value: &str) -> String {
     value
         .chars()
         .map(|ch| {

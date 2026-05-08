@@ -8,7 +8,7 @@ use mirai_product_worker::services::accounts::{
     account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
     account_usage_limits, VerifiedIdentity,
 };
-use mirai_product_worker::services::media::{media_storage_key, normalize_extension};
+use mirai_product_worker::services::media::{media_storage_key, normalize_extension, safe_segment};
 use serde_json::json;
 
 #[test]
@@ -243,6 +243,17 @@ fn account_billing_flags_default_false_and_follow_config() {
 fn media_storage_key_is_user_scoped() {
     let key = media_storage_key("user/one", "clone:two", "media_abc", "image/png");
     assert_eq!(key, "users/user-one/clones/clone-two/media_abc.png");
+}
+
+#[test]
+fn media_safe_segment_is_exported_deterministic_and_capped() {
+    let input = "user/with:unsafe spaces".repeat(10);
+    let segment = safe_segment(&input);
+    assert_eq!(segment.len(), 96);
+    assert!(segment.contains("user-with-unsafe-spaces"));
+    assert!(segment
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')));
 }
 
 #[test]
