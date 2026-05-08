@@ -18,7 +18,7 @@
     "higgsfield:session:publish": "python scripts/higgsfield_session.py --publish-wrangler",
     "higgsfield:clone:create": "node scripts/create_higgsfield_clone.mjs",
     "product:check": "cd workers/product && cargo check --target wasm32-unknown-unknown",
-    "product:test": "cd workers/product && cargo test --target x86_64-unknown-linux-gnu",
+    "product:test": "bash scripts/test_product_worker.sh",
     "product:build": "bash scripts/build_product_worker.sh",
     "auth:dev": "wrangler dev -c workers/auth/wrangler.auth.jsonc",
     "product:dev": "npm run build:client && npm run product:build && wrangler dev -c workers/product/wrangler.product.jsonc",
