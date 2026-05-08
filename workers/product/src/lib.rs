@@ -1,4 +1,5 @@
 pub mod db;
+pub mod domain;
 pub mod env;
 pub mod http;
 
