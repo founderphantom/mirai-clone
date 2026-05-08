@@ -3,11 +3,13 @@ mod db;
 pub mod domain;
 mod env;
 mod http;
+mod providers;
 mod queues;
 mod routes;
 pub mod services;
 
-use worker::{event, Context, Env, Request, Response, Result as WorkerResult};
+use queues::CloneTrainingMessage;
+use worker::{event, Context, Env, MessageBatch, Request, Response, Result as WorkerResult};
 
 #[event(fetch, respond_with_errors)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> WorkerResult<Response> {
@@ -21,4 +23,13 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
     }
 
     env.assets("ASSETS")?.fetch_request(req).await
+}
+
+#[event(queue)]
+pub async fn queue(
+    batch: MessageBatch<CloneTrainingMessage>,
+    env: Env,
+    _ctx: Context,
+) -> WorkerResult<()> {
+    queues::clone_training::handle_batch(batch, env).await
 }

@@ -10,6 +10,9 @@ use mirai_product_worker::services::accounts::{
 };
 use mirai_product_worker::services::clones::{handle_with_suffix, slugify_handle};
 use mirai_product_worker::services::media::{media_storage_key, normalize_extension, safe_segment};
+use mirai_product_worker::services::provider_accounts::{
+    choose_provider_account, ProviderAccountCandidate,
+};
 use serde_json::json;
 
 #[test]
@@ -244,6 +247,25 @@ fn account_billing_flags_default_false_and_follow_config() {
 fn media_storage_key_is_user_scoped() {
     let key = media_storage_key("user/one", "clone:two", "media_abc", "image/png");
     assert_eq!(key, "users/user-one/clones/clone-two/media_abc.png");
+}
+
+#[test]
+fn provider_selection_skips_unhealthy_accounts() {
+    let candidates = vec![
+        ProviderAccountCandidate {
+            id: "bad".to_string(),
+            health_state: "auth_required".to_string(),
+            active_leases: 0,
+            max_leases: 2,
+        },
+        ProviderAccountCandidate {
+            id: "good".to_string(),
+            health_state: "healthy".to_string(),
+            active_leases: 1,
+            max_leases: 2,
+        },
+    ];
+    assert_eq!(choose_provider_account(&candidates).unwrap().id, "good");
 }
 
 #[test]
