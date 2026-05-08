@@ -8,12 +8,17 @@ SCRAPECREATORS_API_KEY=
 POLAR_ACCESS_TOKEN=
 POLAR_WEBHOOK_SECRET=
 POLAR_PRO_PRODUCT_ID=
+POLAR_STUDIO_PRODUCT_ID=
 HIGGSFIELD_JWT=
 HIGGSFIELD_SESSION_ID=
 HIGGSFIELD_CLIENT_COOKIE=
+HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FUFU=
+OPENROUTER_API_KEY=
+OPENCODE_GO_API_KEY=
 ```
 
 Use either `HIGGSFIELD_JWT` for short-lived local testing or `HIGGSFIELD_SESSION_ID` plus `HIGGSFIELD_CLIENT_COOKIE` for Worker-side token refresh.
+Higgsfield tokens are stored as Cloudflare Secrets only. Raw Higgsfield tokens must not be written to D1.
 
 For Polar sandbox setup, see `docs/polar-sandbox-setup.md`. Webhooks are optional until the app has a public URL; checkout can be tested with only `POLAR_ACCESS_TOKEN`, `POLAR_PRO_PRODUCT_ID`, and `POLAR_SERVER=sandbox`.
 
