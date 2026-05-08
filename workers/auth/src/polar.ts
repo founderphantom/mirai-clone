@@ -4,6 +4,11 @@ import type { AuthEnv } from "./auth";
 
 type PolarPluginUse = Parameters<typeof polar>[0]["use"];
 type UnknownRecord = Record<string, unknown>;
+type PolarWebhookPayload = {
+  type?: unknown;
+  data?: unknown;
+  [key: string]: unknown;
+};
 
 export function polarPlugin(env: AuthEnv) {
   if (!env.POLAR_ACCESS_TOKEN) return [];
@@ -54,14 +59,14 @@ export function polarPlugin(env: AuthEnv) {
   ];
 }
 
-async function insertBillingEvent(env: AuthEnv, payload: { type?: unknown; data?: unknown }) {
+async function insertBillingEvent(env: AuthEnv, payload: PolarWebhookPayload) {
   const data = asRecord(payload.data);
 
   await env.DB.prepare(
-    `INSERT INTO billing_events
+    `INSERT OR IGNORE INTO billing_events
       (id, user_id, event_type, polar_customer_id, polar_subscription_id,
-       polar_product_id, payload_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+       polar_product_id, external_event_id, payload_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       createId("bevt"),
@@ -70,10 +75,28 @@ async function insertBillingEvent(env: AuthEnv, payload: { type?: unknown; data?
       extractPolarCustomerId(data),
       extractPolarSubscriptionId(data),
       extractPolarProductId(data),
+      derivePolarExternalEventId(payload),
       toJson(payload),
       nowIso()
     )
     .run();
+}
+
+export function derivePolarExternalEventId(payload: PolarWebhookPayload): string | null {
+  const externalEventId = firstString(
+    payload.id,
+    payload.event_id,
+    payload.eventId,
+    payload.webhook_id,
+    payload.webhookId
+  );
+  if (externalEventId) return externalEventId;
+
+  const eventType = readEventType(payload);
+  const timestamp = firstString(payload.timestamp);
+  const dataId = firstString(asRecord(payload.data)?.id);
+
+  return timestamp && dataId ? `${eventType}:${timestamp}:${dataId}` : null;
 }
 
 function extractPolarUserId(payload: { data?: unknown }): string | null {

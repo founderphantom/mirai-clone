@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import authWorker, { buildVerifiedSessionSnapshot, rewritePolarWebhookRequest } from "../src/index";
 import { createAuth } from "../src/auth";
+import { derivePolarExternalEventId } from "../src/polar";
 import type { AuthEnv } from "../src/auth";
 
 const db = {} as AuthEnv["DB"];
@@ -139,5 +140,28 @@ describe("auth worker routing", () => {
         "https://auth.example.com"
       )
     ).toThrow("BETTER_AUTH_SECRET must be configured outside local development.");
+  });
+});
+
+describe("polar webhook billing events", () => {
+  it("derives stable external event ids from reliable webhook payload fields", () => {
+    expect(
+      derivePolarExternalEventId({
+        type: "subscription.active",
+        id: "evt_top_level",
+        timestamp: "2026-05-08T12:00:00.000Z",
+        data: { id: "sub_123" }
+      })
+    ).toBe("evt_top_level");
+
+    expect(
+      derivePolarExternalEventId({
+        type: "subscription.active",
+        timestamp: "2026-05-08T12:00:00.000Z",
+        data: { id: "sub_123" }
+      })
+    ).toBe("subscription.active:2026-05-08T12:00:00.000Z:sub_123");
+
+    expect(derivePolarExternalEventId({ type: "subscription.active", data: {} })).toBeNull();
   });
 });
