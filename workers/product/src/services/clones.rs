@@ -7,7 +7,7 @@ pub fn slugify_handle(value: &str) -> String {
         if ch.is_ascii_alphanumeric() {
             slug.push(ch);
             previous_dash = false;
-        } else if !previous_dash {
+        } else if !previous_dash && !slug.is_empty() {
             slug.push('-');
             previous_dash = true;
         }

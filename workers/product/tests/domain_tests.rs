@@ -271,5 +271,6 @@ fn normalize_extension_uses_content_type() {
 #[test]
 fn clone_handle_slug_is_stable() {
     assert_eq!(slugify_handle("My New Soul!!"), "my-new-soul");
+    assert_eq!(slugify_handle("!!My Soul"), "my-soul");
     assert_eq!(slugify_handle("   "), "my-soul");
 }
