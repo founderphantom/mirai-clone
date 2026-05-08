@@ -18,6 +18,15 @@ SECRET_NAME = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FUFU"
 WRANGLER_CONFIG = "workers/product/wrangler.product.jsonc"
 
 
+class HttpJsonError(RuntimeError):
+    def __init__(self, url: str, status: int, payload: dict[str, Any] | None, text: str):
+        self.url = url
+        self.status = status
+        self.payload = payload or {}
+        self.text = text
+        super().__init__(f"{url} returned HTTP {status}: {text}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Start Higgsfield device auth and print the Wrangler secret command.",
@@ -58,7 +67,11 @@ def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{url} returned HTTP {error.code}: {detail}") from error
+        try:
+            payload = json.loads(detail)
+        except json.JSONDecodeError:
+            payload = None
+        raise HttpJsonError(url, error.code, payload, detail) from error
 
 
 def first_present(data: dict[str, Any], *keys: str) -> Any:
@@ -77,11 +90,16 @@ def poll_for_token(device_code: str, interval: float, timeout: float) -> dict[st
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(interval)
-        response = post_json(TOKEN_URL, {"deviceCode": device_code})
+        try:
+            response = post_json(TOKEN_URL, {"deviceCode": device_code})
+        except HttpJsonError as error:
+            response = error.payload
+            if error.status >= 500 or not response:
+                raise
         if first_present(response, "refreshToken", "refresh_token"):
             return response
 
-        error = first_present(response, "error", "code")
+        error = first_present(response, "error", "code", "detail")
         if error not in (None, "authorization_pending", "slow_down"):
             raise RuntimeError(f"token polling failed: {response}")
         if error == "slow_down":

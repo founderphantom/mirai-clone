@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ProviderAccountCandidate {
     pub id: String,
     pub health_state: String,

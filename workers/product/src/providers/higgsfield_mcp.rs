@@ -55,7 +55,12 @@ pub async fn call_tool(
     let request = Request::new_with_init(HIGGSFIELD_MCP_URL, &init)?;
     let mut response = Fetch::Request(request).send().await?;
     let status = response.status_code();
-    let raw_json = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    let response_text = response.text().await.unwrap_or_default();
+    let raw_json = serde_json::from_str::<Value>(&response_text).unwrap_or_else(|_| {
+        json!({
+            "rawText": response_text,
+        })
+    });
 
     if status >= 400 {
         return Err(HiggsfieldMcpError::HttpStatus {
