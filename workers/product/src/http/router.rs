@@ -23,6 +23,10 @@ struct HealthBindings {
 pub async fn run(req: Request, env: Env) -> WorkerResult<Response> {
     Router::new()
         .get_async("/api/account", crate::routes::account::get_account)
+        .post_async(
+            "/api/clones/manual-upload",
+            crate::routes::clones::manual_upload,
+        )
         .get_async("/api/media/:id", crate::routes::media::get_media)
         .get_async("/api/health", |_req, ctx| async move { health(ctx).await })
         .run(req, env)

@@ -3,6 +3,7 @@ mod db;
 pub mod domain;
 mod env;
 mod http;
+mod queues;
 mod routes;
 pub mod services;
 

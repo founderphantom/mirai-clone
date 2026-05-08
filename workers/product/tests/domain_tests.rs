@@ -8,6 +8,7 @@ use mirai_product_worker::services::accounts::{
     account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
     account_usage_limits, VerifiedIdentity,
 };
+use mirai_product_worker::services::clones::slugify_handle;
 use mirai_product_worker::services::media::{media_storage_key, normalize_extension, safe_segment};
 use serde_json::json;
 
@@ -265,4 +266,10 @@ fn normalize_extension_uses_content_type() {
     assert_eq!(normalize_extension("image/png"), "png");
     assert_eq!(normalize_extension("image/webp"), "webp");
     assert_eq!(normalize_extension("image/heic"), "heic");
+}
+
+#[test]
+fn clone_handle_slug_is_stable() {
+    assert_eq!(slugify_handle("My New Soul!!"), "my-new-soul");
+    assert_eq!(slugify_handle("   "), "my-soul");
 }
