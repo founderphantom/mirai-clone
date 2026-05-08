@@ -8,6 +8,7 @@ use mirai_product_worker::services::accounts::{
     account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
     account_usage_limits, VerifiedIdentity,
 };
+use mirai_product_worker::services::media::{media_storage_key, normalize_extension};
 use serde_json::json;
 
 #[test]
@@ -201,7 +202,12 @@ fn account_billing_flags_default_false_and_follow_config() {
     assert!(!account_checkout_enabled(None, None, None, None));
     assert!(!account_portal_enabled(None, None));
 
-    assert!(!account_checkout_enabled(None, None, Some("prod_pro"), None));
+    assert!(!account_checkout_enabled(
+        None,
+        None,
+        Some("prod_pro"),
+        None
+    ));
     assert!(!account_checkout_enabled(
         None,
         Some("polar_token"),
@@ -231,4 +237,18 @@ fn account_billing_flags_default_false_and_follow_config() {
     assert!(account_portal_enabled(None, Some("polar_token")));
     assert!(account_portal_enabled(Some("true"), None));
     assert!(!account_portal_enabled(Some("false"), Some("polar_token")));
+}
+
+#[test]
+fn media_storage_key_is_user_scoped() {
+    let key = media_storage_key("user/one", "clone:two", "media_abc", "image/png");
+    assert_eq!(key, "users/user-one/clones/clone-two/media_abc.png");
+}
+
+#[test]
+fn normalize_extension_uses_content_type() {
+    assert_eq!(normalize_extension("image/jpeg"), "jpg");
+    assert_eq!(normalize_extension("image/png"), "png");
+    assert_eq!(normalize_extension("image/webp"), "webp");
+    assert_eq!(normalize_extension("image/heic"), "heic");
 }
