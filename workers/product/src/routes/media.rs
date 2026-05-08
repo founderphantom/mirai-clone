@@ -72,7 +72,10 @@ pub async fn get_media(req: Request, ctx: RouteContext<()>) -> WorkerResult<Resp
     };
 
     let headers = Headers::new();
-    headers.set("content-type", safe_response_content_type(row.content_type.as_deref()))?;
+    headers.set(
+        "content-type",
+        safe_response_content_type(row.content_type.as_deref()),
+    )?;
     headers.set("cache-control", "private, max-age=300")?;
     headers.set("x-content-type-options", "nosniff")?;
 
