@@ -1,8 +1,9 @@
-use crate::auth_client::{verify_session, AuthVerifyResponse};
+use crate::auth_client::verify_session;
 use crate::db;
 use crate::http::error::ApiError;
 use crate::services::accounts::{
-    account_usage_limits, upsert_account_from_identity, UsageLimits, VerifiedIdentity,
+    account_entitlement_snapshot, account_usage_limits, upsert_account_from_identity,
+    EntitlementSnapshot, UsageLimits, VerifiedIdentity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -12,7 +13,7 @@ use worker::{Request, Response, Result as WorkerResult, RouteContext};
 struct AccountResponse {
     user: AccountUser,
     plan: String,
-    entitlements: AccountEntitlements,
+    entitlements: EntitlementSnapshot,
     usage: UsageLimits,
     billing: BillingMetadata,
 }
@@ -22,13 +23,6 @@ struct AccountUser {
     id: String,
     email: Option<String>,
     name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct AccountEntitlements {
-    max_active_clones: u32,
-    generation_priority: String,
-    watermark_exports: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,7 +48,7 @@ pub async fn get_account(req: Request, ctx: RouteContext<()>) -> WorkerResult<Re
     upsert_account_from_identity(&db, &identity).await?;
 
     let active_clones = count_active_clones(&db, &identity.user_id).await?;
-    let response = build_account_response(auth, identity, active_clones, polar_server(&ctx));
+    let response = build_account_response(identity, active_clones, polar_server(&ctx));
 
     Response::from_json(&response)
 }
@@ -77,12 +71,12 @@ async fn count_active_clones(db: &worker::D1Database, user_id: &str) -> WorkerRe
 }
 
 fn build_account_response(
-    auth: AuthVerifyResponse,
     identity: VerifiedIdentity,
     active_clones: u32,
     billing_server: String,
 ) -> AccountResponse {
     let usage = account_usage_limits(&identity, active_clones);
+    let entitlements = account_entitlement_snapshot(&identity);
 
     AccountResponse {
         user: AccountUser {
@@ -91,11 +85,7 @@ fn build_account_response(
             name: identity.name,
         },
         plan: identity.plan,
-        entitlements: AccountEntitlements {
-            max_active_clones: auth.entitlements.max_active_clones,
-            generation_priority: auth.entitlements.generation_priority,
-            watermark_exports: auth.entitlements.watermark_exports,
-        },
+        entitlements,
         usage,
         billing: BillingMetadata {
             checkout_enabled: true,

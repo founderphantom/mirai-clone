@@ -4,7 +4,9 @@ use mirai_product_worker::domain::media_validation::{
     is_supported_reference_content_type, validate_reference_count, ReferenceCountError,
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
-use mirai_product_worker::services::accounts::{account_usage_limits, VerifiedIdentity};
+use mirai_product_worker::services::accounts::{
+    account_entitlement_snapshot, account_usage_limits, VerifiedIdentity,
+};
 
 #[test]
 fn free_users_can_create_only_one_active_clone() {
@@ -134,10 +136,30 @@ fn account_usage_limits_come_from_verified_identity() {
         name: Some("Creator".to_string()),
         plan: "paid".to_string(),
         max_active_clones: 5,
+        generation_priority: "high".to_string(),
+        watermark_exports: false,
     };
 
     let limits = account_usage_limits(&identity, 3);
     assert_eq!(limits.active_clones, 3);
     assert_eq!(limits.max_active_clones, 5);
     assert_eq!(limits.plan, "paid");
+}
+
+#[test]
+fn account_entitlement_snapshot_preserves_verified_identity_fields() {
+    let identity = VerifiedIdentity {
+        user_id: "user_1".to_string(),
+        email: Some("creator@example.com".to_string()),
+        name: Some("Creator".to_string()),
+        plan: "free".to_string(),
+        max_active_clones: 7,
+        generation_priority: "verified-priority".to_string(),
+        watermark_exports: false,
+    };
+
+    let snapshot = account_entitlement_snapshot(&identity);
+    assert_eq!(snapshot.max_active_clones, 7);
+    assert_eq!(snapshot.generation_priority, "verified-priority");
+    assert!(!snapshot.watermark_exports);
 }

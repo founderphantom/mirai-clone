@@ -10,6 +10,8 @@ pub struct VerifiedIdentity {
     pub name: Option<String>,
     pub plan: String,
     pub max_active_clones: u32,
+    pub generation_priority: String,
+    pub watermark_exports: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -27,12 +29,27 @@ pub fn account_usage_limits(identity: &VerifiedIdentity, active_clones: u32) -> 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EntitlementSnapshot {
+    pub max_active_clones: u32,
+    pub generation_priority: String,
+    pub watermark_exports: bool,
+}
+
+pub fn account_entitlement_snapshot(identity: &VerifiedIdentity) -> EntitlementSnapshot {
+    EntitlementSnapshot {
+        max_active_clones: identity.max_active_clones,
+        generation_priority: identity.generation_priority.clone(),
+        watermark_exports: identity.watermark_exports,
+    }
+}
+
 pub async fn upsert_account_from_identity(
     db: &D1Database,
     identity: &VerifiedIdentity,
 ) -> WorkerResult<()> {
     let now = now_iso_string();
-    let snapshot = entitlement_snapshot(identity);
+    let snapshot = account_entitlement_snapshot(identity);
 
     db::exec(
         db,
@@ -76,23 +93,4 @@ pub async fn upsert_account_from_identity(
 
 fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
-}
-
-fn entitlement_snapshot(identity: &VerifiedIdentity) -> EntitlementSnapshot {
-    if identity.plan == "paid" {
-        EntitlementSnapshot {
-            generation_priority: "high",
-            watermark_exports: false,
-        }
-    } else {
-        EntitlementSnapshot {
-            generation_priority: "standard",
-            watermark_exports: true,
-        }
-    }
-}
-
-struct EntitlementSnapshot {
-    generation_priority: &'static str,
-    watermark_exports: bool,
 }

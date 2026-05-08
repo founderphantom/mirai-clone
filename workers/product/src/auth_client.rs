@@ -28,6 +28,8 @@ impl AuthVerifyResponse {
             name: self.name.clone(),
             plan: self.plan.clone(),
             max_active_clones: self.entitlements.max_active_clones,
+            generation_priority: self.entitlements.generation_priority.clone(),
+            watermark_exports: self.entitlements.watermark_exports,
         }
     }
 }
