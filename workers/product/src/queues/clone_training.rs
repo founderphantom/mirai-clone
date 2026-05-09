@@ -17,6 +17,8 @@ const HIGGSFIELD_TRAINING_TOOL_VAR: &str = "HIGGSFIELD_MCP_CLONE_TRAINING_TOOL";
 struct TrainingJobRow {
     status: String,
     request_json: String,
+    provider_job_id: Option<String>,
+    response_json: String,
 }
 
 #[derive(Debug, Error)]
@@ -27,6 +29,8 @@ enum CloneTrainingProviderError {
     HiggsfieldMcpToolMissing,
     #[error("No healthy Higgsfield provider account is available.")]
     HiggsfieldProviderAccountUnavailable,
+    #[error("Higgsfield provider access token is invalid.")]
+    HiggsfieldTokenInvalid,
 }
 
 impl CloneTrainingProviderError {
@@ -35,6 +39,7 @@ impl CloneTrainingProviderError {
             Self::HiggsfieldSecretMissing => "higgsfield_secret_missing",
             Self::HiggsfieldMcpToolMissing => "higgsfield_mcp_tool_missing",
             Self::HiggsfieldProviderAccountUnavailable => "higgsfield_provider_account_unavailable",
+            Self::HiggsfieldTokenInvalid => "higgsfield_token_invalid",
         }
     }
 }
@@ -100,7 +105,7 @@ async fn handle_clone_training_message(
     let job = db::first::<TrainingJobRow>(
         db,
         r#"
-        SELECT status, request_json
+        SELECT status, request_json, provider_job_id, response_json
         FROM soul_training_jobs
         WHERE id = ?
           AND user_id = ?
@@ -121,6 +126,9 @@ async fn handle_clone_training_message(
     };
 
     if !matches!(job.status.as_str(), "queued" | "training") {
+        return Ok(());
+    }
+    if has_provider_submission(&job) {
         return Ok(());
     }
 
@@ -192,10 +200,27 @@ async fn handle_clone_training_message(
         Err(error) => return Err(Error::RustError(error.to_string())),
     };
 
-    validate_access_token(&token.access_token)
+    let validation = validate_access_token(&token.access_token)
         .await
         .map_err(|error| Error::RustError(error.to_string()))?;
-    reserve_provider_lease(db, &provider_account.id, job_id).await?;
+    if !validation.valid {
+        mark_provider_action_required(
+            db,
+            job_id,
+            clone_id,
+            user_id,
+            idempotency_key,
+            &CloneTrainingProviderError::HiggsfieldTokenInvalid,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if !reserve_provider_lease(db, &provider_account.id, job_id).await? {
+        return Err(Error::RustError(
+            "clone_training_provider_submission_in_progress".to_string(),
+        ));
+    }
 
     let request_json =
         serde_json::from_str::<Value>(&job.request_json).unwrap_or_else(|_| json!({}));
@@ -227,6 +252,13 @@ async fn handle_clone_training_message(
         &result.raw_json,
     )
     .await
+}
+
+fn has_provider_submission(job: &TrainingJobRow) -> bool {
+    job.provider_job_id
+        .as_deref()
+        .is_some_and(|provider_job_id| !provider_job_id.trim().is_empty())
+        || job.response_json.trim() != "{}"
 }
 
 async fn claim_training_job(
@@ -314,10 +346,10 @@ async fn reserve_provider_lease(
     db: &D1Database,
     provider_account_id: &str,
     job_id: &str,
-) -> WorkerResult<()> {
+) -> WorkerResult<bool> {
     let now = now_iso_string();
     let lease_expires_at = lease_expires_at_iso(30.0);
-    db::exec(
+    let result = db::run(
         db,
         r#"
         INSERT OR IGNORE INTO provider_account_leases (
@@ -339,7 +371,9 @@ async fn reserve_provider_lease(
             json!(now),
         ],
     )
-    .await
+    .await?;
+
+    Ok(changed_rows(&result)? > 0)
 }
 
 async fn record_provider_submission(
@@ -353,7 +387,7 @@ async fn record_provider_submission(
 ) -> WorkerResult<()> {
     let now = now_iso_string();
     let response_json = raw_json.to_string();
-    db::exec(
+    let result = db::run(
         db,
         r#"
         UPDATE soul_training_jobs
@@ -379,7 +413,15 @@ async fn record_provider_submission(
             json!(idempotency_key),
         ],
     )
-    .await
+    .await?;
+
+    if changed_rows(&result)? == 0 {
+        return Err(Error::RustError(
+            "clone_training_submission_record_stale".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn mark_provider_action_required(
@@ -393,21 +435,7 @@ async fn mark_provider_action_required(
     let now = now_iso_string();
     let message = error.to_string();
 
-    db::exec(
-        db,
-        r#"
-        UPDATE clone_profiles
-        SET soul_status = 'provider_action_required',
-            updated_at = ?
-        WHERE id = ?
-          AND user_id = ?
-          AND soul_status IN ('queued', 'training', 'provider_action_required')
-        "#,
-        vec![json!(now), json!(clone_id), json!(user_id)],
-    )
-    .await?;
-
-    db::exec(
+    let job_result = db::run(
         db,
         r#"
         UPDATE soul_training_jobs
@@ -431,6 +459,24 @@ async fn mark_provider_action_required(
             json!(idempotency_key),
         ],
     )
+    .await?;
+
+    if changed_rows(&job_result)? == 0 {
+        return Ok(());
+    }
+
+    db::exec(
+        db,
+        r#"
+        UPDATE clone_profiles
+        SET soul_status = 'provider_action_required',
+            updated_at = ?
+        WHERE id = ?
+          AND user_id = ?
+          AND soul_status IN ('queued', 'training', 'provider_action_required')
+        "#,
+        vec![json!(now), json!(clone_id), json!(user_id)],
+    )
     .await
 }
 
@@ -452,4 +498,33 @@ fn lease_expires_at_iso(minutes_from_now: f64) -> String {
 
 fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_provider_submission, TrainingJobRow};
+
+    fn job(provider_job_id: Option<&str>, response_json: &str) -> TrainingJobRow {
+        TrainingJobRow {
+            status: "training".to_string(),
+            request_json: "{}".to_string(),
+            provider_job_id: provider_job_id.map(ToString::to_string),
+            response_json: response_json.to_string(),
+        }
+    }
+
+    #[test]
+    fn provider_submission_is_present_when_provider_job_id_exists() {
+        assert!(has_provider_submission(&job(Some("hf_job_1"), "{}")));
+        assert!(!has_provider_submission(&job(Some("   "), "{}")));
+    }
+
+    #[test]
+    fn provider_submission_is_present_when_response_json_is_recorded() {
+        assert!(has_provider_submission(&job(
+            None,
+            r#"{"rawText":"accepted"}"#
+        )));
+        assert!(!has_provider_submission(&job(None, "{}")));
+    }
 }
