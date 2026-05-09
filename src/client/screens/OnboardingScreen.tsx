@@ -70,7 +70,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         if (ignore) return;
         setState(next);
         setActiveClone(next.activeClone);
-        setHarvest(next.latestHarvest);
+        setHarvest(next.latestHarvest ?? null);
         setSelectedBubbles(next.bubbles.filter((bubble) => bubble.selected).map((bubble) => bubble.id));
         if (next.bubbles.length > 0) setMode("bubbles");
       })

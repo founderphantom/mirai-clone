@@ -70,7 +70,7 @@ export type InspirationBubble = {
   title: string;
   vibe_summary: string;
   searchQueries: string[];
-  selected: number;
+  selected: boolean;
 };
 
 export type InstagramHarvestJob = {
@@ -86,10 +86,11 @@ export type InstagramHarvestJob = {
 export type OnboardingState = {
   clones: Clone[];
   activeClone: Clone | null;
-  latestHarvest: InstagramHarvestJob | null;
+  latestHarvest?: InstagramHarvestJob | null;
   bubbles: InspirationBubble[];
   inspirationPoolCount: number;
   starters: StarterCharacter[];
+  instagram?: { enabled: boolean; status: string };
 };
 
 export type AppRoute =
