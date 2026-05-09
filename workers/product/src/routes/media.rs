@@ -11,6 +11,8 @@ use worker::{
     RouteContext,
 };
 
+const MAX_MEDIA_BYTES: usize = 15 * 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 struct MediaAssetRow {
     storage_key: Option<String>,
@@ -148,6 +150,11 @@ pub async fn upload_media(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
 
     let bytes = file.bytes().await?;
     let byte_count = bytes.len();
+    if byte_count > MAX_MEDIA_BYTES {
+        return ApiError::bad_request("file_too_large", "Upload an image up to 15 MB.")
+            .to_response();
+    }
+
     let media_id = format!("media_{}", Uuid::new_v4().simple());
     let storage_key = media_storage_key(
         &auth.user_id,
@@ -156,8 +163,8 @@ pub async fn upload_media(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
         &content_type,
     );
 
-    ctx.env
-        .bucket("MEDIA")?
+    let bucket = ctx.env.bucket("MEDIA")?;
+    bucket
         .put(storage_key.clone(), bytes)
         .http_metadata(HttpMetadata {
             content_type: Some(content_type.clone()),
@@ -171,7 +178,7 @@ pub async fn upload_media(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
         .await?;
 
     let now: String = js_sys::Date::new_0().to_iso_string().into();
-    db::exec(
+    let insert_result = db::exec(
         &ctx.env.d1("DB")?,
         r#"
         INSERT INTO media_assets (
@@ -197,7 +204,18 @@ pub async fn upload_media(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
             json!(now),
         ],
     )
-    .await?;
+    .await;
+    if let Err(error) = insert_result {
+        if let Err(cleanup_error) = bucket.delete(storage_key.clone()).await {
+            web_sys::console::error_1(
+                &format!(
+                    "Failed to delete uploaded media object '{storage_key}' after D1 insert failure: {cleanup_error}"
+                )
+                .into(),
+            );
+        }
+        return Err(error);
+    }
 
     Response::from_json(&UploadMediaResponse {
         media: UploadedMedia { id: media_id },
