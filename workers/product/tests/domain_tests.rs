@@ -6,6 +6,7 @@ use mirai_product_worker::domain::media_validation::{
     is_supported_reference_content_type, validate_reference_count, ReferenceCountError,
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
+use mirai_product_worker::routes::onboarding::default_bubbles;
 use mirai_product_worker::services::accounts::{
     account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
     account_usage_limits, VerifiedIdentity,
@@ -102,6 +103,17 @@ fn moderation_level_is_bounded() {
     assert_eq!(clamp_moderation_level(-3), 0);
     assert_eq!(clamp_moderation_level(7), 7);
     assert_eq!(clamp_moderation_level(42), 10);
+}
+
+#[test]
+fn default_bubbles_include_visual_queries() {
+    let bubbles = default_bubbles();
+
+    assert!(bubbles.len() >= 8);
+    assert!(bubbles
+        .iter()
+        .all(|bubble| !bubble.search_queries.is_empty()));
+    assert!(bubbles.iter().any(|bubble| bubble.slug == "y2k-cafe"));
 }
 
 #[test]

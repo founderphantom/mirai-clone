@@ -23,6 +23,18 @@ struct HealthBindings {
 pub async fn run(req: Request, env: Env) -> WorkerResult<Response> {
     Router::new()
         .get_async("/api/account", crate::routes::account::get_account)
+        .get_async(
+            "/api/onboarding/state",
+            crate::routes::onboarding::onboarding_state,
+        )
+        .post_async(
+            "/api/onboarding/bubbles/generate",
+            crate::routes::onboarding::generate_bubbles,
+        )
+        .post_async(
+            "/api/onboarding/bubbles",
+            crate::routes::onboarding::save_bubbles,
+        )
         .post_async(
             "/api/clones/manual-upload",
             crate::routes::clones::manual_upload,

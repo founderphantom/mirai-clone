@@ -6,7 +6,7 @@ mod env;
 mod http;
 mod providers;
 mod queues;
-mod routes;
+pub mod routes;
 pub mod services;
 
 use queues::CloneTrainingMessage;
