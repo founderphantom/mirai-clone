@@ -214,6 +214,31 @@ pub async fn onboarding_state(req: Request, ctx: RouteContext<()>) -> WorkerResu
     })
 }
 
+pub async fn instagram_harvest_status(
+    req: Request,
+    ctx: RouteContext<()>,
+) -> WorkerResult<Response> {
+    match verify_session(&ctx, req.headers()).await? {
+        Some(_) => ApiError::not_found(
+            "instagram_onboarding_unavailable",
+            "Instagram onboarding is not available in this backend phase.",
+        )
+        .to_response(),
+        None => ApiError::unauthorized().to_response(),
+    }
+}
+
+pub async fn adopt_starter(req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
+    match verify_session(&ctx, req.headers()).await? {
+        Some(_) => ApiError::not_found(
+            "starter_onboarding_unavailable",
+            "Starter Souls are not available in this backend phase.",
+        )
+        .to_response(),
+        None => ApiError::unauthorized().to_response(),
+    }
+}
+
 pub async fn generate_bubbles(req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
     let auth = match verify_session(&ctx, req.headers()).await? {
         Some(auth) => auth,

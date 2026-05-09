@@ -24,6 +24,14 @@ pub async fn run(req: Request, env: Env) -> WorkerResult<Response> {
     Router::new()
         .get_async("/api/account", crate::routes::account::get_account)
         .get_async("/api/account/usage", crate::routes::account::get_usage)
+        .get_async(
+            "/api/telemetry/config",
+            crate::routes::telemetry::telemetry_config,
+        )
+        .post_async(
+            "/api/telemetry/events",
+            crate::routes::telemetry::telemetry_events,
+        )
         .get_async("/api/clones", crate::routes::clones::list_clones)
         .get_async(
             "/api/generations",
@@ -44,6 +52,14 @@ pub async fn run(req: Request, env: Env) -> WorkerResult<Response> {
         .get_async(
             "/api/onboarding/state",
             crate::routes::onboarding::onboarding_state,
+        )
+        .get_async(
+            "/api/onboarding/harvest/:id",
+            crate::routes::onboarding::instagram_harvest_status,
+        )
+        .post_async(
+            "/api/onboarding/starter",
+            crate::routes::onboarding::adopt_starter,
         )
         .post_async(
             "/api/onboarding/bubbles/generate",
