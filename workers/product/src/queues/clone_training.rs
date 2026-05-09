@@ -12,6 +12,8 @@ use worker::{D1Database, Env, Error, MessageBatch, MessageExt, Result as WorkerR
 
 const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FUFU";
 const HIGGSFIELD_TRAINING_TOOL_VAR: &str = "HIGGSFIELD_MCP_CLONE_TRAINING_TOOL";
+const ACTIVE_LEASE_MINUTES: f64 = 30.0;
+const SUBMITTED_LEASE_MINUTES: f64 = 360.0;
 
 #[derive(Debug, Deserialize)]
 struct TrainingJobRow {
@@ -19,6 +21,20 @@ struct TrainingJobRow {
     request_json: String,
     provider_job_id: Option<String>,
     response_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderLeaseRow {
+    provider_account_id: String,
+    status: String,
+    lease_expires_at: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProviderLeaseReservation {
+    Acquired,
+    InProgress,
+    Submitted { provider_account_id: String },
 }
 
 #[derive(Debug, Error)]
@@ -216,15 +232,32 @@ async fn handle_clone_training_message(
         return Ok(());
     }
 
-    if !reserve_provider_lease(db, &provider_account.id, job_id).await? {
-        return Err(Error::RustError(
-            "clone_training_provider_submission_in_progress".to_string(),
-        ));
+    match reserve_provider_lease(db, &provider_account.id, job_id).await? {
+        ProviderLeaseReservation::Acquired => {}
+        ProviderLeaseReservation::Submitted {
+            provider_account_id,
+        } => {
+            record_provider_submission_marker(
+                db,
+                job_id,
+                clone_id,
+                user_id,
+                idempotency_key,
+                &provider_account_id,
+            )
+            .await?;
+            return Ok(());
+        }
+        ProviderLeaseReservation::InProgress => {
+            return Err(Error::RustError(
+                "clone_training_provider_submission_in_progress".to_string(),
+            ));
+        }
     }
 
     let request_json =
         serde_json::from_str::<Value>(&job.request_json).unwrap_or_else(|_| json!({}));
-    let result = call_tool(
+    let result = match call_tool(
         &token.access_token,
         json!(job_id),
         &tool_name,
@@ -232,17 +265,21 @@ async fn handle_clone_training_message(
             "jobId": job_id,
             "cloneId": clone_id,
             "userId": user_id,
+            "idempotencyKey": idempotency_key,
             "providerAccountId": provider_account.id,
             "request": request_json,
         }),
     )
     .await
-    .map_err(|error| match error {
-        HiggsfieldMcpError::Worker(worker_error) => worker_error,
-        other => Error::RustError(other.to_string()),
-    })?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            release_provider_lease(db, job_id).await?;
+            return Err(map_mcp_error(error));
+        }
+    };
 
-    record_provider_submission(
+    if let Err(error) = record_provider_submission(
         db,
         job_id,
         clone_id,
@@ -252,6 +289,12 @@ async fn handle_clone_training_message(
         &result.raw_json,
     )
     .await
+    {
+        mark_provider_lease_submitted(db, job_id).await?;
+        return Err(error);
+    }
+
+    mark_provider_lease_submitted(db, job_id).await
 }
 
 fn has_provider_submission(job: &TrainingJobRow) -> bool {
@@ -320,6 +363,7 @@ async fn ensure_clone_training_status(
 }
 
 async fn load_provider_candidates(db: &D1Database) -> WorkerResult<Vec<ProviderAccountCandidate>> {
+    let now = now_iso_string();
     db::all::<ProviderAccountCandidate>(
         db,
         r#"
@@ -331,13 +375,14 @@ async fn load_provider_candidates(db: &D1Database) -> WorkerResult<Vec<ProviderA
         FROM provider_accounts pa
         LEFT JOIN provider_account_leases pal
           ON pal.provider_account_id = pa.id
-         AND pal.status = 'active'
+         AND pal.status IN ('active', 'submitted')
          AND pal.released_at IS NULL
+         AND pal.lease_expires_at > ?
         WHERE pa.provider = 'higgsfield'
           AND pa.disabled_at IS NULL
         GROUP BY pa.id, pa.health_state, pa.capacity_json
         "#,
-        vec![],
+        vec![json!(now)],
     )
     .await
 }
@@ -346,9 +391,9 @@ async fn reserve_provider_lease(
     db: &D1Database,
     provider_account_id: &str,
     job_id: &str,
-) -> WorkerResult<bool> {
+) -> WorkerResult<ProviderLeaseReservation> {
     let now = now_iso_string();
-    let lease_expires_at = lease_expires_at_iso(30.0);
+    let lease_expires_at = lease_expires_at_iso(ACTIVE_LEASE_MINUTES);
     let result = db::run(
         db,
         r#"
@@ -373,7 +418,63 @@ async fn reserve_provider_lease(
     )
     .await?;
 
-    Ok(changed_rows(&result)? > 0)
+    if changed_rows(&result)? > 0 {
+        return Ok(ProviderLeaseReservation::Acquired);
+    }
+
+    let lease = db::first::<ProviderLeaseRow>(
+        db,
+        r#"
+        SELECT provider_account_id, status, lease_expires_at
+        FROM provider_account_leases
+        WHERE job_type = 'clone_training'
+          AND job_id = ?
+        "#,
+        vec![json!(job_id)],
+    )
+    .await?;
+
+    let Some(lease) = lease else {
+        return Ok(ProviderLeaseReservation::InProgress);
+    };
+    if lease.status == "submitted" {
+        return Ok(ProviderLeaseReservation::Submitted {
+            provider_account_id: lease.provider_account_id,
+        });
+    }
+    if lease.status == "active" && !lease_is_expired(&lease.lease_expires_at, &now) {
+        return Ok(ProviderLeaseReservation::InProgress);
+    }
+
+    let result = db::run(
+        db,
+        r#"
+        UPDATE provider_account_leases
+        SET provider_account_id = ?,
+            status = 'active',
+            lease_expires_at = ?,
+            released_at = NULL
+        WHERE job_type = 'clone_training'
+          AND job_id = ?
+          AND (
+            status = 'released'
+            OR lease_expires_at <= ?
+          )
+        "#,
+        vec![
+            json!(provider_account_id),
+            json!(lease_expires_at),
+            json!(job_id),
+            json!(now),
+        ],
+    )
+    .await?;
+
+    if changed_rows(&result)? > 0 {
+        Ok(ProviderLeaseReservation::Acquired)
+    } else {
+        Ok(ProviderLeaseReservation::InProgress)
+    }
 }
 
 async fn record_provider_submission(
@@ -422,6 +523,82 @@ async fn record_provider_submission(
     }
 
     Ok(())
+}
+
+async fn record_provider_submission_marker(
+    db: &D1Database,
+    job_id: &str,
+    clone_id: &str,
+    user_id: &str,
+    idempotency_key: &str,
+    provider_account_id: &str,
+) -> WorkerResult<()> {
+    let now = now_iso_string();
+    db::exec(
+        db,
+        r#"
+        UPDATE soul_training_jobs
+        SET provider_account_id = COALESCE(provider_account_id, ?),
+            response_json = CASE
+              WHEN response_json = '{}' THEN ?
+              ELSE response_json
+            END,
+            updated_at = ?
+        WHERE id = ?
+          AND user_id = ?
+          AND clone_id = ?
+          AND idempotency_key = ?
+          AND status = 'training'
+        "#,
+        vec![
+            json!(provider_account_id),
+            json!(json!({
+                "providerSubmission": "submitted",
+                "source": "provider_lease",
+            })
+            .to_string()),
+            json!(now),
+            json!(job_id),
+            json!(user_id),
+            json!(clone_id),
+            json!(idempotency_key),
+        ],
+    )
+    .await
+}
+
+async fn release_provider_lease(db: &D1Database, job_id: &str) -> WorkerResult<()> {
+    let now = now_iso_string();
+    db::exec(
+        db,
+        r#"
+        UPDATE provider_account_leases
+        SET status = 'released',
+            released_at = ?
+        WHERE job_type = 'clone_training'
+          AND job_id = ?
+          AND status = 'active'
+        "#,
+        vec![json!(now), json!(job_id)],
+    )
+    .await
+}
+
+async fn mark_provider_lease_submitted(db: &D1Database, job_id: &str) -> WorkerResult<()> {
+    let lease_expires_at = lease_expires_at_iso(SUBMITTED_LEASE_MINUTES);
+    db::exec(
+        db,
+        r#"
+        UPDATE provider_account_leases
+        SET status = 'submitted',
+            lease_expires_at = ?
+        WHERE job_type = 'clone_training'
+          AND job_id = ?
+          AND status = 'active'
+        "#,
+        vec![json!(lease_expires_at), json!(job_id)],
+    )
+    .await
 }
 
 async fn mark_provider_action_required(
@@ -487,6 +664,17 @@ fn changed_rows(result: &worker::D1Result) -> WorkerResult<usize> {
         .unwrap_or_default())
 }
 
+fn map_mcp_error(error: HiggsfieldMcpError) -> Error {
+    match error {
+        HiggsfieldMcpError::Worker(worker_error) => worker_error,
+        other => Error::RustError(other.to_string()),
+    }
+}
+
+fn lease_is_expired(lease_expires_at: &str, now: &str) -> bool {
+    lease_expires_at <= now
+}
+
 fn lease_expires_at_iso(minutes_from_now: f64) -> String {
     let now = js_sys::Date::new_0().get_time();
     js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
@@ -502,7 +690,7 @@ fn now_iso_string() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_provider_submission, TrainingJobRow};
+    use super::{has_provider_submission, lease_is_expired, TrainingJobRow};
 
     fn job(provider_job_id: Option<&str>, response_json: &str) -> TrainingJobRow {
         TrainingJobRow {
@@ -526,5 +714,21 @@ mod tests {
             r#"{"rawText":"accepted"}"#
         )));
         assert!(!has_provider_submission(&job(None, "{}")));
+    }
+
+    #[test]
+    fn lease_expiry_uses_iso_timestamp_ordering() {
+        assert!(lease_is_expired(
+            "2026-05-08T12:00:00.000Z",
+            "2026-05-08T12:00:00.000Z"
+        ));
+        assert!(lease_is_expired(
+            "2026-05-08T11:59:59.999Z",
+            "2026-05-08T12:00:00.000Z"
+        ));
+        assert!(!lease_is_expired(
+            "2026-05-08T12:00:00.001Z",
+            "2026-05-08T12:00:00.000Z"
+        ));
     }
 }
