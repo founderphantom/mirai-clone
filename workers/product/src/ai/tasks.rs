@@ -13,7 +13,9 @@ impl AiTask {
     pub fn requires_vision(self) -> bool {
         matches!(
             self,
-            AiTask::PhotoQualityReview | AiTask::HumanPresenceDetection
+            AiTask::PhotoQualityReview
+                | AiTask::HumanPresenceDetection
+                | AiTask::VisualReferenceSelection
         )
     }
 }

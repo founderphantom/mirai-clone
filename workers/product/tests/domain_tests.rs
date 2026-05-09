@@ -49,6 +49,40 @@ fn text_only_models_are_not_chosen_for_vision_tasks() {
 }
 
 #[test]
+fn visual_reference_selection_uses_vision_models() {
+    let models = vec![
+        ModelConfig {
+            provider: "openrouter".to_string(),
+            model: "deepseek/deepseek-v4-pro".to_string(),
+            supports_vision: false,
+            supports_structured_json: true,
+        },
+        ModelConfig {
+            provider: "workers_ai".to_string(),
+            model: "@cf/moonshotai/kimi-k2.6".to_string(),
+            supports_vision: true,
+            supports_structured_json: true,
+        },
+    ];
+
+    let selected = choose_model(AiTask::VisualReferenceSelection, &models).unwrap();
+
+    assert_eq!(selected.provider, "workers_ai");
+}
+
+#[test]
+fn models_without_structured_json_are_rejected() {
+    let models = vec![ModelConfig {
+        provider: "workers_ai".to_string(),
+        model: "@cf/moonshotai/kimi-k2.6".to_string(),
+        supports_vision: true,
+        supports_structured_json: false,
+    }];
+
+    assert!(choose_model(AiTask::HumanPresenceDetection, &models).is_none());
+}
+
+#[test]
 fn deepseek_can_handle_text_tasks() {
     let models = vec![ModelConfig {
         provider: "deepseek".to_string(),
