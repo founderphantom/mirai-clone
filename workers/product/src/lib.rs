@@ -1,3 +1,4 @@
+pub mod ai;
 mod auth_client;
 mod db;
 pub mod domain;

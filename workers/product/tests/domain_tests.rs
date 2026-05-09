@@ -1,3 +1,5 @@
+use mirai_product_worker::ai::model_router::{choose_model, clamp_moderation_level, ModelConfig};
+use mirai_product_worker::ai::tasks::AiTask;
 use mirai_product_worker::domain::entitlements::{can_create_clone, Entitlements};
 use mirai_product_worker::domain::idempotency::clone_upload_key;
 use mirai_product_worker::domain::media_validation::{
@@ -14,6 +16,59 @@ use mirai_product_worker::services::provider_accounts::{
     choose_provider_account, ProviderAccountCandidate,
 };
 use serde_json::json;
+
+#[test]
+fn text_only_models_are_not_chosen_for_vision_tasks() {
+    let text_only = vec![ModelConfig {
+        provider: "deepseek".to_string(),
+        model: "deepseek-v4-pro".to_string(),
+        supports_vision: false,
+        supports_structured_json: true,
+    }];
+    let models = vec![
+        ModelConfig {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            supports_vision: false,
+            supports_structured_json: true,
+        },
+        ModelConfig {
+            provider: "openai".to_string(),
+            model: "gpt-4.1-mini".to_string(),
+            supports_vision: true,
+            supports_structured_json: true,
+        },
+    ];
+
+    assert!(choose_model(AiTask::PhotoQualityReview, &text_only).is_none());
+
+    let selected = choose_model(AiTask::PhotoQualityReview, &models).unwrap();
+
+    assert_eq!(selected.model, "gpt-4.1-mini");
+    assert!(selected.supports_vision);
+}
+
+#[test]
+fn deepseek_can_handle_text_tasks() {
+    let models = vec![ModelConfig {
+        provider: "deepseek".to_string(),
+        model: "deepseek-v4-pro".to_string(),
+        supports_vision: false,
+        supports_structured_json: true,
+    }];
+
+    let selected = choose_model(AiTask::NicheSeedExtraction, &models).unwrap();
+
+    assert_eq!(selected.provider, "deepseek");
+    assert_eq!(selected.model, "deepseek-v4-pro");
+}
+
+#[test]
+fn moderation_level_is_bounded() {
+    assert_eq!(clamp_moderation_level(-3), 0);
+    assert_eq!(clamp_moderation_level(7), 7);
+    assert_eq!(clamp_moderation_level(42), 10);
+}
 
 #[test]
 fn free_users_can_create_only_one_active_clone() {
