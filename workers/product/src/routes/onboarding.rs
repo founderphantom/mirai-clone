@@ -270,9 +270,9 @@ pub async fn save_bubbles(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
     }
 
     ensure_default_bubbles(&db, &auth.user_id, Some(&active_clone.id)).await?;
-    save_selected_bubbles(&db, &auth.user_id, &active_clone.id, &selected_bubble_ids).await?;
     let selected_bubble_ids =
-        load_selected_bubble_ids(&db, &auth.user_id, &active_clone.id).await?;
+        load_matching_bubble_ids(&db, &auth.user_id, &active_clone.id, &selected_bubble_ids)
+            .await?;
     if selected_bubble_ids.is_empty() {
         return ApiError::bad_request(
             "invalid_bubble_selection",
@@ -280,6 +280,7 @@ pub async fn save_bubbles(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
         )
         .to_response();
     }
+    save_selected_bubbles(&db, &auth.user_id, &active_clone.id, &selected_bubble_ids).await?;
 
     let moderation_level = clamp_moderation_level(input.moderation_level.unwrap_or(4));
     ctx.env
@@ -470,11 +471,13 @@ async fn save_selected_bubbles(
     .await
 }
 
-async fn load_selected_bubble_ids(
+async fn load_matching_bubble_ids(
     db: &worker::D1Database,
     user_id: &str,
     clone_id: &str,
+    selected_bubble_ids: &[String],
 ) -> WorkerResult<Vec<String>> {
+    let selected_json = serde_json::to_string(selected_bubble_ids)?;
     let rows = db::all::<IdRow>(
         db,
         r#"
@@ -482,10 +485,14 @@ async fn load_selected_bubble_ids(
         FROM inspiration_bubbles
         WHERE user_id = ?
           AND clone_id = ?
-          AND selected = 1
+          AND EXISTS (
+            SELECT 1
+            FROM json_each(?)
+            WHERE json_each.value = inspiration_bubbles.id
+          )
         ORDER BY sort_order ASC, created_at ASC
         "#,
-        vec![json!(user_id), json!(clone_id)],
+        vec![json!(user_id), json!(clone_id), json!(selected_json)],
     )
     .await?;
 
