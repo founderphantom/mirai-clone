@@ -13,7 +13,7 @@ type UploadReferencePanelProps = {
 };
 
 export function UploadReferencePanel({ busy, onSubmit }: UploadReferencePanelProps) {
-  const [name, setName] = useState("My Soul");
+  const [displayName, setDisplayName] = useState("My Soul");
   const [files, setFiles] = useState<File[]>([]);
   const [touched, setTouched] = useState(false);
   const validation = useMemo(() => validateReferenceFiles(files), [files]);
@@ -26,7 +26,7 @@ export function UploadReferencePanel({ busy, onSubmit }: UploadReferencePanelPro
     if (!validation.valid) return;
 
     const form = new FormData();
-    form.set("name", name.trim() || "My Soul");
+    form.set("displayName", displayName.trim() || "My Soul");
     for (const file of files) form.append("photos", file);
     await onSubmit(form);
   }
@@ -41,7 +41,7 @@ export function UploadReferencePanel({ busy, onSubmit }: UploadReferencePanelPro
           <div>
             <span className="app-kicker">Creator setup</span>
             <h2 id="upload-reference-title">Upload reference photos</h2>
-            <p>Share 5-15 clear images that capture your look, style, and content vibe.</p>
+            <p>Share 5-20 clear images. 8-12 varied photos usually trains the best first Soul.</p>
           </div>
         </div>
 
@@ -49,17 +49,17 @@ export function UploadReferencePanel({ busy, onSubmit }: UploadReferencePanelPro
           <label className="upload-reference-field">
             <span><UserRound size={18} /> Soul name</span>
             <input
-              name="name"
-              onChange={(event) => setName(event.target.value)}
+              name="displayName"
+              onChange={(event) => setDisplayName(event.target.value)}
               placeholder="My Soul"
-              value={name}
+              value={displayName}
             />
           </label>
 
           <div className={validation.valid ? "upload-reference-dropzone ready" : "upload-reference-dropzone"}>
             <input
               aria-describedby="upload-reference-status"
-              aria-label="Choose 5 to 15 reference photos"
+              aria-label="Choose 5 to 20 reference photos"
               disabled={busy}
               multiple
               name="photos"
@@ -85,7 +85,7 @@ export function UploadReferencePanel({ busy, onSubmit }: UploadReferencePanelPro
           >
             <span aria-hidden="true">{validation.valid ? <CheckCircle2 size={16} /> : <ImageIcon size={16} />}</span>
             <div>
-              <strong>{showValidation ? validation.message : "Select 5-15 clear reference photos."}</strong>
+              <strong>{showValidation ? validation.message : "Select 5-20 clear reference photos."}</strong>
               <small>{selectedSummary}</small>
             </div>
           </div>

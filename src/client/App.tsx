@@ -16,12 +16,15 @@ import { authClient } from "./lib/auth-client";
 
 type Clone = {
   id: string;
-  name: string;
+  display_name: string;
   handle: string;
-  persona: string;
-  style_prompt: string;
-  provider_config_json?: string;
-  reference_count?: number;
+  source?: "manual_upload" | "starter" | "future_instagram";
+  status?: "active" | "archived" | "deleting";
+  soul_status?: "draft" | "queued" | "training" | "ready" | "failed" | "provider_action_required";
+  provider?: "higgsfield";
+  provider_soul_id?: string | null;
+  reference_count_total?: number;
+  reference_count_training_selected?: number;
   generation_count?: number;
 };
 
@@ -40,7 +43,7 @@ type Job = {
   clone_id: string;
   clone_name?: string;
   status: string;
-  prompt: string;
+  prompt?: string | null;
   updated_at: string;
   output_count?: number;
   preview_media_id?: string | null;
@@ -205,17 +208,9 @@ function ClonesPage({ clones, reload }: { clones: Clone[]; reload: () => Promise
     setError("");
     try {
       const form = new FormData(formElement);
-      const customReferenceId = String(form.get("customReferenceId") || "").trim();
-      const handle = String(form.get("handle") || "").trim();
-      await api("/api/clones", {
+      await api("/api/clones/manual-upload", {
         method: "POST",
-        body: JSON.stringify({
-          name: form.get("name"),
-          ...(handle ? { handle } : {}),
-          persona: form.get("persona"),
-          stylePrompt: form.get("stylePrompt"),
-          providerConfig: customReferenceId ? { customReferenceId } : undefined
-        })
+        body: form
       });
       formElement.reset();
       await reload();
@@ -231,20 +226,17 @@ function ClonesPage({ clones, reload }: { clones: Clone[]; reload: () => Promise
     <div className="split">
       <form className="panel form-grid" onSubmit={createClone}>
         <h2>New Clone</h2>
-        <input name="name" placeholder="Name" required />
-        <input name="handle" placeholder="Handle" />
-        <textarea name="persona" placeholder="Identity" rows={5} />
-        <textarea name="stylePrompt" placeholder="Visual style" rows={5} />
-        <input name="customReferenceId" placeholder="Higgsfield Soul-ID" />
+        <input name="displayName" placeholder="Soul name" required />
+        <input name="photos" type="file" accept="image/*" multiple required />
         {error && <p className="error">{error}</p>}
         <button className="primary" disabled={busy}>Create clone</button>
       </form>
       <div className="grid-list">
         {clones.map((clone) => (
           <article className="item-card" key={clone.id}>
-            <h3>{clone.name}</h3>
+            <h3>{cloneDisplayName(clone)}</h3>
             <p>@{clone.handle}</p>
-            <footer>{clone.reference_count || 0} refs · {clone.generation_count || 0} jobs</footer>
+            <footer>{clone.reference_count_total || 0} refs · {clone.generation_count || 0} jobs</footer>
           </article>
         ))}
       </div>
@@ -397,7 +389,7 @@ function GeneratePage({
   return (
     <div className="split">
       <form className="panel form-grid" onSubmit={submit}>
-        <h2>{clone?.name || "Select a clone"}</h2>
+        <h2>{clone ? cloneDisplayName(clone) : "Select a clone"}</h2>
         <details className="advanced-field">
           <summary>Prompt override</summary>
           <textarea name="prompt" placeholder="Optional prompt" rows={4} />
@@ -467,7 +459,7 @@ function ClonePicker({ clones, selected, onSelect }: { clones: Clone[]; selected
 
   return (
     <select value={selected} onChange={(event) => onSelect(event.target.value)}>
-      {clones.map((clone) => <option key={clone.id} value={clone.id}>{clone.name}</option>)}
+      {clones.map((clone) => <option key={clone.id} value={clone.id}>{cloneDisplayName(clone)}</option>)}
     </select>
   );
 }
@@ -478,4 +470,8 @@ function FullScreenLoading() {
 
 function viewTitle(view: string) {
   return views.find(([id]) => id === view)?.[2] || "Mirai";
+}
+
+function cloneDisplayName(clone: Clone) {
+  return clone.display_name || clone.handle || "Mirai Soul";
 }

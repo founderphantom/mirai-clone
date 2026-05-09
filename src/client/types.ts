@@ -1,14 +1,14 @@
 export type Clone = {
   id: string;
-  name: string;
+  display_name: string;
   handle: string;
-  persona: string;
-  style_prompt: string;
-  soul_source?: "instagram" | "manual_upload" | "starter" | "manual";
-  soul_status?: "pending_script" | "ready" | "failed";
-  starter_character_id?: string | null;
-  provider_config_json?: string;
-  reference_count?: number;
+  source?: "manual_upload" | "starter" | "future_instagram";
+  status?: "active" | "archived" | "deleting";
+  soul_status?: "draft" | "queued" | "training" | "ready" | "failed" | "provider_action_required";
+  provider?: "higgsfield";
+  provider_soul_id?: string | null;
+  reference_count_total?: number;
+  reference_count_training_selected?: number;
   generation_count?: number;
 };
 
@@ -28,7 +28,7 @@ export type Job = {
   clone_name?: string;
   status: string;
   mode?: "image" | "video";
-  prompt: string;
+  prompt?: string | null;
   updated_at: string;
   output_count?: number;
   preview_media_id?: string | null;

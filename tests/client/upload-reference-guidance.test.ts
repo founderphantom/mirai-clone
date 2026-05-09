@@ -9,21 +9,21 @@ describe("upload reference guidance validation", () => {
   it("requires at least 5 images", () => {
     expect(validateReferenceFiles([file("one.jpg"), file("two.jpg"), file("three.jpg"), file("four.jpg")])).toMatchObject({
       valid: false,
-      message: "Upload at least 5 reference photos."
+      message: "Choose at least 5 reference photos."
     });
   });
 
-  it("accepts 5 to 15 image files up to 15 MB each", () => {
+  it("accepts 5 to 20 image files up to 15 MB each", () => {
     expect(validateReferenceFiles(Array.from({ length: 5 }, (_, index) => file(`${index}.jpg`)))).toMatchObject({
       valid: true,
       message: "5 photos ready."
     });
   });
 
-  it("rejects more than 15 files", () => {
-    expect(validateReferenceFiles(Array.from({ length: 16 }, (_, index) => file(`${index}.jpg`)))).toMatchObject({
+  it("rejects more than 20 files", () => {
+    expect(validateReferenceFiles(Array.from({ length: 21 }, (_, index) => file(`${index}.jpg`)))).toMatchObject({
       valid: false,
-      message: "Upload no more than 15 reference photos."
+      message: "Choose no more than 20 reference photos."
     });
   });
 

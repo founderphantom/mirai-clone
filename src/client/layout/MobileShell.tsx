@@ -77,7 +77,7 @@ export function MobileShell({
                   className={`sidebar-clone-btn${selectedCloneId === clone.id ? " active" : ""}`}
                   onClick={() => onClone(clone.id)}
                 >
-                  {clone.name}
+                  {cloneDisplayName(clone)}
                 </button>
               ))
             )}
@@ -144,7 +144,7 @@ export function MobileShell({
                 key={clone.id}
                 onClick={() => onClone(clone.id)}
               >
-                {clone.name}
+                {cloneDisplayName(clone)}
               </button>
             ))
           )}
@@ -177,4 +177,8 @@ export function MobileShell({
       <BottomTabBar route={route} onRoute={onRoute} />
     </motion.div>
   );
+}
+
+function cloneDisplayName(clone: Clone) {
+  return clone.display_name || clone.handle || "Mirai Soul";
 }
