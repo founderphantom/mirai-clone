@@ -23,6 +23,24 @@ struct HealthBindings {
 pub async fn run(req: Request, env: Env) -> WorkerResult<Response> {
     Router::new()
         .get_async("/api/account", crate::routes::account::get_account)
+        .get_async("/api/account/usage", crate::routes::account::get_usage)
+        .get_async("/api/clones", crate::routes::clones::list_clones)
+        .get_async(
+            "/api/generations",
+            crate::routes::generations::list_generations,
+        )
+        .post_async(
+            "/api/generations",
+            crate::routes::generations::create_generation,
+        )
+        .get_async(
+            "/api/discovery/feed",
+            crate::routes::discovery::discovery_feed,
+        )
+        .post_async(
+            "/api/discovery/refresh",
+            crate::routes::discovery::refresh_discovery,
+        )
         .get_async(
             "/api/onboarding/state",
             crate::routes::onboarding::onboarding_state,
@@ -39,6 +57,7 @@ pub async fn run(req: Request, env: Env) -> WorkerResult<Response> {
             "/api/clones/manual-upload",
             crate::routes::clones::manual_upload,
         )
+        .post_async("/api/media/upload", crate::routes::media::upload_media)
         .get_async("/api/media/:id", crate::routes::media::get_media)
         .get_async("/api/health", |_req, ctx| async move { health(ctx).await })
         .run(req, env)

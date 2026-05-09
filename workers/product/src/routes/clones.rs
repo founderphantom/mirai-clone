@@ -69,8 +69,7 @@ struct ManualUploadResponse {
     training_job: TrainingJobResponse,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Deserialize, Serialize)]
 struct CloneResponse {
     id: String,
     display_name: String,
@@ -472,6 +471,43 @@ pub async fn manual_upload(mut req: Request, ctx: RouteContext<()>) -> WorkerRes
             reference_count,
         },
     })
+}
+
+#[derive(Debug, Serialize)]
+struct CloneListResponse {
+    clones: Vec<CloneResponse>,
+}
+
+pub async fn list_clones(req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
+    let auth = match verify_session(&ctx, req.headers()).await? {
+        Some(auth) => auth,
+        None => return ApiError::unauthorized().to_response(),
+    };
+
+    let db = ctx.env.d1("DB")?;
+    let clones = db::all::<CloneResponse>(
+        &db,
+        r#"
+        SELECT
+          id,
+          display_name,
+          handle,
+          source,
+          status,
+          soul_status,
+          reference_count_total
+        FROM clone_profiles
+        WHERE user_id = ?
+          AND deleted_at IS NULL
+        ORDER BY
+          CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+          updated_at DESC
+        "#,
+        vec![json!(auth.user_id)],
+    )
+    .await?;
+
+    Response::from_json(&CloneListResponse { clones })
 }
 
 fn collect_reference_files(form: &FormData) -> Vec<ReferenceFile> {
