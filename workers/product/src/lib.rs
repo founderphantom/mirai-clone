@@ -9,7 +9,7 @@ mod queues;
 pub mod routes;
 pub mod services;
 
-use queues::CloneTrainingMessage;
+use serde_json::Value;
 use worker::{event, Context, Env, MessageBatch, Request, Response, Result as WorkerResult};
 
 #[event(fetch, respond_with_errors)]
@@ -27,10 +27,6 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
 }
 
 #[event(queue)]
-pub async fn queue(
-    batch: MessageBatch<CloneTrainingMessage>,
-    env: Env,
-    _ctx: Context,
-) -> WorkerResult<()> {
-    queues::clone_training::handle_batch(batch, env).await
+pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> WorkerResult<()> {
+    queues::handle_batch(batch, env).await
 }

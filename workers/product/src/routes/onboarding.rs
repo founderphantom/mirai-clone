@@ -18,9 +18,9 @@ pub struct BubbleSeed {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CloneSummary {
     id: String,
+    name: String,
     display_name: String,
     handle: String,
     source: String,
@@ -40,12 +40,12 @@ struct BubbleRow {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct BubbleResponse {
     id: String,
     slug: String,
     title: String,
     vibe_summary: String,
+    #[serde(rename = "searchQueries")]
     search_queries: Vec<String>,
     selected: bool,
 }
@@ -77,9 +77,16 @@ struct BubblesResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveBubblesRequest {
+    #[serde(alias = "bubbleIds")]
     selected_bubble_ids: Vec<String>,
     clone_id: Option<String>,
     moderation_level: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateBubblesRequest {
+    clone_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,7 +220,11 @@ pub async fn generate_bubbles(req: Request, ctx: RouteContext<()>) -> WorkerResu
         None => return ApiError::unauthorized().to_response(),
     };
     let db = ctx.env.d1("DB")?;
-    let active_clone = load_active_clone(&db, &auth.user_id).await?;
+    let input = read_optional_json::<GenerateBubblesRequest>(req).await?;
+    let active_clone = match input.and_then(|input| input.clone_id) {
+        Some(clone_id) => load_clone_by_id(&db, &auth.user_id, &clone_id).await?,
+        None => load_active_clone(&db, &auth.user_id).await?,
+    };
     let clone_id = active_clone.as_ref().map(|clone| clone.id.as_str());
 
     ensure_default_bubbles(&db, &auth.user_id, clone_id).await?;
@@ -249,16 +260,26 @@ pub async fn save_bubbles(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
             .to_response();
     };
 
+    let selected_bubble_ids = unique_selected_bubble_ids(input.selected_bubble_ids);
+    if selected_bubble_ids.is_empty() || selected_bubble_ids.len() > 5 {
+        return ApiError::bad_request(
+            "invalid_bubble_selection",
+            "Choose between 1 and 5 inspiration bubbles.",
+        )
+        .to_response();
+    }
+
     ensure_default_bubbles(&db, &auth.user_id, Some(&active_clone.id)).await?;
-    save_selected_bubbles(
-        &db,
-        &auth.user_id,
-        &active_clone.id,
-        &input.selected_bubble_ids,
-    )
-    .await?;
+    save_selected_bubbles(&db, &auth.user_id, &active_clone.id, &selected_bubble_ids).await?;
     let selected_bubble_ids =
         load_selected_bubble_ids(&db, &auth.user_id, &active_clone.id).await?;
+    if selected_bubble_ids.is_empty() {
+        return ApiError::bad_request(
+            "invalid_bubble_selection",
+            "Choose at least one available inspiration bubble.",
+        )
+        .to_response();
+    }
 
     let moderation_level = clamp_moderation_level(input.moderation_level.unwrap_or(4));
     ctx.env
@@ -280,7 +301,15 @@ async fn load_clones(db: &worker::D1Database, user_id: &str) -> WorkerResult<Vec
     db::all(
         db,
         r#"
-        SELECT id, display_name, handle, source, status, soul_status, reference_count_total
+        SELECT
+          id,
+          display_name AS name,
+          display_name,
+          handle,
+          source,
+          status,
+          soul_status,
+          reference_count_total
         FROM clone_profiles
         WHERE user_id = ?
           AND deleted_at IS NULL
@@ -309,7 +338,15 @@ async fn load_clone_by_id(
     db::first(
         db,
         r#"
-        SELECT id, display_name, handle, source, status, soul_status, reference_count_total
+        SELECT
+          id,
+          display_name AS name,
+          display_name,
+          handle,
+          source,
+          status,
+          soul_status,
+          reference_count_total
         FROM clone_profiles
         WHERE user_id = ?
           AND id = ?
@@ -455,6 +492,24 @@ async fn load_selected_bubble_ids(
     Ok(rows.into_iter().map(|row| row.id).collect())
 }
 
+async fn read_optional_json<T: for<'de> Deserialize<'de>>(
+    mut req: Request,
+) -> WorkerResult<Option<T>> {
+    Ok(req.json::<T>().await.ok())
+}
+
+fn unique_selected_bubble_ids(ids: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() || unique.iter().any(|existing| existing == id) {
+            continue;
+        }
+        unique.push(id.to_string());
+    }
+    unique
+}
+
 async fn count_inspiration_pool(db: &worker::D1Database, user_id: &str) -> WorkerResult<u32> {
     let row = db::first::<CountRow>(
         db,
@@ -500,4 +555,67 @@ fn deterministic_bubble_id(user_id: &str, clone_id: Option<&str>, slug: &str) ->
 
 fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{unique_selected_bubble_ids, BubbleResponse, CloneSummary, SaveBubblesRequest};
+    use serde_json::json;
+
+    #[test]
+    fn save_bubbles_request_accepts_existing_bubble_ids_contract() {
+        let request = serde_json::from_value::<SaveBubblesRequest>(json!({
+            "cloneId": "clone_1",
+            "bubbleIds": ["bubble_1", "bubble_2"],
+            "moderationLevel": 7
+        }))
+        .unwrap();
+
+        assert_eq!(request.clone_id.as_deref(), Some("clone_1"));
+        assert_eq!(request.selected_bubble_ids, vec!["bubble_1", "bubble_2"]);
+        assert_eq!(request.moderation_level, Some(7));
+    }
+
+    #[test]
+    fn selected_bubble_ids_are_deduped_and_trimmed() {
+        assert_eq!(
+            unique_selected_bubble_ids(vec![
+                " bubble_1 ".to_string(),
+                "bubble_1".to_string(),
+                "".to_string(),
+                "bubble_2".to_string(),
+            ]),
+            vec!["bubble_1".to_string(), "bubble_2".to_string()]
+        );
+    }
+
+    #[test]
+    fn onboarding_responses_keep_current_frontend_field_names() {
+        let clone = serde_json::to_value(CloneSummary {
+            id: "clone_1".to_string(),
+            name: "My Soul".to_string(),
+            display_name: "My Soul".to_string(),
+            handle: "my-soul".to_string(),
+            source: "manual_upload".to_string(),
+            status: "active".to_string(),
+            soul_status: "queued".to_string(),
+            reference_count_total: 5,
+        })
+        .unwrap();
+        let bubble = serde_json::to_value(BubbleResponse {
+            id: "bubble_1".to_string(),
+            slug: "y2k-cafe".to_string(),
+            title: "Y2K Cafe".to_string(),
+            vibe_summary: "Cafe flash.".to_string(),
+            search_queries: vec!["y2k cafe".to_string()],
+            selected: true,
+        })
+        .unwrap();
+
+        assert_eq!(clone["name"], json!("My Soul"));
+        assert_eq!(clone["display_name"], json!("My Soul"));
+        assert_eq!(clone["soul_status"], json!("queued"));
+        assert_eq!(bubble["vibe_summary"], json!("Cafe flash."));
+        assert_eq!(bubble["searchQueries"], json!(["y2k cafe"]));
+    }
 }

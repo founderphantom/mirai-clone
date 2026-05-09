@@ -60,7 +60,7 @@ impl CloneTrainingProviderError {
     }
 }
 
-pub async fn handle_batch(batch: MessageBatch<CloneTrainingMessage>, env: Env) -> WorkerResult<()> {
+pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<()> {
     let db = env.d1("DB")?;
 
     for raw_message in batch.raw_iter() {

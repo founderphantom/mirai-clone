@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use worker::{Env, MessageBatch, MessageExt, Result as WorkerResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,10 +17,7 @@ pub enum NicheResearchMessage {
     },
 }
 
-pub async fn handle_batch(
-    batch: MessageBatch<NicheResearchMessage>,
-    _env: Env,
-) -> WorkerResult<()> {
+pub async fn handle_batch(batch: MessageBatch<Value>, _env: Env) -> WorkerResult<()> {
     for raw_message in batch.raw_iter() {
         let body = match serde_wasm_bindgen::from_value::<NicheResearchMessage>(raw_message.body())
         {
