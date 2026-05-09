@@ -260,8 +260,8 @@ pub async fn save_bubbles(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
             .to_response();
     };
 
-    let selected_bubble_ids = unique_selected_bubble_ids(input.selected_bubble_ids);
-    if selected_bubble_ids.is_empty() || selected_bubble_ids.len() > 5 {
+    let requested_bubble_ids = unique_selected_bubble_ids(input.selected_bubble_ids);
+    if requested_bubble_ids.is_empty() || requested_bubble_ids.len() > 5 {
         return ApiError::bad_request(
             "invalid_bubble_selection",
             "Choose between 1 and 5 inspiration bubbles.",
@@ -269,14 +269,13 @@ pub async fn save_bubbles(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
         .to_response();
     }
 
-    ensure_default_bubbles(&db, &auth.user_id, Some(&active_clone.id)).await?;
     let selected_bubble_ids =
-        load_matching_bubble_ids(&db, &auth.user_id, &active_clone.id, &selected_bubble_ids)
+        load_matching_bubble_ids(&db, &auth.user_id, &active_clone.id, &requested_bubble_ids)
             .await?;
-    if selected_bubble_ids.is_empty() {
+    if !all_requested_bubbles_matched(&selected_bubble_ids, &requested_bubble_ids) {
         return ApiError::bad_request(
             "invalid_bubble_selection",
-            "Choose at least one available inspiration bubble.",
+            "Choose only available inspiration bubbles.",
         )
         .to_response();
     }
@@ -517,6 +516,10 @@ fn unique_selected_bubble_ids(ids: Vec<String>) -> Vec<String> {
     unique
 }
 
+fn all_requested_bubbles_matched(matched_ids: &[String], requested_ids: &[String]) -> bool {
+    matched_ids.len() == requested_ids.len()
+}
+
 async fn count_inspiration_pool(db: &worker::D1Database, user_id: &str) -> WorkerResult<u32> {
     let row = db::first::<CountRow>(
         db,
@@ -566,7 +569,10 @@ fn now_iso_string() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{unique_selected_bubble_ids, BubbleResponse, CloneSummary, SaveBubblesRequest};
+    use super::{
+        all_requested_bubbles_matched, unique_selected_bubble_ids, BubbleResponse, CloneSummary,
+        SaveBubblesRequest,
+    };
     use serde_json::json;
 
     #[test]
@@ -594,6 +600,22 @@ mod tests {
             ]),
             vec!["bubble_1".to_string(), "bubble_2".to_string()]
         );
+    }
+
+    #[test]
+    fn all_requested_bubbles_must_match_available_bubbles() {
+        assert!(all_requested_bubbles_matched(
+            &["bubble_1".to_string(), "bubble_2".to_string()],
+            &["bubble_2".to_string(), "bubble_1".to_string()]
+        ));
+        assert!(!all_requested_bubbles_matched(
+            &["bubble_1".to_string()],
+            &["bubble_1".to_string(), "foreign".to_string()]
+        ));
+        assert!(!all_requested_bubbles_matched(
+            &Vec::<String>::new(),
+            &["foreign".to_string()]
+        ));
     }
 
     #[test]
