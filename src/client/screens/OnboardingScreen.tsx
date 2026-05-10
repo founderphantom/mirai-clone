@@ -1,7 +1,7 @@
 import { AtSign, Camera, Check, Images, Loader2, Sparkles, WandSparkles } from "lucide-react";
 import { motion } from "motion/react";
-import type { CSSProperties, FormEvent } from "react";
-import { useEffect, useMemo, useState } from "react";
+import type { CSSProperties } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { track } from "../lib/analytics";
 import { UploadReferencePanel } from "./onboarding/UploadReferencePanel";
@@ -50,7 +50,7 @@ const starterImages: Record<string, string> = {
 
 export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void> }) {
   const [state, setState] = useState<OnboardingState | null>(null);
-  const [mode, setMode] = useState<OnboardingMode>("instagram");
+  const [mode, setMode] = useState<OnboardingMode>("upload");
   const [activeClone, setActiveClone] = useState<Clone | null>(null);
   const [harvest, setHarvest] = useState<InstagramHarvestJob | null>(null);
   const [selectedBubbles, setSelectedBubbles] = useState<string[]>([]);
@@ -70,7 +70,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         if (ignore) return;
         setState(next);
         setActiveClone(next.activeClone);
-        setHarvest(next.latestHarvest);
+        setHarvest(next.latestHarvest ?? null);
         setSelectedBubbles(next.bubbles.filter((bubble) => bubble.selected).map((bubble) => bubble.id));
         if (next.bubbles.length > 0) setMode("bubbles");
       })
@@ -103,11 +103,6 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
     };
   }, [harvest?.id, harvest?.status]);
 
-  const selectedStarter = useMemo(
-    () => starters.find((starter) => starter.id === clone?.starter_character_id) ?? null,
-    [starters, clone?.starter_character_id]
-  );
-
   async function refreshState() {
     const next = await loadState();
     setState(next);
@@ -117,33 +112,11 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
     return next;
   }
 
-  async function startInstagram(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const instagram = String(form.get("instagram") || "").trim();
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const response = await api<{ job: InstagramHarvestJob }>("/api/onboarding/instagram", {
-        method: "POST",
-        body: JSON.stringify({ instagram })
-      });
-      setHarvest(response.job);
-      setNotice("Harvest started. Mirai is checking public posts for clear reference photos.");
-      track("onboarding_instagram_started", { handle: response.job.handle });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not start Instagram harvest.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function uploadPhotos(form: FormData) {
     setBusy(true);
     setError("");
     try {
-      const response = await api<{ clone: Clone }>("/api/onboarding/upload", {
+      const response = await api<{ clone: Clone }>("/api/clones/manual-upload", {
         method: "POST",
         body: form
       });
@@ -241,10 +214,10 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
       </section>
 
       <section className="source-tabs onboarding-source-tabs" aria-label="Soul source">
-        <button type="button" className={sourceTabClass(mode, "instagram", "source-tab-instagram")} onClick={() => setMode("instagram")}>
+        <button type="button" className={sourceTabClass(mode, "instagram", "source-tab-instagram")} disabled>
           <AtSign size={18} />
           <strong>Instagram</strong>
-          <span>Public profile</span>
+          <span>Coming soon</span>
         </button>
         <button type="button" className={sourceTabClass(mode, "upload", "source-tab-upload")} onClick={() => setMode("upload")}>
           <Camera size={18} />
@@ -267,7 +240,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         <section className="pending-script">
           <Sparkles size={16} />
           <div>
-            <strong>{clone.name}</strong>
+            <strong>{cloneDisplayName(clone)}</strong>
             <span>Soul Character creation pending script</span>
           </div>
         </section>
@@ -276,15 +249,11 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
       {mode === "instagram" && (
         <motion.section className="moment-card primary-moment" initial={{ y: 12, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
           <AtSign size={24} />
-          <h2>Paste your Instagram</h2>
-          <p>Mirai will scan public posts and save up to 12 likely reference photos. If fewer than 5 are usable, upload photos instead.</p>
-          <form className="source-form" onSubmit={startInstagram}>
-            <input name="instagram" placeholder="instagram.com/handle" required />
-            <button className="primary" disabled={busy}>
-              {busy ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-              Start harvest
-            </button>
-          </form>
+          <h2>Instagram import is coming soon</h2>
+          <p>Use manual uploads today. Instagram profile scanning will return once the backend route is ready.</p>
+          <button className="primary" disabled>
+            Coming soon
+          </button>
           {harvest && <HarvestProgress job={harvest} />}
         </motion.section>
       )}
@@ -362,11 +331,14 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         </motion.section>
       )}
 
-      {selectedStarter && <p className="notice">Starter selected: {selectedStarter.name}</p>}
       {notice && <p className="notice">{notice}</p>}
       {error && <p className="error">{error}</p>}
     </div>
   );
+}
+
+function cloneDisplayName(clone: Clone) {
+  return clone.display_name || clone.handle || "Mirai Soul";
 }
 
 async function loadState() {

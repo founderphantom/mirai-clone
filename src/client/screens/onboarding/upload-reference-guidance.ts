@@ -4,7 +4,7 @@ export type ReferenceValidation = {
 };
 
 export const MIN_REFERENCE_PHOTOS = 5;
-export const MAX_REFERENCE_PHOTOS = 15;
+export const MAX_REFERENCE_PHOTOS = 20;
 export const MAX_REFERENCE_PHOTO_BYTES = 15 * 1024 * 1024;
 
 export const REFERENCE_GUIDANCE = [
@@ -46,14 +46,14 @@ export function validateReferenceFiles(files: File[]): ReferenceValidation {
   if (files.length < MIN_REFERENCE_PHOTOS) {
     return {
       valid: false,
-      message: "Upload at least 5 reference photos."
+      message: "Choose at least 5 reference photos."
     };
   }
 
   if (files.length > MAX_REFERENCE_PHOTOS) {
     return {
       valid: false,
-      message: "Upload no more than 15 reference photos."
+      message: "Choose no more than 20 reference photos."
     };
   }
 

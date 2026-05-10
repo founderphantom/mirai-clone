@@ -1,0 +1,23 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "mirai-auth",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "APP_NAME": "Mirai",
+    "APP_URL": "https://mirai.founder-968.workers.dev",
+    "POLAR_SERVER": "sandbox"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mirai-db",
+      "migrations_dir": "../../config/d1/migrations",
+      "database_id": "d1430981-3129-47fc-8f93-4fc2696de239"
+    }
+  ]
+}
