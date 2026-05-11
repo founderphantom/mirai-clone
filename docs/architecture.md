@@ -60,9 +60,9 @@ Cloudflare bindings needed by the Rust Worker:
 - R2: uploaded references, accepted Instagram candidates, generated outputs,
   export variants, and niche research materializations.
 - Queues: clone training, image generation, and niche research refresh.
-- Workers AI: optional first-party model execution via an `AI` binding.
-- Secrets/vars: auth secrets, billing secrets, ScrapeCreators key, AI provider
-  keys, and provider account credentials/session references.
+- Workers AI: app-owned model execution via an `AI` binding.
+- Secrets/vars: auth secrets, billing secrets, ScrapeCreators key, and
+  Higgsfield provider account credentials/session references.
 
 Workers AI binding is supported in Wrangler with:
 
@@ -87,7 +87,7 @@ The Rust docs list `Ai`, `D1Database`, R2 `Bucket`, and `Queue` as available
 - Instagram photo selection: candidate collection, AI scoring, accepted/rejected
   audit records, fallback states, and consent metadata.
 - Niche research: dynamic research derived from `social-page`, bubble queries,
-  visual references, and user inspiration pools.
+  visual reference pools, liked-output metadata, and user inspiration pools.
 - Media: R2 storage, signed/private reads, remote materialization, lifecycle
   cleanup, and metadata.
 - Generation: provider-agnostic job records, provider account assignment,
@@ -119,6 +119,11 @@ prototype routes:
 - `GET /api/generations`: list jobs for Blitz, Inbox, Library.
 - `GET /api/generations/:id`: inspect job outputs.
 - `POST /api/generations/:id/retry`: retry failed/canceled jobs when allowed.
+- `GET /api/blitz/current`: return the current ready 10-image Blitz batch.
+- `POST /api/blitz/batches`: request or enqueue the next 10-image batch when
+  quota allows.
+- `POST /api/blitz/swipes`: record right-swipe/save/skip feedback for batch
+  learning.
 - `/api/media/*`: upload/read private user media and materialized references.
 - `/api/telemetry/*`: app events and server-evaluated config flags.
 
@@ -151,6 +156,14 @@ Core target tables:
   cluster, score, and freshness.
 - `visual_references`: style archetypes, thumbnail/materialized image refs,
   descriptions, source URLs, and niche.
+- `visual_reference_pools`: per-user/per-clone batches of accepted visual
+  references used to guide future Soul image generation.
+- `swipe_events`: Blitz decisions such as right swipe/save/skip, linked to the
+  generated output, visual reference, clone, and batch.
+- `blitz_batches`: groups of 10 queued/generated Soul images that become
+  visible together when the full batch is ready.
+- `generation_daily_usage`: per-user daily counters for Soul image generation
+  quotas and reset calculations.
 - `user_inspiration_pool`: user-specific discovery items linked to bubbles.
 - `discovery_sources` and `discovery_items`: cached external discovery feeds.
 - `soul_training_jobs`: clone-training job state, queue state, provider account,
@@ -195,13 +208,19 @@ DLQ, capacity, and user-facing status semantics.
 
 ### `generation_queue`
 
-Purpose: generate images from an input inspiration image plus a ready Soul.
+Purpose: generate image-guided Soul outputs from visual references plus a ready
+Soul.
 
 Responsibilities:
 
 - Enforce credits, plan limits, and clone readiness.
 - Materialize remote inspiration images to R2 before provider submission.
 - Select or lease a provider account.
+- Generate Blitz outputs in batches of 10.
+- Keep a new Blitz batch hidden until all 10 jobs in the batch are terminal,
+  then make the ready images available together.
+- Use right-swiped/saved output metadata from the previous batch to weight the
+  next visual reference selection.
 - Submit provider jobs.
 - Poll provider status using delayed queue messages.
 - Persist generated outputs to R2 and D1.
@@ -218,8 +237,7 @@ marketing niches.
 Responsibilities:
 
 - Convert selected bubbles into search queries.
-- Run ScrapeCreators API searches for TikTok, Reddit, Instagram, and YouTube
-  where enabled.
+- Run ScrapeCreators API searches for TikTok and Instagram where enabled.
 - Extract queries, knowledge bits, clusters, visual style archetypes, and
   discovery items.
 - Cache source results with TTLs.
@@ -332,32 +350,18 @@ Flow:
 Each accepted/rejected decision should be stored with a reason and model trace.
 This protects quality, debugging, and user trust.
 
-## AI Model Routing
+## Workers AI Model Interface
 
-Do not hardcode one AI model into product logic.
+All app-owned model calls use Workers AI through the `AI` binding. The default
+model is Kimi K2.6: `@cf/moonshotai/kimi-k2.6`, because it supports text,
+vision, and structured outputs in one provider path.
 
-Add a model router with config for:
-
-- provider: `workers_ai`, `openrouter`, `opencode_go`, or future providers.
-- endpoint/base URL where applicable.
-- model ID/name.
-- purpose: `photo_selection`, `persona_bubbles`, `niche_research`,
-  `copywriting`, or `moderation`.
-- supports vision, structured output, and tool/function calling.
-- cost and timeout settings.
-
-Candidate models:
-
-- Workers AI Kimi K2.6: `@cf/moonshotai/kimi-k2.6`; useful for vision,
-  structured output, and simple deployment through the `AI` binding.
-- OpenRouter DeepSeek V4 Pro: useful when token price or quality is better for
-  text-heavy niche research.
-- OpenCode Go DeepSeek V4 Pro: treat as a configurable HTTP provider if it
-  exposes an OpenAI-compatible or documented custom endpoint.
-
-The Rust backend should expose a small internal interface such as
-`AiProvider.run_structured(task, input, schema)` so model changes do not require
-rewriting onboarding or research services.
+Keep a small internal interface such as
+`WorkersAi.run_structured(task, input, schema)` so onboarding, moderation,
+photo selection, and niche research do not hardcode request details. Do not add
+OpenRouter, OpenCode, or other external model providers to app-owned model
+tasks. Higgsfield MCP remains separate and is used only for Soul clone training
+and image generation.
 
 ## Discovery And Niche Research
 
@@ -372,7 +376,7 @@ first. Production should bring over the concepts, not the exact Node CLI
 runtime:
 
 - niche configuration
-- search terms, hashtags, and subreddit/source lists
+- search terms, hashtags, and source lists
 - query and knowledge extraction
 - clustering and deeper query expansion
 - high-engagement visual reference detection
@@ -381,6 +385,20 @@ runtime:
 For app runtime, selected onboarding bubbles should feed `niche_research_queue`.
 That queue refreshes the user's inspiration pool and gives Create/Blitz better
 dynamic ideas over time.
+
+The visual reference pool is the bridge between niche research and image-guided
+Soul generation. It should collect accepted public visual references for each
+user/clone, tag them with aesthetic metadata, and select each next batch of 10
+generation inputs from a mix of:
+
+- selected onboarding bubbles
+- current niche research clusters
+- metadata from right-swiped/saved Blitz images
+- freshness and variety constraints so the deck does not collapse into one look
+
+After a user right-swipes images in Blitz, the next generated batch should lean
+toward the liked images' metadata. The user should wait for the next batch of
+10 to finish before seeing the refreshed Blitz deck.
 
 For marketing operations, `produce.js` and `place-product.js` can keep running
 manually from `social-page` until there is a separate marketing automation
@@ -393,11 +411,18 @@ Initial clone limits:
 - Free: 1 clone.
 - Paid: 5 clones.
 
+Initial daily Soul image generation limits:
+
+- Free: 10 generated images per day.
+- Pro: 30 generated images per day.
+- Pro target after usage/cost testing: 50 generated images per day.
+
 Other entitlement examples:
 
-- Free: limited daily Blitz cards, watermark exports, lower priority queues.
-- Pro: more generations, no watermark, higher queue priority, more bubbles and
-  inspiration refreshes.
+- Free: one daily Blitz batch of 10, watermark exports, lower priority queues.
+- Pro: three daily Blitz batches of 10 at launch, no watermark, higher queue
+  priority, more bubbles and inspiration refreshes. Increase to five daily
+  batches only after unit economics and provider capacity are validated.
 - Studio: larger batches, video when available, more aggressive pre-generation,
   priority support, and commercial/agency features later.
 

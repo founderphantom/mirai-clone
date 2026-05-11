@@ -89,9 +89,9 @@ The onboarding product contract is now:
 
 1. User signs up.
 2. User chooses a Soul source:
-   - Instagram public profile.
-   - Manual upload of 5-15 reference photos.
-   - Preset Starter Soul.
+    - Instagram public profile.
+    - Manual upload of 5-15 reference photos.
+    - Preset Starter Soul.
 3. Mirai generates or loads inspiration bubbles.
 4. User selects up to 5 bubbles.
 5. Mirai seeds a dynamic inspiration pool.
@@ -175,7 +175,10 @@ The Rust backend should use three primary queues.
 
 `generation_queue`:
 
-- Image generation from a ready clone and input inspiration image.
+- Image-guided Soul generation from a ready clone and selected visual
+  references.
+- Produces Blitz images in batches of 10.
+- Keeps the next Blitz batch hidden until the 10-image batch is complete.
 - Handles submit, delayed poll, output persistence, retries, and credit
   settlement/refunds.
 - Uses Higgsfield API/runner initially and should preserve a provider interface
@@ -185,8 +188,30 @@ The Rust backend should use three primary queues.
 
 - Dynamic inspiration-pool refresh.
 - Uses selected bubbles and app-wide niches to run research.
+- Builds per-user visual reference pools for future image-guided Soul
+  generation.
 - Feeds Create, Blitz, and eventually marketing automation.
 - Should avoid expensive refreshes for inactive users unless needed.
+
+## Blitz Batch Loop
+
+The next backend slice should make Blitz batch-oriented instead of an infinite
+single-card stream.
+
+Target behavior:
+
+1. Niche research builds a per-user/per-clone visual reference pool.
+2. The generation system selects 10 visual references for the next Blitz batch.
+3. The generation queue creates 10 image-guided Soul outputs.
+4. The user waits while that batch is generating.
+5. Blitz shows the new images only after the batch of 10 is complete.
+6. The user swipes through the batch.
+7. Right-swiped/saved image metadata influences the next batch of 10.
+
+This turns swipes into taste feedback. The system should store which visual
+reference, niche cluster, aesthetic tags, and generation output produced each
+right swipe. The next selector should lean toward liked metadata while still
+preserving enough variety to avoid repetitive decks.
 
 ## Niche Research Integration
 
@@ -241,7 +266,7 @@ and structured result for audit/debugging.
 Keep Free useful but bounded:
 
 - 1 clone.
-- Limited daily Blitz.
+- 10 Soul image generations per day, delivered as one 10-image Blitz batch.
 - Watermarked exports.
 - Lower generation priority.
 - Limited inspiration refresh.
@@ -249,7 +274,10 @@ Keep Free useful but bounded:
 Paid plans should unlock:
 
 - 5 clones.
-- More generation credits.
+- Pro: 30 Soul image generations per day at launch, delivered as three 10-image
+  Blitz batches.
+- Pro target after testing: increase to 50 per day if provider capacity and unit
+  economics hold.
 - No watermark.
 - Higher queue priority.
 - More aggressive Blitz/inspiration refresh.

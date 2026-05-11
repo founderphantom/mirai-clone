@@ -110,8 +110,7 @@ Product Worker bindings:
 - Service binding: `AUTH_SERVICE` to the JS Auth Worker.
 - Vars: app URL/name, environment, moderation level, feature flags, default AI
   routing config, ScrapeCreators defaults.
-- Secrets: ScrapeCreators API key, OpenRouter key, OpenCode Go key, Higgsfield
-  provider token secrets.
+- Secrets: ScrapeCreators API key and Higgsfield provider token secrets.
 
 Auth Worker bindings:
 
@@ -375,10 +374,11 @@ The design treats this behavior as the MVP generation model. The backend should
 call Higgsfield over HTTP/MCP with the same semantics: empty prompt, input image
 as visual direction, and Soul ID as identity.
 
-## AI Routing
+## Workers AI Routing
 
-AI model routing is task-configurable. Model config must include capability
-flags:
+All app-owned model tasks use Workers AI through the `AI` binding. The default
+model is Kimi K2.6: `@cf/moonshotai/kimi-k2.6`. Model config must include
+capability flags:
 
 - `supports_vision`
 - `supports_structured_json`
@@ -397,12 +397,14 @@ Tasks:
   image verification requires a vision model.
 - `moderation`: configurable strictness.
 
-Provider options:
+Provider policy:
 
-- Workers AI Kimi K2.6 through the `AI` binding for vision/structured tasks.
-- OpenRouter DeepSeek V4 Pro for text-heavy tasks. Do not route image review
-  tasks to it if it cannot inspect images.
-- OpenCode Go DeepSeek V4 Pro through configurable HTTP if available.
+- Workers AI Kimi K2.6 through the `AI` binding for text, vision, structured
+  extraction, moderation, and niche research.
+- Do not add OpenRouter, OpenCode, or other external model providers for
+  app-owned model calls.
+- Higgsfield MCP is separate from app-owned model calls and remains the
+  provider path for Soul clone training and image generation.
 
 Every model call inserts `ai_model_invocations` with task, provider, model,
 input hash/reference, status, latency, structured result, and error summary.
@@ -425,7 +427,7 @@ Node CLI pipeline inside the Rust Worker.
 Mirai should recreate the useful concepts:
 
 1. Seed from selected user bubbles and inferred niche.
-2. Scrape Reddit, TikTok, X, and Instagram where enabled.
+2. Scrape TikTok and Instagram where enabled.
 3. Extract queries and knowledge bits with an LLM.
 4. Cluster knowledge and generate deeper searches.
 5. Research top visual posts in the niche.
