@@ -557,6 +557,11 @@ fn instagram_reels_normalizer_extracts_reel_candidates() {
 #[test]
 fn synthetic_generation_terms_are_rejected_case_insensitively() {
     assert!(filter_synthetic_terms("clean girl outfit inspo").is_ok());
+    assert!(filter_synthetic_terms("paid creator outfit").is_ok());
+    assert_eq!(
+        filter_synthetic_terms("ai").unwrap_err(),
+        "synthetic_generation_term"
+    );
     assert_eq!(
         filter_synthetic_terms("AI generated avatar inspo").unwrap_err(),
         "synthetic_generation_term"
@@ -625,12 +630,42 @@ fn human_presence_accepts_single_organic_recent_images_only() {
         can_accept_human_presence(&studio).unwrap_err(),
         "too_professional"
     );
+
+    let mut no_human = accepted.clone();
+    no_human.has_human = false;
+    no_human.human_count = 0;
+    assert_eq!(
+        can_accept_human_presence(&no_human).unwrap_err(),
+        "no_human"
+    );
+
+    let mut low_confidence = accepted.clone();
+    low_confidence.confidence = 0.69;
+    assert_eq!(
+        can_accept_human_presence(&low_confidence).unwrap_err(),
+        "low_confidence"
+    );
+
+    let mut stale_visual_style = accepted.clone();
+    stale_visual_style.freshness_visual_score = 0.69;
+    assert_eq!(
+        can_accept_human_presence(&stale_visual_style).unwrap_err(),
+        "not_recent_visual_style"
+    );
+
+    let mut render_like = accepted.clone();
+    render_like.capture_style = "render_like".to_string();
+    assert_eq!(
+        can_accept_human_presence(&render_like).unwrap_err(),
+        "too_professional"
+    );
 }
 
 #[test]
 fn daily_generation_limits_follow_plan() {
     assert_eq!(daily_generation_limit("free", 10, 50), 10);
     assert_eq!(daily_generation_limit("paid", 10, 50), 50);
+    assert_eq!(daily_generation_limit("pro", 10, 50), 50);
     assert_eq!(daily_generation_limit("studio", 10, 50), 50);
     assert_eq!(daily_generation_limit("unknown", 10, 50), 10);
 }
@@ -729,4 +764,55 @@ fn selection_respects_influence_variety_and_reuse_cap() {
     );
     assert!(!ids.contains(&"unliked_used".to_string()));
     assert!(!ids.contains(&"capped".to_string()));
+}
+
+#[test]
+fn selection_caps_cluster_and_platform_variety() {
+    let refs = (0..6)
+        .map(|index| VisualReferenceForSelection {
+            id: format!("same_cluster_{index}"),
+            source_platform: "tiktok".to_string(),
+            source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some("same-cluster".to_string()),
+            aesthetic_tags: vec!["street".to_string()],
+            human_presence_score: 0.9 - (index as f64 * 0.01),
+            organic_photo_score: 0.8,
+            freshness_visual_score: 0.8,
+            generation_use_count: 0,
+            last_liked_at: None,
+        })
+        .chain((0..5).map(|index| VisualReferenceForSelection {
+            id: format!("same_platform_{index}"),
+            source_platform: "instagram".to_string(),
+            source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some(format!("cluster_{index}")),
+            aesthetic_tags: vec!["minimalist".to_string()],
+            human_presence_score: 0.85 - (index as f64 * 0.01),
+            organic_photo_score: 0.8,
+            freshness_visual_score: 0.8,
+            generation_use_count: 0,
+            last_liked_at: None,
+        }))
+        .collect::<Vec<_>>();
+
+    let selected = select_visual_references(
+        &refs,
+        &Influence::default(),
+        8,
+        4,
+        "2026-05-11T00:00:00.000Z",
+    );
+
+    let same_cluster_count = selected
+        .iter()
+        .filter(|item| item.niche_cluster.as_deref() == Some("same-cluster"))
+        .count();
+    let instagram_count = selected
+        .iter()
+        .filter(|item| item.source_platform == "instagram")
+        .count();
+
+    assert_eq!(same_cluster_count, 2);
+    assert_eq!(instagram_count, 3);
+    assert!(selected.len() <= 5);
 }
