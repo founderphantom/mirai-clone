@@ -1,5 +1,10 @@
 use mirai_product_worker::ai::model_router::{choose_model, clamp_moderation_level, ModelConfig};
 use mirai_product_worker::ai::tasks::AiTask;
+use mirai_product_worker::domain::blitz::{
+    accumulate_influence, can_accept_human_presence, classify_freshness, daily_generation_limit,
+    filter_synthetic_terms, select_visual_references, FreshnessDecision, HumanPresenceReview,
+    Influence, SwipeMetadata, VisualReferenceForSelection,
+};
 use mirai_product_worker::domain::entitlements::{can_create_clone, Entitlements};
 use mirai_product_worker::domain::idempotency::clone_upload_key;
 use mirai_product_worker::domain::media_validation::{
@@ -502,3 +507,180 @@ fn instagram_reels_normalizer_extracts_reel_candidates() {
     );
 }
 
+
+#[test]
+fn synthetic_generation_terms_are_rejected_case_insensitively() {
+    assert!(filter_synthetic_terms("clean girl outfit inspo").is_ok());
+    assert_eq!(
+        filter_synthetic_terms("AI generated avatar inspo").unwrap_err(),
+        "synthetic_generation_term"
+    );
+    assert_eq!(
+        filter_synthetic_terms("Midjourney fashion render").unwrap_err(),
+        "synthetic_generation_term"
+    );
+}
+
+#[test]
+fn source_freshness_uses_rolling_five_year_cutoff() {
+    assert_eq!(
+        classify_freshness(
+            Some("2024-02-01T00:00:00.000Z"),
+            true,
+            "2026-05-11T00:00:00.000Z",
+            5
+        ),
+        FreshnessDecision::Recent
+    );
+    assert_eq!(
+        classify_freshness(
+            Some("2020-05-10T00:00:00.000Z"),
+            true,
+            "2026-05-11T00:00:00.000Z",
+            5
+        ),
+        FreshnessDecision::TooOld
+    );
+    assert_eq!(
+        classify_freshness(None, true, "2026-05-11T00:00:00.000Z", 5),
+        FreshnessDecision::UnknownAllowed
+    );
+    assert_eq!(
+        classify_freshness(None, false, "2026-05-11T00:00:00.000Z", 5),
+        FreshnessDecision::UnknownRejected
+    );
+}
+
+#[test]
+fn human_presence_accepts_single_organic_recent_images_only() {
+    let accepted = HumanPresenceReview {
+        has_human: true,
+        human_count: 1,
+        human_type: "full_body".to_string(),
+        confidence: 0.82,
+        organic_photo_score: 0.8,
+        freshness_visual_score: 0.78,
+        capture_style: "phone".to_string(),
+        aesthetic_tags: vec!["street".to_string()],
+        rejection_reason: None,
+    };
+    assert!(can_accept_human_presence(&accepted).is_ok());
+
+    let mut multiple = accepted.clone();
+    multiple.human_count = 2;
+    assert_eq!(
+        can_accept_human_presence(&multiple).unwrap_err(),
+        "multiple_humans"
+    );
+
+    let mut studio = accepted.clone();
+    studio.capture_style = "professional_studio".to_string();
+    assert_eq!(
+        can_accept_human_presence(&studio).unwrap_err(),
+        "too_professional"
+    );
+}
+
+#[test]
+fn daily_generation_limits_follow_plan() {
+    assert_eq!(daily_generation_limit("free", 10, 50), 10);
+    assert_eq!(daily_generation_limit("paid", 10, 50), 50);
+    assert_eq!(daily_generation_limit("studio", 10, 50), 50);
+    assert_eq!(daily_generation_limit("unknown", 10, 50), 10);
+}
+
+#[test]
+fn influence_accumulates_likes_and_dislikes_from_metadata() {
+    let influence = accumulate_influence(&[
+        SwipeMetadata {
+            action: "like".to_string(),
+            aesthetic_tags: vec!["minimalist".to_string(), "street".to_string()],
+            niche_cluster: Some("outfit-inspo".to_string()),
+            source_platform: "tiktok".to_string(),
+            visual_reference_id: Some("vref_1".to_string()),
+        },
+        SwipeMetadata {
+            action: "dislike".to_string(),
+            aesthetic_tags: vec!["neon".to_string()],
+            niche_cluster: Some("formal-wear".to_string()),
+            source_platform: "instagram".to_string(),
+            visual_reference_id: Some("vref_2".to_string()),
+        },
+    ]);
+
+    assert_eq!(influence.liked_tags["minimalist"], 1);
+    assert_eq!(influence.liked_clusters["outfit-inspo"], 1);
+    assert_eq!(influence.disliked_tags["neon"], 1);
+    assert_eq!(influence.disliked_clusters["formal-wear"], 1);
+    assert_eq!(influence.liked_platforms["tiktok"], 1);
+    assert_eq!(influence.liked_visual_reference_ids["vref_1"], 1);
+}
+
+#[test]
+fn selection_respects_influence_variety_and_reuse_cap() {
+    let refs = vec![
+        VisualReferenceForSelection {
+            id: "liked_repeat".to_string(),
+            source_platform: "tiktok".to_string(),
+            source_published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some("outfit-inspo".to_string()),
+            aesthetic_tags: vec!["minimalist".to_string()],
+            human_presence_score: 0.8,
+            organic_photo_score: 0.8,
+            freshness_visual_score: 0.8,
+            generation_use_count: 1,
+            last_liked_at: Some("2026-05-10T00:00:00.000Z".to_string()),
+        },
+        VisualReferenceForSelection {
+            id: "unliked_used".to_string(),
+            source_platform: "instagram".to_string(),
+            source_published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some("outfit-inspo".to_string()),
+            aesthetic_tags: vec!["minimalist".to_string()],
+            human_presence_score: 0.95,
+            organic_photo_score: 0.8,
+            freshness_visual_score: 0.8,
+            generation_use_count: 1,
+            last_liked_at: None,
+        },
+        VisualReferenceForSelection {
+            id: "fresh_unused".to_string(),
+            source_platform: "instagram".to_string(),
+            source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some("mirror-fit".to_string()),
+            aesthetic_tags: vec!["street".to_string()],
+            human_presence_score: 0.7,
+            organic_photo_score: 0.8,
+            freshness_visual_score: 0.8,
+            generation_use_count: 0,
+            last_liked_at: None,
+        },
+        VisualReferenceForSelection {
+            id: "capped".to_string(),
+            source_platform: "tiktok".to_string(),
+            source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some("mirror-fit".to_string()),
+            aesthetic_tags: vec!["street".to_string()],
+            human_presence_score: 0.9,
+            organic_photo_score: 0.8,
+            freshness_visual_score: 0.8,
+            generation_use_count: 4,
+            last_liked_at: Some("2026-05-10T00:00:00.000Z".to_string()),
+        },
+    ];
+    let mut influence = Influence::default();
+    influence.liked_tags.insert("minimalist".to_string(), 3);
+    influence
+        .liked_visual_reference_ids
+        .insert("liked_repeat".to_string(), 1);
+
+    let selected = select_visual_references(&refs, &influence, 2, 4, "2026-05-11T00:00:00.000Z");
+    let ids = selected.into_iter().map(|item| item.id).collect::<Vec<_>>();
+
+    assert_eq!(
+        ids,
+        vec!["liked_repeat".to_string(), "fresh_unused".to_string()]
+    );
+    assert!(!ids.contains(&"unliked_used".to_string()));
+    assert!(!ids.contains(&"capped".to_string()));
+}
