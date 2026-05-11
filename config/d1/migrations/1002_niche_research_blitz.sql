@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS inspiration_bubbles (
 CREATE TABLE IF NOT EXISTS niche_research_queries (
   id TEXT PRIMARY KEY,
   user_id TEXT,
-  clone_id TEXT,
+  clone_id TEXT NOT NULL,
   bubble_id TEXT,
   query TEXT NOT NULL,
   source TEXT NOT NULL,
@@ -77,14 +77,14 @@ CREATE TABLE IF NOT EXISTS niche_research_queries (
   raw_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
   used_at TEXT,
-  FOREIGN KEY (clone_id) REFERENCES clone_profiles(id) ON DELETE SET NULL,
+  FOREIGN KEY (clone_id) REFERENCES clone_profiles(id) ON DELETE CASCADE,
   FOREIGN KEY (bubble_id) REFERENCES inspiration_bubbles(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS niche_knowledge (
   id TEXT PRIMARY KEY,
   user_id TEXT,
-  clone_id TEXT,
+  clone_id TEXT NOT NULL,
   bit TEXT NOT NULL,
   cluster TEXT,
   cluster_relevance_score REAL,
@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS niche_knowledge (
   score REAL NOT NULL DEFAULT 1,
   raw_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
-  FOREIGN KEY (clone_id) REFERENCES clone_profiles(id) ON DELETE SET NULL
+  FOREIGN KEY (clone_id) REFERENCES clone_profiles(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS blitz_batches (
@@ -163,7 +163,7 @@ CREATE TABLE IF NOT EXISTS generation_outputs (
 CREATE TABLE IF NOT EXISTS visual_reference_candidates (
   id TEXT PRIMARY KEY,
   user_id TEXT,
-  clone_id TEXT,
+  clone_id TEXT NOT NULL,
   discovery_item_id TEXT,
   source_platform TEXT NOT NULL,
   source_url TEXT,
@@ -189,7 +189,7 @@ CREATE TABLE IF NOT EXISTS visual_reference_candidates (
 CREATE TABLE IF NOT EXISTS visual_references (
   id TEXT PRIMARY KEY,
   user_id TEXT,
-  clone_id TEXT,
+  clone_id TEXT NOT NULL,
   candidate_id TEXT,
   media_asset_id TEXT,
   source_platform TEXT NOT NULL,
@@ -286,11 +286,14 @@ CREATE INDEX IF NOT EXISTS idx_blitz_batches_user_date ON blitz_batches(user_id,
 CREATE INDEX IF NOT EXISTS idx_blitz_swipes_batch ON blitz_swipes(batch_id, swipe_index);
 CREATE INDEX IF NOT EXISTS idx_blitz_swipes_clone ON blitz_swipes(clone_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_generation_daily_usage_date ON generation_daily_usage(user_id, usage_date DESC);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_user ON generation_jobs(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_status ON generation_jobs(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_generation_jobs_batch ON generation_jobs(blitz_batch_id) WHERE blitz_batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_generation_jobs_visual_ref ON generation_jobs(input_visual_reference_id, status) WHERE input_visual_reference_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_generation_outputs_job ON generation_outputs(job_id, output_index);
 CREATE INDEX IF NOT EXISTS idx_discovery_items_source ON discovery_items(source_id, discovered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_discovery_items_platform_published ON discovery_items(platform, source_published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_discovery_items_platform_discovered ON discovery_items(platform, discovered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_visual_references_clone ON visual_references(clone_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_visual_references_clone_published ON visual_references(clone_id, source_published_at DESC) WHERE source_published_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_visual_references_clone_reuse ON visual_references(clone_id, generation_use_count, last_liked_at);
