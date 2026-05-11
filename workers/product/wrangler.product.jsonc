@@ -17,8 +17,11 @@
     "APP_URL": "https://mirai.founder-968.workers.dev",
     "ENVIRONMENT": "development",
     "MODERATION_LEVEL": "4",
+    "SCRAPECREATORS_BASE_URL": "https://api.scrapecreators.com",
     "SCRAPECREATORS_CACHE_TTL_SECONDS": "1800",
-    "DISCOVERY_DEFAULT_REGION": "US"
+    "DISCOVERY_DEFAULT_REGION": "US",
+    "HIGGSFIELD_MCP_GENERATION_TOOL": "text2image_soul_v2",
+    "BLITZ_BATCH_STALE_MINUTES": "45"
   },
   "services": [
     {
