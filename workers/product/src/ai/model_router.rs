@@ -12,7 +12,10 @@ pub fn choose_model(task: AiTask, models: &[ModelConfig]) -> Option<ModelConfig>
     models
         .iter()
         .find(|model| {
-            model.supports_structured_json && (!task.requires_vision() || model.supports_vision)
+            model.provider == "workers_ai"
+                && model.model == "@cf/moonshotai/kimi-k2.6"
+                && model.supports_structured_json
+                && (!task.requires_vision() || model.supports_vision)
         })
         .cloned()
 }

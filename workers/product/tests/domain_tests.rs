@@ -1,5 +1,8 @@
 use mirai_product_worker::ai::model_router::{choose_model, clamp_moderation_level, ModelConfig};
 use mirai_product_worker::ai::tasks::AiTask;
+use mirai_product_worker::ai::workers_ai::{
+    human_presence_prompt, knowledge_extraction_prompt, seed_extraction_prompt,
+};
 use mirai_product_worker::domain::blitz::{
     accumulate_influence, can_accept_human_presence, classify_freshness, daily_generation_limit,
     filter_synthetic_terms, select_visual_references, FreshnessDecision, HumanPresenceReview,
@@ -43,8 +46,8 @@ fn text_only_models_are_not_chosen_for_vision_tasks() {
             supports_structured_json: true,
         },
         ModelConfig {
-            provider: "openai".to_string(),
-            model: "gpt-4.1-mini".to_string(),
+            provider: "workers_ai".to_string(),
+            model: "@cf/moonshotai/kimi-k2.6".to_string(),
             supports_vision: true,
             supports_structured_json: true,
         },
@@ -54,7 +57,8 @@ fn text_only_models_are_not_chosen_for_vision_tasks() {
 
     let selected = choose_model(AiTask::PhotoQualityReview, &models).unwrap();
 
-    assert_eq!(selected.model, "gpt-4.1-mini");
+    assert_eq!(selected.provider, "workers_ai");
+    assert_eq!(selected.model, "@cf/moonshotai/kimi-k2.6");
     assert!(selected.supports_vision);
 }
 
@@ -93,18 +97,41 @@ fn models_without_structured_json_are_rejected() {
 }
 
 #[test]
-fn deepseek_can_handle_text_tasks() {
-    let models = vec![ModelConfig {
-        provider: "deepseek".to_string(),
-        model: "deepseek-v4-pro".to_string(),
-        supports_vision: false,
-        supports_structured_json: true,
-    }];
+fn kimi_is_the_only_analysis_model_for_text_tasks() {
+    let models = vec![
+        ModelConfig {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            supports_vision: false,
+            supports_structured_json: true,
+        },
+        ModelConfig {
+            provider: "workers_ai".to_string(),
+            model: "@cf/moonshotai/kimi-k2.6".to_string(),
+            supports_vision: true,
+            supports_structured_json: true,
+        },
+    ];
 
     let selected = choose_model(AiTask::NicheSeedExtraction, &models).unwrap();
 
-    assert_eq!(selected.provider, "deepseek");
-    assert_eq!(selected.model, "deepseek-v4-pro");
+    assert_eq!(selected.provider, "workers_ai");
+    assert_eq!(selected.model, "@cf/moonshotai/kimi-k2.6");
+}
+
+#[test]
+fn workers_ai_prompts_include_research_guardrails() {
+    let seed = seed_extraction_prompt("Clean Girl Street", &["minimal outfit".to_string()]);
+    assert!(seed.contains("TikTok and Instagram"));
+    assert!(seed.contains("Do not include synthetic/generation topics"));
+
+    let knowledge = knowledge_extraction_prompt("Clean Girl Street");
+    assert!(knowledge.contains("Do not extract from known-stale source items"));
+
+    let human = human_presence_prompt();
+    assert!(human.contains("exactly one human person"));
+    assert!(human.contains("organic creator content"));
+    assert!(human.contains("render_like"));
 }
 
 #[test]

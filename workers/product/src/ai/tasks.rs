@@ -4,6 +4,7 @@ pub enum AiTask {
     HumanPresenceDetection,
     BubbleGeneration,
     NicheSeedExtraction,
+    NicheKnowledgeExtraction,
     NicheClusterExpansion,
     VisualReferenceSelection,
     Moderation,
