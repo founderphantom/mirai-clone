@@ -269,6 +269,9 @@
   width: 300px;
   height: 520px;
   margin: 0 auto;
+  isolation: isolate;
+  perspective: 1000px;
+  transform-style: preserve-3d;
 }
 
 .lp-deck__card {
@@ -280,11 +283,19 @@
   cursor: grab;
   transform-origin: bottom center;
   box-shadow: 0 24px 48px rgba(0, 0, 0, 0.15);
+  backface-visibility: hidden;
+  touch-action: pan-y;
   user-select: none;
+  will-change: transform, opacity;
 }
 
 .lp-deck__card:active {
   cursor: grabbing;
+}
+
+.lp-deck__card--departing {
+  cursor: grabbing;
+  pointer-events: none;
 }
 
 .lp-deck__card img {
@@ -311,6 +322,7 @@
   font-weight: 700;
   text-align: center;
   pointer-events: none;
+  z-index: 20;
 }
 
 /* ── Social Proof Strip ───────────────────────────────── */

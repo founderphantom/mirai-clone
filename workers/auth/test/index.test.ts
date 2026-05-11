@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import authWorker, { buildVerifiedSessionSnapshot, rewritePolarWebhookRequest } from "../src/index";
-import { createAuth } from "../src/auth";
+import { createAuth, resolveAppUrl } from "../src/auth";
 import { derivePolarExternalEventId } from "../src/polar";
 import type { AuthEnv } from "../src/auth";
 
@@ -140,6 +140,14 @@ describe("auth worker routing", () => {
         "https://auth.example.com"
       )
     ).toThrow("BETTER_AUTH_SECRET must be configured outside local development.");
+  });
+
+  it("keeps configured local app URL when verifying sessions through an internal service origin", () => {
+    expect(resolveAppUrl("http://localhost:8780", "https://auth.internal")).toBe("http://localhost:8780");
+  });
+
+  it("falls back to the request origin only when no auth URL is configured", () => {
+    expect(resolveAppUrl(undefined, "https://auth.example.com")).toBe("https://auth.example.com");
   });
 });
 

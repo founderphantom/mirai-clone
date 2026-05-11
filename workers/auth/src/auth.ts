@@ -6,6 +6,7 @@ export type AuthEnv = {
   DB: D1Database;
   APP_NAME?: string;
   APP_URL?: string;
+  BETTER_AUTH_URL?: string;
   BETTER_AUTH_SECRET?: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
@@ -17,7 +18,7 @@ export type AuthEnv = {
 };
 
 export function createAuth(env: AuthEnv, requestOrigin?: string) {
-  const appUrl = resolveAppUrl(env.APP_URL, requestOrigin);
+  const appUrl = resolveAppUrl(env.BETTER_AUTH_URL || env.APP_URL, requestOrigin);
   const secret = env.BETTER_AUTH_SECRET || resolveLocalDevSecret(appUrl, requestOrigin);
 
   return betterAuth({
@@ -25,7 +26,7 @@ export function createAuth(env: AuthEnv, requestOrigin?: string) {
     baseURL: appUrl,
     secret,
     database: env.DB,
-    trustedOrigins: [appUrl, "http://localhost:5173", "http://localhost:8787"],
+    trustedOrigins: [appUrl, "http://localhost:5173", "http://localhost:8787", "http://localhost:8780"],
     emailAndPassword: { enabled: true },
     socialProviders: resolveSocialProviders(env, appUrl),
     plugins: polarPlugin(env)
@@ -37,12 +38,9 @@ function resolveLocalDevSecret(appUrl: string, requestOrigin?: string) {
   throw new Error("BETTER_AUTH_SECRET must be configured outside local development.");
 }
 
-function resolveAppUrl(configuredUrl?: string, requestOrigin?: string) {
-  const configured = configuredUrl || "http://localhost:5173";
-  if (!requestOrigin) return configured;
-  const configuredIsLocal = isLocalUrl(configured);
-  const requestIsLocal = isLocalUrl(requestOrigin);
-  return configuredIsLocal && !requestIsLocal ? requestOrigin : configured;
+export function resolveAppUrl(configuredUrl?: string, requestOrigin?: string) {
+  if (configuredUrl) return configuredUrl;
+  return requestOrigin || "http://localhost:5173";
 }
 
 function isLocalUrl(value?: string) {

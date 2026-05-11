@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   motion,
   useMotionValue,
@@ -19,105 +19,245 @@ const CARDS = [
 ];
 
 type SwipeDirection = -1 | 0 | 1;
+type CommittedSwipeDirection = Exclude<SwipeDirection, 0>;
+type HeroCard = (typeof CARDS)[number];
+type DepartingCard = HeroCard & {
+  direction: CommittedSwipeDirection;
+  id: number;
+  initialRotate: number;
+  initialX: number;
+};
+
+const AUTOPLAY_DELAY_MS = 3600;
+const DRAG_RESET_SPRING = { type: 'spring', stiffness: 520, damping: 42 } as const;
+const SWIPE_EXIT_SPRING = { type: 'spring', stiffness: 420, damping: 46 } as const;
+const DECK_RESTACK_SPRING = {
+  type: 'spring',
+  stiffness: 360,
+  damping: 44,
+  mass: 0.9,
+} as const;
+const SWIPE_OFFSET_THRESHOLD = 90;
+const SWIPE_VELOCITY_THRESHOLD = 500;
+const SWIPE_EXIT_X = 480;
+const SWIPE_EXIT_Y = 18;
+const VISIBLE_STACK_CARDS = 4;
+
+export function resolveSwipeDirection(offsetX: number, velocityX: number): SwipeDirection {
+  const byVelocity = Math.abs(velocityX) > SWIPE_VELOCITY_THRESHOLD;
+  const byOffset = Math.abs(offsetX) > SWIPE_OFFSET_THRESHOLD;
+
+  if (!byVelocity && !byOffset) return 0;
+  if (byVelocity) return velocityX < 0 ? -1 : 1;
+  return offsetX < 0 ? -1 : 1;
+}
+
+export function getNextDeckIndex(
+  activeIndex: number,
+  _direction: CommittedSwipeDirection,
+  total: number
+) {
+  if (total <= 0) return 0;
+  return (activeIndex + 1) % total;
+}
+
+export function getDeckCardMotionState(position: number, total = CARDS.length) {
+  const stackPosition = Math.min(position, VISIBLE_STACK_CARDS);
+  const roundedScale = Number(Math.max(0.895, 1 - stackPosition * 0.035).toFixed(3));
+  const roundedRotate =
+    position === 0
+      ? 0
+      : Number((-2.5 + (stackPosition - 1) * 1.4).toFixed(1));
+
+  return {
+    x: position === 0 ? 0 : stackPosition * 12,
+    y: position === 0 ? 0 : stackPosition * 10,
+    rotate: roundedRotate,
+    scale: roundedScale,
+    opacity: position < VISIBLE_STACK_CARDS ? 1 : 0,
+    zIndex: total - position,
+  };
+}
 
 function DeckCard({
-  src,
-  label,
+  card,
+  isLocked,
   position,
-  onDragEnd,
   onDismiss,
+  onInteractionStart,
   reduceMotion,
 }: {
-  src: string;
-  label: string;
+  card: HeroCard;
+  isLocked: boolean;
   position: number;
-  onDragEnd: (offsetX: number, velocityX: number) => SwipeDirection;
-  onDismiss: (direction: Exclude<SwipeDirection, 0>) => void;
+  onDismiss: (
+    direction: CommittedSwipeDirection,
+    card: HeroCard,
+    initialX: number,
+    initialRotate: number
+  ) => void;
+  onInteractionStart: () => void;
   reduceMotion: boolean;
 }) {
+  const motionState = getDeckCardMotionState(position, CARDS.length);
+  const isTopCard = position === 0;
   const x = useMotionValue(0);
-  const rotate = useTransform(x, [-200, 200], [-12, 12]);
+  const rotate = useTransform(x, [-220, 220], [-10, 10]);
 
   useEffect(() => {
-    if (position !== 0) x.set(0);
-  }, [position, x]);
+    x.set(0);
+  }, [card.src, position, x]);
 
   return (
     <motion.div
       className="lp-deck__card"
+      layout
       style={{
-        x,
-        rotate: position === 0 ? rotate : position * 3 - 3,
-        y: position * 8,
-        zIndex: CARDS.length - position,
         position: 'absolute',
+        zIndex: motionState.zIndex,
+        pointerEvents: isTopCard && !isLocked ? 'auto' : 'none',
+        ...(isTopCard ? { x, rotate } : {}),
       }}
-      drag={position === 0 ? 'x' : false}
-      dragConstraints={{ left: -300, right: 300 }}
-      dragElastic={0.15}
+      drag={isTopCard && !isLocked ? 'x' : false}
+      dragConstraints={{ left: -280, right: 280 }}
+      dragElastic={0.12}
       dragMomentum={false}
+      onDragStart={() => {
+        if (isTopCard) onInteractionStart();
+      }}
       onDragEnd={(_, info) => {
-        if (position !== 0) return;
-        const direction = onDragEnd(info.offset.x, info.velocity.x);
+        if (!isTopCard || isLocked) return;
+        const direction = resolveSwipeDirection(info.offset.x, info.velocity.x);
+
         if (!direction) {
-          animate(x, 0, { type: 'spring', stiffness: 500, damping: 35 });
+          animate(x, 0, DRAG_RESET_SPRING);
           return;
         }
+
         if (reduceMotion) {
           x.set(0);
-          onDismiss(direction);
+          onDismiss(direction, card, 0, 0);
           return;
         }
-        animate(x, direction * 420, {
-          type: 'spring',
-          stiffness: 360,
-          damping: 34,
-        }).then(() => {
-          x.set(0);
-          onDismiss(direction);
-        });
+
+        const initialX = x.get();
+        const initialRotate = Math.max(-14, Math.min(14, (initialX / 220) * 10));
+        x.set(0);
+        onDismiss(direction, card, initialX, initialRotate);
       }}
       animate={
-        position !== 0
-          ? { rotate: position * 3 - 3, y: position * 8, x: 0 }
-          : undefined
+        isTopCard
+          ? { y: motionState.y, scale: motionState.scale, opacity: motionState.opacity }
+          : {
+              x: motionState.x,
+              y: motionState.y,
+              rotate: motionState.rotate,
+              scale: motionState.scale,
+              opacity: motionState.opacity,
+            }
       }
-      transition={{ type: 'spring', stiffness: 400, damping: 35 }}
-      whileDrag={{ scale: 1.02, cursor: 'grabbing' }}
+      transition={DECK_RESTACK_SPRING}
+      whileDrag={{ scale: 1.025, cursor: 'grabbing' }}
     >
       <img
-        src={src}
-        alt={label}
-        loading={position === 0 ? 'eager' : 'lazy'}
+        src={card.src}
+        alt={card.label}
+        draggable={false}
+        loading={isTopCard ? 'eager' : 'lazy'}
       />
+    </motion.div>
+  );
+}
+
+function DepartingDeckCard({
+  card,
+  onComplete,
+}: {
+  card: DepartingCard;
+  onComplete: (id: number) => void;
+}) {
+  return (
+    <motion.div
+      className="lp-deck__card lp-deck__card--departing"
+      initial={{
+        x: card.initialX,
+        y: 0,
+        rotate: card.initialRotate,
+        scale: 1,
+        opacity: 1,
+      }}
+      animate={{
+        x: card.direction * SWIPE_EXIT_X,
+        y: SWIPE_EXIT_Y,
+        rotate: card.direction * 16,
+        scale: 1.02,
+        opacity: 0,
+      }}
+      exit={{ opacity: 0 }}
+      transition={SWIPE_EXIT_SPRING}
+      style={{ position: 'absolute', zIndex: CARDS.length + 2 }}
+      onAnimationComplete={() => onComplete(card.id)}
+    >
+      <img src={card.src} alt={card.label} draggable={false} loading="eager" />
     </motion.div>
   );
 }
 
 export function SwipeDeckHero() {
   const [activeIndex, setActiveIndex] = useState(0);
+  const [departingCard, setDepartingCard] = useState<DepartingCard | null>(null);
+  const autoplayTimeout = useRef<number | null>(null);
+  const departingId = useRef(0);
+  const isDismissing = useRef(false);
   const reduceMotion = useReducedMotion();
 
+  const cancelAutoplay = useCallback(() => {
+    if (autoplayTimeout.current === null) return;
+    window.clearTimeout(autoplayTimeout.current);
+    autoplayTimeout.current = null;
+  }, []);
+
+  const handleDismiss = useCallback((
+    direction: CommittedSwipeDirection,
+    card: HeroCard,
+    initialX = 0,
+    initialRotate = 0
+  ) => {
+    cancelAutoplay();
+    if (isDismissing.current) return;
+    isDismissing.current = true;
+
+    if (!reduceMotion) {
+      departingId.current += 1;
+      setDepartingCard({
+        ...card,
+        direction,
+        id: departingId.current,
+        initialRotate,
+        initialX,
+      });
+    } else {
+      isDismissing.current = false;
+    }
+
+    setActiveIndex((index) => getNextDeckIndex(index, direction, CARDS.length));
+  }, [cancelAutoplay, reduceMotion]);
+
+  const clearDepartingCard = useCallback((id: number) => {
+    if (departingId.current === id) {
+      isDismissing.current = false;
+    }
+    setDepartingCard((current) => current?.id === id ? null : current);
+  }, []);
+
   useEffect(() => {
-    if (reduceMotion) return;
-    const id = setInterval(() => {
-      setActiveIndex((i) => (i + 1) % CARDS.length);
-    }, 3000);
-    return () => clearInterval(id);
-  }, [reduceMotion]);
-
-  const handleDragEnd = (offsetX: number, velocityX: number) => {
-    const byVelocity = Math.abs(velocityX) > 400;
-    const byOffset = Math.abs(offsetX) > 80;
-    if (!byVelocity && !byOffset) return 0;
-    return velocityX < 0 || offsetX < 0 ? -1 : 1;
-  };
-
-  const handleDismiss = (direction: Exclude<SwipeDirection, 0>) => {
-    setActiveIndex((i) =>
-      direction < 0 ? (i + 1) % CARDS.length : (i - 1 + CARDS.length) % CARDS.length
-    );
-  };
+    if (reduceMotion || departingCard || isDismissing.current) return;
+    autoplayTimeout.current = window.setTimeout(() => {
+      autoplayTimeout.current = null;
+      handleDismiss(-1, CARDS[activeIndex], 0, 0);
+    }, AUTOPLAY_DELAY_MS);
+    return cancelAutoplay;
+  }, [activeIndex, cancelAutoplay, departingCard, handleDismiss, reduceMotion]);
 
   const orderedCards = [
     ...CARDS.slice(activeIndex),
@@ -129,14 +269,19 @@ export function SwipeDeckHero() {
       {orderedCards.map((card, position) => (
         <DeckCard
           key={card.src}
-          src={card.src}
-          label={card.label}
+          card={card}
+          isLocked={Boolean(departingCard)}
           position={position}
-          onDragEnd={handleDragEnd}
           onDismiss={handleDismiss}
+          onInteractionStart={cancelAutoplay}
           reduceMotion={Boolean(reduceMotion)}
         />
       ))}
+      <AnimatePresence initial={false}>
+        {departingCard ? (
+          <DepartingDeckCard card={departingCard} onComplete={clearDepartingCard} />
+        ) : null}
+      </AnimatePresence>
       <AnimatePresence mode="wait">
         <motion.div
           key={orderedCards[0].label}
