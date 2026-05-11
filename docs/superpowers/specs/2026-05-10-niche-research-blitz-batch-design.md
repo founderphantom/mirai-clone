@@ -4,601 +4,730 @@ Date: 2026-05-10
 
 ## Status
 
-Design in progress. Builds on the merged Rust Product Worker (40 commits, 42
-tests passing). This is the second backend implementation slice.
+Design approved in brainstorming. This document defines the second Rust
+backend implementation slice: niche research visual reference pools,
+the generation queue handler, and the Blitz batch system.
 
 ## Product Scope
 
-This slice adds two connected systems:
+This slice builds the niche research pipeline and Blitz batch system on top
+of the existing Rust Product Worker (40 commits merged, 42 tests passing).
+The existing clone training queue, auth, media, onboarding bubbles, and
+account routes remain unchanged except where noted.
 
-1. **Niche research pipeline**: builds per-clone visual reference pools from
-   bubble-derived search terms, ScrapeCreators scraping, Kimi K2.6 extraction,
-   clustering, expansion, and visual candidate selection with human presence
-   verification.
+Three capabilities ship together as a full vertical slice:
 
-2. **Blitz batch system**: Tinder-like swipe deck with pre-generated batches,
-   configurable batch size (default 5), accumulated taste feedback, and
-   per-user generation quotas.
+1. Niche research queue handler: scrapes trending content, extracts visual
+   references with single-human presence, builds per-clone visual reference
+   pools.
+2. Generation queue handler: submits Higgsfield image-guided Soul v2 jobs,
+   manages credits, assembles Blitz batches.
+3. Blitz batch API routes: serves ready batches, records swipe feedback,
+   triggers pre-fetched next-batch generation with metadata influence.
 
 ## Key Product Decisions
 
-- Batch size is **5** (configurable via `BLITZ_BATCH_SIZE` env var).
-- Free users get **10** generations per user (not per clone).
-- Pro users get **50** generations per user.
-- Bubbles are **per clone**, not per user. More bubble aesthetics will be added
-  over time.
-- Niche is **inferred from the clone's selected bubbles** -- no explicit niche
-  picker. Bubble search queries and vibe summaries become seed terms.
-- Every 5 swipes (likes + dislikes) produces taste metadata that influences
-  future batches, but with a one-batch delay for UX speed.
-- The AI model for niche research is **Kimi K2.6** via **OpenRouter** (not
-  Workers AI), using the OpenAI-compatible chat completions endpoint with
-  structured JSON output.
+- Bubbles are per-clone, not per-user. Each clone gets its own bubble
+  selection, niche research, and visual reference pool.
+- Blitz is per-clone. The user selects which clone to Blitz.
+- Generation limits are per-user (not per-clone): 10 images/day free,
+  50 images/day pro. Daily reset. All configurable.
+- Batch size is 5 (configurable). Each image in a batch consumes 1
+  generation credit.
+- Swipe actions are like (right) or dislike (left) only.
+- Influence is metadata-based re-ranking (no extra AI calls). Aesthetic
+  tags, niche clusters, and source platforms from liked/disliked images
+  re-rank which visual references get selected for the next batch.
+- Visual references require exactly one human presence. Multiple humans
+  or no humans are rejected.
+- AI provider is Workers AI Kimi K2.6 for all tasks (vision, extraction,
+  clustering, moderation).
+- ScrapeCreators HTTP API for platform scraping (TikTok, Reddit, Instagram,
+  YouTube). No CLI.
 
-## Blitz Batch Lifecycle
+## Architecture
 
-The Blitz deck works like Tinder: the next batch is always pre-generating so
-the user never waits.
+### Cold Start Flow
 
-### Generation flow with taste delay
-
-```
-User opens Blitz for clone C (no prior batches):
-  1. System creates Batch 1 (5 images) from visual reference pool, NO taste influence.
-  2. System immediately starts generating Batch 2 (5 images), NO taste influence.
-  3. User swipes through Batch 1 (likes 3, dislikes 2).
-  4. Batch 2 is already done or in progress -- it was NOT influenced by Batch 1 swipes.
-  5. System starts generating Batch 3 using taste from Batch 1 swipes (first 5).
-  6. User swipes through Batch 2 (likes 2, dislikes 3).
-  7. System starts generating Batch 4 using taste from Batches 1+2 (first 10).
-  8. ...and so on. Each new batch uses ALL prior accumulated taste.
-```
-
-The one-batch delay is intentional: the batch generating while the user swipes
-cannot use that batch's swipe data because it started before swipes happened.
-This keeps the UX fast without fake waiting.
-
-### Batch states
-
-```
-pending    -> generating -> ready -> swiping -> completed
-                         -> failed
+```text
+User finishes onboarding → saves 5+ bubbles for clone
+  → niche_research_queue: SeedFromBubbles message
+  → Niche research runs 5 stages
+  → ≥5 visual references accepted
+  → First blitz_batch created (status: generating)
+  → generation_queue: GenerateBlitzBatch message (5 jobs)
+  → All 5 complete → batch status: ready
+  → User sees first Blitz deck
 ```
 
-- `pending`: batch record created, waiting for queue pickup.
-- `generating`: generation jobs submitted to provider.
-- `ready`: all images generated and stored. Deck can show this batch.
-- `swiping`: user has seen at least one card in this batch.
-- `completed`: all cards in this batch have been swiped.
-- `failed`: generation failed after retries.
+### Steady-State Pre-Fetch Pipeline
 
-### Pre-generation trigger
+```text
+Batch 1: cold start, no influence
+  User starts swiping → trigger Batch 2 (no influence, pre-fetch)
+  User finishes (5 swipes)
 
-When the user swipes the **first card** of the current batch, the system checks
-whether a next batch exists in `pending`/`generating`/`ready` state. If not, it
-creates the next batch. This means:
+Batch 2: no influence (pre-generated)
+  User starts swiping → trigger Batch 3 (influence from Batch 1)
+  User finishes (10 total swipes)
 
-- Batch N+1 starts generating when user swipes card 1 of Batch N.
-- Batch N+1 does NOT use Batch N's taste (Batch N is not yet completed).
-- Batch N+2 starts generating when user swipes card 1 of Batch N+1.
-- Batch N+2 uses taste from all completed batches (Batch 1 through N).
-
-### Quota enforcement
-
-Quotas are per user, not per clone:
-
-| Plan | Generations per user | Batches at size 5 |
-|------|---------------------|-------------------|
-| Free | 10                  | 2                 |
-| Pro  | 50                  | 10                |
-
-Quota resets daily at midnight UTC. The backend checks remaining quota before
-creating a new batch. If quota is exhausted, the API returns the current batch
-(if any) plus a `quotaExhausted: true` flag.
-
-Quota is tracked via `generation_jobs` count for the user where
-`DATE(queued_at) = DATE('now')`, not via the credit ledger (credits are for
-future monetization of individual features).
-
-## Niche Research Pipeline
-
-Ported from `social-page/pipeline` concepts into the Rust Worker's
-`NICHE_RESEARCH_QUEUE` consumer. Does NOT run the Node CLI. Calls
-ScrapeCreators HTTP API and Kimi K2.6 (OpenRouter) from Rust.
-
-### Pipeline stages
-
-**Stage 1 -- Seed**
-
-Triggered when user saves bubbles for a clone (`POST /api/onboarding/bubbles`).
-
-1. Collect `search_queries_json` from all selected bubbles for the clone.
-2. For each search query:
-   a. Call ScrapeCreators `GET /v1/reddit/search` with `query`, `sort=top`,
-      `timeframe=month`.
-   b. Call ScrapeCreators `GET /v1/tiktok/search/keyword` with `query`,
-      `sort_by=relevance`.
-   c. For top Reddit posts, call `GET /v1/reddit/post/comments` for comment
-      extraction.
-3. Aggregate scraped text content.
-4. Send to Kimi K2.6 (OpenRouter) with extraction prompt requesting JSON:
-   `{ queries: [{ query, source }], knowledge: [{ bit, source_platform }] }`.
-5. Store extracted queries in `niche_research_queries` and knowledge bits in
-   `niche_knowledge`, both scoped to `user_id` and linked to `bubble_id`.
-
-**Stage 2 -- Expand (cluster and deepen)**
-
-Runs as a follow-up queue message after seed completes.
-
-1. Load all knowledge bits and unused queries for the clone's user.
-2. Send to Kimi K2.6 for clustering:
-   `{ clusters: [{ name, bit_ids, query_ids, description }] }`.
-3. Update cluster assignments in D1.
-4. For each cluster, ask Kimi K2.6 for 3-5 deeper search queries.
-5. Scrape deeper queries via ScrapeCreators.
-6. Extract new queries and knowledge from deeper scrape results.
-7. Store new entries in D1.
-
-**Stage 3 -- Visual research**
-
-Runs as a follow-up queue message after expand completes.
-
-1. Collect search terms and TikTok hashtags derived from bubbles.
-2. Call ScrapeCreators `GET /v1/tiktok/search/keyword` with `sort_by=most-liked`
-   for each term.
-3. Call ScrapeCreators `GET /v1/tiktok/search/hashtag` for each hashtag.
-4. Filter by engagement threshold (configurable, default 10000 likes).
-5. Deduplicate by URL.
-6. For each high-engagement video, extract cover/thumbnail URL.
-7. Store candidates in `visual_reference_candidates` with
-   `human_presence_status = 'unreviewed'`.
-
-**Stage 4 -- Human presence verification**
-
-Runs inline during visual research or as a follow-up.
-
-1. For each unreviewed candidate with an image URL:
-   a. Call Kimi K2.6 with vision capability, sending the image URL and a
-      structured prompt:
-      ```
-      Analyze this image. Is there a human visible?
-      Return JSON: {
-        "human_present": true/false,
-        "presence_type": "human_full_body" | "human_upper_body" | "human_face" | "human_partial" | "no_human",
-        "confidence": 0.0-1.0,
-        "aesthetic_tags": ["tag1", "tag2", ...],
-        "description": "brief description of style/mood"
-      }
-      ```
-   b. Accept candidates with `human_present: true` and `confidence >= 0.7`.
-   c. Store accepted rows in `visual_references` with aesthetic tags.
-   d. Reject others with typed reason.
-2. Log all AI calls in `ai_model_invocations`.
-
-### ScrapeCreators HTTP client
-
-The Rust Worker calls `https://api.scrapecreators.com` with:
-- Header: `x-api-key: <SCRAPECREATORS_API_KEY>` (Cloudflare Secret).
-- All responses are JSON.
-- Rate limit with configurable delay between calls (`SCRAPE_DELAY_MS`, default
-  1000).
-
-Endpoints used:
-
-| Endpoint | Purpose | Credits |
-|----------|---------|---------|
-| `GET /v1/reddit/search` | Search Reddit by keyword | 1 |
-| `GET /v1/reddit/post/comments` | Get post comments | 1 |
-| `GET /v1/tiktok/search/keyword` | Search TikTok by keyword | 1 |
-| `GET /v1/tiktok/search/hashtag` | Search TikTok by hashtag | 1 |
-
-### Kimi K2.6 via OpenRouter
-
-Model: `moonshotai/kimi-k2.6` on OpenRouter (`https://openrouter.ai/api/v1`).
-
-The Rust Worker uses the OpenAI-compatible chat completions API:
-
-```
-POST https://openrouter.ai/api/v1/chat/completions
-Authorization: Bearer <OPENROUTER_API_KEY>
-Content-Type: application/json
-
-{
-  "model": "moonshotai/kimi-k2.6",
-  "messages": [...],
-  "response_format": { "type": "json_object" },
-  "temperature": 0.7
-}
+Batch 3: influenced by Batch 1
+  User starts swiping → trigger Batch 4 (influence from Batch 1+2)
+  ...and so on
 ```
 
-For vision tasks (human presence detection), include image URLs in message
-content using the standard vision format:
+Rule: Batch N+1 uses feedback from Batches 1..N-1 (all previously
+completed batches, never the current batch being swiped).
 
-```json
-{
-  "role": "user",
-  "content": [
-    { "type": "text", "text": "Analyze this image..." },
-    { "type": "image_url", "image_url": { "url": "https://..." } }
-  ]
-}
-```
+## New Tables
 
-Secret: `OPENROUTER_API_KEY` (Cloudflare Secret).
+### blitz_batches
 
-AI task types added to `AiTask` enum:
-- `NicheSeedExtraction` (existing)
-- `NicheClusterExpansion` (existing)
-- `VisualReferenceSelection` (existing)
-- `HumanPresenceDetection` (existing)
-- `BlitzTasteInfluence` (new) -- generates weighted visual reference selection
-  prompt from accumulated swipe metadata.
-
-## Schema Changes
-
-### New migration: `1002_blitz_niche_research.sql`
+Tracks batch lifecycle from creation through completion.
 
 ```sql
--- Blitz batches track pre-generated image sets per clone
 CREATE TABLE IF NOT EXISTS blitz_batches (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   clone_id TEXT NOT NULL,
   batch_number INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
   batch_size INTEGER NOT NULL DEFAULT 5,
-  taste_snapshot_json TEXT NOT NULL DEFAULT '{}',
-  visual_ref_ids_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'pending',
+  influence_json TEXT NOT NULL DEFAULT '{}',
+  generation_count INTEGER NOT NULL DEFAULT 0,
+  like_count INTEGER NOT NULL DEFAULT 0,
+  dislike_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
-  started_at TEXT,
+  ready_at TEXT,
+  served_at TEXT,
   completed_at TEXT,
-  updated_at TEXT NOT NULL,
   FOREIGN KEY (clone_id) REFERENCES clone_profiles(id) ON DELETE CASCADE,
   UNIQUE(clone_id, batch_number)
 );
+```
 
--- Blitz swipes record per-card feedback
+Status values: `pending`, `generating`, `ready`, `active`, `completed`,
+`failed`.
+
+### blitz_swipes
+
+Records individual like/dislike decisions per output.
+
+```sql
 CREATE TABLE IF NOT EXISTS blitz_swipes (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   clone_id TEXT NOT NULL,
   batch_id TEXT NOT NULL,
-  generation_output_id TEXT NOT NULL,
+  generation_output_id TEXT,
   visual_reference_id TEXT,
-  direction TEXT NOT NULL,
-  aesthetic_tags_json TEXT NOT NULL DEFAULT '[]',
-  metadata_json TEXT NOT NULL DEFAULT '{}',
+  action TEXT NOT NULL,
+  output_metadata_json TEXT NOT NULL DEFAULT '{}',
+  swipe_index INTEGER NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY (batch_id) REFERENCES blitz_batches(id) ON DELETE CASCADE,
-  FOREIGN KEY (generation_output_id) REFERENCES generation_outputs(id) ON DELETE CASCADE,
-  UNIQUE(batch_id, generation_output_id)
+  FOREIGN KEY (generation_output_id) REFERENCES generation_outputs(id)
+    ON DELETE SET NULL,
+  FOREIGN KEY (visual_reference_id) REFERENCES visual_references(id)
+    ON DELETE SET NULL,
+  UNIQUE(batch_id, swipe_index)
 );
-
-CREATE INDEX IF NOT EXISTS idx_blitz_batches_clone_status
-  ON blitz_batches(clone_id, status, batch_number);
-CREATE INDEX IF NOT EXISTS idx_blitz_batches_user_date
-  ON blitz_batches(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_blitz_swipes_batch
-  ON blitz_swipes(batch_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_blitz_swipes_user_clone
-  ON blitz_swipes(user_id, clone_id, created_at DESC);
 ```
 
-### Modifications to existing tables
+`output_metadata_json` snapshots the visual reference's aesthetic tags,
+niche cluster, and source platform at swipe time. This is the data used
+for influence computation.
 
-`inspiration_bubbles`: already has `clone_id` column. The onboarding route
-(`save_bubbles`) must require `clone_id` and reject requests without it.
-Bubbles are per clone, not per user.
+### generation_daily_usage
 
-`generation_jobs`: add `blitz_batch_id TEXT` column referencing
-`blitz_batches(id)`. This links generation jobs to their batch.
+Tracks per-user daily generation consumption with configurable limits.
+
+```sql
+CREATE TABLE IF NOT EXISTS generation_daily_usage (
+  user_id TEXT NOT NULL,
+  usage_date TEXT NOT NULL,
+  images_generated INTEGER NOT NULL DEFAULT 0,
+  images_limit INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, usage_date)
+);
+```
+
+### blitz_config
+
+App-level configurable parameters. Stored in D1 so they can be changed
+without redeploying. Environment variables or feature flags can override.
+
+```sql
+CREATE TABLE IF NOT EXISTS blitz_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
+Initial keys:
+
+- `batch_size`: `5`
+- `free_daily_limit`: `10`
+- `pro_daily_limit`: `50`
+- `influence_window`: `5` (swipes before influence kicks in)
+- `min_visual_refs`: `5` (minimum pool size before generation)
+- `engagement_threshold`: `10000` (minimum likes for visual reference
+  candidates)
+- `scrape_delay_ms`: `1000` (delay between ScrapeCreators API calls)
+
+## Modified Existing Tables
+
+### inspiration_bubbles
+
+Change: `clone_id` becomes NOT NULL. Bubbles are per-clone.
+
+```sql
+-- Migration: make clone_id required
+-- Existing rows with NULL clone_id should be cleaned up or backfilled
+ALTER TABLE inspiration_bubbles
+  -- SQLite does not support ALTER COLUMN; migration will recreate table
+```
+
+### generation_jobs
+
+Add: `blitz_batch_id` column linking generation jobs to their Blitz batch.
+NULL for non-Blitz generations (future Create flow).
 
 ```sql
 ALTER TABLE generation_jobs ADD COLUMN blitz_batch_id TEXT
   REFERENCES blitz_batches(id) ON DELETE SET NULL;
-CREATE INDEX IF NOT EXISTS idx_generation_jobs_blitz_batch
-  ON generation_jobs(blitz_batch_id);
 ```
 
-`accounts`: add generation quota fields:
+### visual_reference_candidates
+
+Add: `clone_id` column scoping candidates to a clone's niche research.
 
 ```sql
-ALTER TABLE accounts ADD COLUMN daily_generation_limit INTEGER NOT NULL DEFAULT 10;
-ALTER TABLE accounts ADD COLUMN generation_quota_reset_at TEXT;
+ALTER TABLE visual_reference_candidates ADD COLUMN clone_id TEXT
+  REFERENCES clone_profiles(id) ON DELETE CASCADE;
+```
+
+### visual_references
+
+Add: `clone_id` column. Accepted visual references belong to a specific
+clone's pool.
+
+```sql
+ALTER TABLE visual_references ADD COLUMN clone_id TEXT
+  REFERENCES clone_profiles(id) ON DELETE CASCADE;
+```
+
+### niche_research_queries
+
+Add: `clone_id` column. Research queries scoped per-clone.
+
+```sql
+ALTER TABLE niche_research_queries ADD COLUMN clone_id TEXT
+  REFERENCES clone_profiles(id) ON DELETE SET NULL;
+```
+
+### niche_knowledge
+
+Add: `clone_id` column. Knowledge bits scoped per-clone.
+
+```sql
+ALTER TABLE niche_knowledge ADD COLUMN clone_id TEXT
+  REFERENCES clone_profiles(id) ON DELETE SET NULL;
+```
+
+### user_inspiration_pool
+
+Add: `clone_id` column (NOT NULL). Pool entries scoped per-clone.
+Update unique constraint to `(clone_id, visual_reference_id)`.
+
+```sql
+ALTER TABLE user_inspiration_pool ADD COLUMN clone_id TEXT NOT NULL
+  REFERENCES clone_profiles(id) ON DELETE CASCADE;
+-- Recreate unique constraint: UNIQUE(clone_id, visual_reference_id)
+```
+
+## New Indexes
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_blitz_batches_clone_status
+  ON blitz_batches(clone_id, status, batch_number DESC);
+CREATE INDEX IF NOT EXISTS idx_blitz_batches_user_date
+  ON blitz_batches(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_blitz_swipes_batch
+  ON blitz_swipes(batch_id, swipe_index);
+CREATE INDEX IF NOT EXISTS idx_blitz_swipes_clone
+  ON blitz_swipes(clone_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_generation_daily_usage_date
+  ON generation_daily_usage(user_id, usage_date DESC);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_batch
+  ON generation_jobs(blitz_batch_id) WHERE blitz_batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_visual_references_clone
+  ON visual_references(clone_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_visual_ref_candidates_clone
+  ON visual_reference_candidates(clone_id, human_presence_status);
+CREATE INDEX IF NOT EXISTS idx_niche_research_queries_clone
+  ON niche_research_queries(clone_id, status);
+CREATE INDEX IF NOT EXISTS idx_niche_knowledge_clone
+  ON niche_knowledge(clone_id, cluster);
 ```
 
 ## API Routes
 
-### Blitz routes
+### New Routes
 
-```
-GET  /api/blitz/current?cloneId=X
-```
+`GET /api/blitz/current?clone_id={clone_id}`
 
-Returns the current active batch for the clone. If no batch exists and quota
-allows, creates the first batch and enqueues generation.
+Returns the current or next ready Blitz batch for a clone.
 
-Response:
+Response when batch is ready:
+
 ```json
 {
   "batch": {
-    "id": "batch_xxx",
-    "cloneId": "clone_xxx",
-    "batchNumber": 1,
+    "id": "batch_abc",
+    "batch_number": 3,
     "status": "ready",
-    "cards": [
+    "images": [
       {
-        "outputId": "out_xxx",
-        "mediaId": "media_xxx",
-        "mediaUrl": "/api/media/media_xxx",
-        "visualReferenceId": "vref_xxx",
-        "aestheticTags": ["streetwear", "neon"]
+        "output_id": "out_1",
+        "media_url": "/api/media/m_1",
+        "visual_reference_id": "vref_1",
+        "swipe_index": 0,
+        "swiped": false
       }
     ]
   },
-  "nextBatchStatus": "generating",
-  "quotaRemaining": 5,
-  "quotaTotal": 10,
-  "quotaExhausted": false
+  "usage": {
+    "images_today": 15,
+    "daily_limit": 50,
+    "remaining": 35
+  },
+  "next_batch_status": "generating"
 }
 ```
 
-```
-POST /api/blitz/swipe
+Response when no batch is ready:
+
+```json
+{
+  "batch": null,
+  "status": "generating",
+  "progress": {
+    "phase": "niche_research",
+    "detail": "Scraping visual references..."
+  }
+}
 ```
 
-Records a swipe on a card. `direction` is `"like"` or `"dislike"`.
+`POST /api/blitz/swipe`
+
+Records a like or dislike on a Blitz image.
 
 Request:
+
 ```json
 {
-  "batchId": "batch_xxx",
-  "outputId": "out_xxx",
-  "direction": "like"
+  "batch_id": "batch_abc",
+  "output_id": "out_1",
+  "action": "like"
 }
 ```
-
-On the first swipe of a batch, triggers pre-generation of the next batch if
-quota allows and no next batch exists.
-
-On batch completion (all cards swiped), marks the batch `completed` and stores
-the taste snapshot for future influence.
 
 Response:
-```json
-{
-  "swipeId": "swipe_xxx",
-  "batchProgress": { "swiped": 1, "total": 5 },
-  "nextBatchTriggered": true
-}
-```
-
-### Niche research routes (internal/debug)
-
-```
-GET  /api/niche/status?cloneId=X
-```
-
-Returns pipeline status for the clone: seed/expand/visual stage completion,
-query count, knowledge count, visual reference count, accepted reference count.
-
-### Modified existing routes
-
-`POST /api/onboarding/bubbles`: require `cloneId` in the request body. Reject
-if missing. Store bubbles with `clone_id`. Enqueue `SeedFromBubbles` with
-`clone_id`.
-
-## Queue Messages
-
-### Niche Research Queue
-
-Existing message extended with new variants:
-
-```rust
-pub enum NicheResearchMessage {
-    SeedFromBubbles {
-        user_id: String,
-        clone_id: String,
-        bubble_ids: Vec<String>,
-        moderation_level: u8,
-    },
-    ExpandClusters {
-        user_id: String,
-        clone_id: String,
-    },
-    ResearchVisuals {
-        user_id: String,
-        clone_id: String,
-        search_terms: Vec<String>,
-        hashtags: Vec<String>,
-        engagement_threshold: u32,
-    },
-    VerifyHumanPresence {
-        user_id: String,
-        clone_id: String,
-        candidate_ids: Vec<String>,
-    },
-}
-```
-
-### Generation Queue
-
-New message variant for batch generation:
-
-```rust
-pub enum GenerationMessage {
-    GenerateBlitzBatch {
-        batch_id: String,
-        clone_id: String,
-        user_id: String,
-        visual_reference_ids: Vec<String>,
-        taste_snapshot_json: String,
-    },
-}
-```
-
-## Taste Influence System
-
-### Snapshot format
-
-After a batch is completed, the system builds a taste snapshot from all
-completed batches for that clone:
 
 ```json
 {
-  "totalSwipes": 10,
-  "likes": 6,
-  "dislikes": 4,
-  "likedTags": {
-    "streetwear": 3,
-    "neon": 2,
-    "urban": 2
-  },
-  "dislikedTags": {
-    "minimal": 2,
-    "pastel": 1
-  },
-  "likedVisualRefIds": ["vref_1", "vref_3", "vref_5"],
-  "dislikedVisualRefIds": ["vref_2", "vref_4"]
+  "swipe_index": 0,
+  "batch_progress": "1/5",
+  "batch_complete": false,
+  "next_batch_triggered": true
 }
 ```
 
-### Visual reference selection with taste
+Side effects:
 
-When generating a batch WITH taste influence:
+- Records `blitz_swipes` row with metadata snapshot.
+- On first swipe of batch: triggers next batch generation (uses influence
+  from all previously completed batches).
+- On last swipe (5/5): marks batch `completed`.
+- Rejects duplicate swipe for same swipe_index.
 
-1. Load the clone's visual reference pool (accepted `visual_references`).
-2. Score each reference by:
-   - Base score from `user_inspiration_pool.score`.
-   - Boost for references with tags matching `likedTags` (proportional to
-     frequency).
-   - Penalty for references with tags matching `dislikedTags`.
-   - Freshness bonus for unused references.
-   - Variety penalty for references with same tags as already-selected refs in
-     this batch.
-3. Select top `batch_size` references by score.
-4. Store the selected IDs in `blitz_batches.visual_ref_ids_json`.
+`GET /api/blitz/history?clone_id={clone_id}&limit=10`
 
-When generating WITHOUT taste (first batch, or pre-generated batch before
-swipes are in):
+Returns completed batch summaries for a clone.
 
-1. Select from the visual reference pool randomly with variety weighting.
-2. Prefer references not yet used in prior batches.
+### Modified Routes
 
-### Influence prompt to Kimi K2.6
+`POST /api/onboarding/bubbles`
 
-For taste-influenced batches, send the taste snapshot to Kimi K2.6 with a
-selection prompt:
+Changes:
 
-```
-Given these visual references and the user's taste history, select the best 5
-for the next generation batch. Prioritize references that match liked aesthetic
-tags while maintaining variety.
+- Validate at least 5 bubbles selected (required for niche research).
+- Save bubbles with `clone_id` NOT NULL.
+- Send `niche_research_queue` message with type `seed_from_bubbles`.
 
-Taste: {taste_snapshot}
-Available references: [{id, tags, description}, ...]
+`GET /api/account/usage`
 
-Return JSON: { "selectedIds": ["id1", "id2", ...], "reasoning": "..." }
-```
+Changes:
 
-This is the `BlitzTasteInfluence` AI task. Log in `ai_model_invocations`.
+- Add `generation_usage` field with `images_today`, `daily_limit`,
+  `remaining`, and `limit_resets_at`.
 
-## Configuration
+## Niche Research Queue Handler
 
-All tuning knobs as Wrangler env vars with sensible defaults:
+### Message Types
 
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `BLITZ_BATCH_SIZE` | `5` | Cards per Blitz batch |
-| `FREE_DAILY_GENERATION_LIMIT` | `10` | Free user daily quota |
-| `PRO_DAILY_GENERATION_LIMIT` | `50` | Pro user daily quota |
-| `SCRAPE_DELAY_MS` | `1000` | Delay between ScrapeCreators calls |
-| `SCRAPE_MAX_POSTS_PER_QUERY` | `10` | Max posts per scrape query |
-| `ENGAGEMENT_THRESHOLD` | `10000` | Min likes for visual research |
-| `HUMAN_PRESENCE_MIN_CONFIDENCE` | `0.7` | Min confidence for human detection |
-| `OPENROUTER_MODEL` | `moonshotai/kimi-k2.6` | Model for niche research |
-| `NICHE_RESEARCH_MAX_QUERIES` | `30` | Max queries extracted per seed |
-| `NICHE_RESEARCH_MAX_KNOWLEDGE` | `60` | Max knowledge bits per seed |
+`SeedFromBubbles` (initial trigger from onboarding):
 
-## File Ownership
-
-New files:
-
-```
-workers/product/src/routes/blitz.rs
-workers/product/src/services/blitz.rs
-workers/product/src/services/niche_research.rs
-workers/product/src/services/scrape_creators.rs
-workers/product/src/services/openrouter.rs
-workers/product/src/services/taste.rs
-workers/product/src/domain/quota.rs
-config/d1/migrations/1002_blitz_niche_research.sql
+```json
+{
+  "type": "seed_from_bubbles",
+  "user_id": "user_...",
+  "clone_id": "clone_...",
+  "bubble_ids": ["b1", "b2", "b3", "b4", "b5"],
+  "moderation_level": 4,
+  "platforms": ["tiktok", "reddit", "instagram", "youtube"]
+}
 ```
 
-Modified files:
+`RefreshPool` (periodic or on-demand refresh):
 
-```
-workers/product/src/http/router.rs          -- add blitz routes
-workers/product/src/queues/messages.rs      -- add GenerationMessage
-workers/product/src/queues/niche_research.rs -- implement pipeline stages
-workers/product/src/routes/onboarding.rs    -- require clone_id for bubbles
-workers/product/src/domain/entitlements.rs  -- add generation limits
-workers/product/src/ai/tasks.rs             -- add BlitzTasteInfluence
-workers/product/src/ai/model_router.rs      -- add OpenRouter provider routing
-workers/product/wrangler.product.jsonc      -- add new env vars
+```json
+{
+  "type": "refresh_pool",
+  "user_id": "user_...",
+  "clone_id": "clone_...",
+  "reason": "pool_depleted"
+}
 ```
 
-## Testing Strategy
+### Pipeline Stages
 
-Unit tests (pure Rust, no bindings):
+Stage 1: Seed extraction.
 
-- Quota calculation: daily limit check, reset logic, plan-based limits.
-- Taste snapshot building from swipe records.
-- Visual reference scoring with taste influence.
-- Batch state transitions.
-- ScrapeCreators response parsing.
-- OpenRouter response parsing.
-- Human presence result parsing and acceptance thresholds.
+- Load selected bubbles (title, vibe_summary, search_queries_json).
+- Send to Workers AI Kimi K2.6 with seed extraction prompt.
+- Extract 15-25 search queries for trending visual content.
+- Insert into `niche_research_queries` with `clone_id`.
 
-Route tests (with D1/queue mocks where available):
+Stage 2: Platform scraping.
 
-- `GET /api/blitz/current` returns 401 without auth.
-- `POST /api/blitz/swipe` validates direction enum.
-- `POST /api/blitz/swipe` returns `quotaExhausted` when limit reached.
-- `POST /api/onboarding/bubbles` rejects missing `cloneId`.
-- `GET /api/niche/status` returns pipeline stage counts.
+- For each query and platform, call ScrapeCreators HTTP API:
+  - TikTok: `GET /v1/tiktok/search/keyword?sort_by=most_liked&trim=true`
+  - TikTok: `GET /v1/tiktok/search/hashtag?trim=true`
+  - Reddit: `GET /v1/reddit/search?sort=top&trim=true`
+  - Instagram: `GET /v2/instagram/reels/search`
+  - YouTube: `GET /v1/youtube/search`
+- Rate limit: 1 second delay between calls (configurable).
+- Store results in `discovery_sources` and `discovery_items`.
+- Deduplicate by `(platform, external_id)`.
 
-Queue tests:
+Stage 3: Knowledge extraction.
 
-- Niche research message variants serialize/deserialize correctly.
-- Generation batch message includes taste snapshot.
+- Batch discovery item text (titles, descriptions, captions).
+- Send to Kimi K2.6 with extraction prompt adapted from social-page.
+- Extract 30-60 knowledge bits and 15-30 deeper queries.
+- Insert into `niche_knowledge` and `niche_research_queries` with
+  `clone_id`.
+
+Stage 4: Clustering.
+
+- Send all knowledge bits and queries for this clone to Kimi K2.6.
+- Group into subtopic clusters with kebab-case names.
+- Update `cluster` field on `niche_knowledge` and
+  `niche_research_queries`.
+- For each cluster, generate 3-5 deeper search queries.
+- Run Stage 2 scraping on the deeper queries (one deepening round).
+
+Stage 5: Visual reference selection.
+
+- Filter discovery items by engagement threshold (configurable, default
+  10K likes).
+- Filter for items with image URLs.
+- For each candidate image:
+  - Insert into `visual_reference_candidates` with `clone_id`.
+  - Run Kimi K2.6 vision check for single-human presence.
+  - Accept: exactly one human, confidence above 0.7.
+  - Reject: no human, multiple humans, low quality, text-heavy.
+  - Accepted candidates inserted into `visual_references` with
+    `clone_id`, aesthetic tags, human presence type, and score.
+- If 5 or more visual references accepted and the clone's
+  `soul_status` is `ready`: create first `blitz_batches` row and
+  enqueue generation.
+- If 5 or more visual references accepted but `soul_status` is not
+  `ready`: mark research as `pool_ready_awaiting_soul`. The first
+  Blitz batch is created when the clone training queue marks the Soul
+  ready.
+- If fewer than 5: mark niche research as `insufficient_refs`. Can
+  retry with broader queries later.
+- If the visual reference pool is depleted during steady-state (all
+  references used), send a `RefreshPool` message to replenish.
+
+### AI Prompts
+
+Seed extraction prompt:
+
+```text
+Given these aesthetic directions for a creator clone:
+{bubble titles + vibe summaries}
+
+Generate 15-25 search queries for finding trending visual content on
+TikTok, Instagram, YouTube, and Reddit.
+Focus on: content with a single person, outfit/lifestyle inspiration,
+creator aesthetics, and trending visual styles.
+
+Return JSON: { "queries": [{ "query": "...", "platforms": ["tiktok", "reddit", ...] }] }
+```
+
+Knowledge extraction prompt (adapted from social-page):
+
+```text
+You are analyzing social media content about "{clone's niche directions}".
+Extract two things:
+
+1. QUERIES: Recurring questions or subtopics people search for.
+   Format: short, searchable phrases. Extract 15-30 unique queries.
+
+2. KNOWLEDGE BITS: Specific, actionable tips or insights.
+   Deduplicate similar advice. Keep each under 30 words.
+   Include source type.
+
+Return JSON: {
+  "queries": [{ "query": "...", "source": "reddit|tiktok|instagram|youtube" }],
+  "knowledge": [{ "bit": "...", "source_platform": "..." }]
+}
+```
+
+Clustering prompt (adapted from social-page):
+
+```text
+Group these knowledge bits and search queries into coherent subtopic
+clusters. Name each with a short kebab-case label.
+
+Return JSON: {
+  "clusters": [{
+    "name": "kebab-case-name",
+    "bit_ids": [1, 2, 3],
+    "query_ids": [1, 2],
+    "description": "what this cluster covers"
+  }]
+}
+```
+
+Human presence detection prompt:
+
+```text
+Analyze this image. Does it contain exactly one human person?
+
+Return JSON: {
+  "has_human": true/false,
+  "human_count": 0/1/2+,
+  "human_type": "full_body" | "upper_body" | "face" | "partial" | "none",
+  "confidence": 0.0-1.0,
+  "aesthetic_tags": ["minimalist", "street", "warm", ...],
+  "rejection_reason": null | "no_human" | "multiple_humans"
+                      | "low_quality" | "text_heavy"
+}
+```
+
+## Generation Queue Handler
+
+### Message Types
+
+`GenerateBlitzBatch`:
+
+```json
+{
+  "type": "generate_blitz_batch",
+  "batch_id": "batch_...",
+  "clone_id": "clone_...",
+  "user_id": "user_...",
+  "idempotency_key": "blitz_gen:batch_...",
+  "visual_reference_ids": ["vref_1", "vref_2", "vref_3", "vref_4", "vref_5"],
+  "provider_soul_id": "soul_..."
+}
+```
+
+`PollGeneration`:
+
+```json
+{
+  "type": "poll_generation",
+  "job_id": "gen_...",
+  "batch_id": "batch_...",
+  "attempt": 1,
+  "max_attempts": 30
+}
+```
+
+### Handler Steps
+
+For each visual reference in the batch:
+
+1. Check Soul readiness. Verify `clone_profiles.soul_status` is `ready`
+   and `provider_soul_id` is set. If not ready, skip batch.
+2. Check daily quota. Load `generation_daily_usage` for user and today.
+   If at limit, skip this image.
+2. Materialize visual reference. Download source image to R2 if not
+   already cached.
+3. Create generation job. Insert `generation_jobs` row with
+   `blitz_batch_id`, `input_visual_reference_id`, status `queued`.
+4. Submit to Higgsfield. Authenticate, lease provider account, call
+   Higgsfield MCP `text2image_soul_v2` with empty prompt, input image
+   URL, and Soul ID.
+5. Poll or complete. If provider returns immediately, persist output.
+   If async, re-enqueue `PollGeneration` with delay.
+6. On completion: download generated image, store in R2, insert
+   `generation_outputs` row, settle credit, increment
+   `blitz_batches.generation_count`.
+7. Check batch complete. If `generation_count == batch_size`, set batch
+   status to `ready`.
+
+### Error Handling
+
+- Provider auth failure: retry with different provider account.
+- Provider quota exhausted: mark batch generating, retry later.
+- Image download failure: retry 3 times, then mark individual job failed.
+- All jobs fail: mark batch failed, refund all credits.
+- Partial failure: mark batch ready with fewer images, deliver what
+  completed.
+
+## Visual Reference Selection with Influence
+
+### Without Influence (Batch 1 and 2)
+
+Select from `visual_references` where `clone_id` matches, status is
+`active`, and not already used in a previous batch. Order by recency.
+
+### With Influence (Batch 3+)
+
+Accumulated `influence_json` on the batch:
+
+```json
+{
+  "liked_tags": { "minimalist": 3, "street": 2 },
+  "disliked_tags": { "neon": 2 },
+  "liked_clusters": { "outfit-inspo": 2 },
+  "disliked_clusters": { "formal-wear": 1 },
+  "liked_platforms": { "tiktok": 3, "instagram": 2 }
+}
+```
+
+Scoring per visual reference:
+
+```text
+base_score     = human_presence_score
+tag_boost      = sum(liked_tags[tag] for tag in ref.aesthetic_tags)
+tag_penalty    = sum(disliked_tags[tag] for tag in ref.aesthetic_tags)
+cluster_boost  = liked_clusters.get(ref.cluster, 0)
+freshness      = 1.0 if unused, 0.3 if used more than 2 batches ago
+
+final_score = base_score
+            + (tag_boost * 0.3)
+            - (tag_penalty * 0.2)
+            + (cluster_boost * 0.2)
+            + (freshness * 0.3)
+```
+
+Variety constraints: max 2 from the same cluster, max 3 from the same
+platform. Sort by `final_score` descending, take top `batch_size`.
+
+## Entitlements and Credits
+
+### Daily Generation Limits
+
+- Free users: 10 images per day (configurable via `blitz_config`).
+- Pro users: 50 images per day (configurable via `blitz_config`).
+- Limits are per-user, not per-clone.
+- Reset daily at midnight UTC (configurable reset period).
+- Credits consumed per image generated, regardless of swipe result.
+
+### Quota Enforcement
+
+- Check `generation_daily_usage` before creating each generation job.
+- If user is at limit, do not generate. Return quota info to frontend.
+- Frontend shows remaining generations and next reset time.
+
+### Credit Flow
+
+1. Reserve: increment `generation_daily_usage.images_generated` before
+   submitting provider job.
+2. Settle: on successful generation, credit stays consumed.
+3. Refund: on failed generation, decrement `images_generated`.
+4. Idempotency: generation job idempotency key prevents double-counting.
 
 ## Reliability
 
-- Idempotency keys for batch creation: `blitz:{clone_id}:{batch_number}`.
-- Idempotency keys for swipes: `swipe:{batch_id}:{output_id}`.
-- Batch generation is atomic: if any image fails, retry the batch (not
-  individual images).
-- ScrapeCreators calls use retry with exponential backoff (max 3 attempts).
-- OpenRouter calls use retry with exponential backoff (max 3 attempts).
-- If visual reference pool is empty (research not yet done), fall back to
-  bubble-derived prompts for generation.
-- DLQ for failed niche research messages.
+- Idempotency keys on batch creation, generation jobs, swipe recording,
+  credit operations, and provider submissions.
+- DLQ for niche_research_queue and generation_queue.
+- Stale batch reconciliation: scheduled check for batches stuck in
+  `generating` status beyond a timeout.
+- Provider lease release on terminal success or failure.
+- Typed failure reasons for user-visible states.
 
-## Privacy
+## Testing Strategy
 
-- Visual reference candidates store public source URLs only.
-- Swipe data is scoped to user and not exposed to other users.
-- ScrapeCreators API key is a Cloudflare Secret, never in D1 or client
-  responses.
-- OpenRouter API key is a Cloudflare Secret.
-- Taste snapshots contain aggregate tag counts, not raw image data.
+### Unit Tests
+
+- Blitz batch lifecycle state transitions.
+- Visual reference scoring with influence (tag boosts, penalties, variety).
+- Daily usage quota checks (under, at, over limit, reset).
+- Influence accumulation (merge swipe metadata into influence_json).
+- ScrapeCreators response parsing (TikTok, Reddit, Instagram, YouTube).
+- Human presence result validation (single-human accept, multi/none reject).
+- Batch pre-fetch trigger logic (first swipe triggers, subsequent no-op).
+- Configurable batch size and limits.
+
+### Route Tests
+
+- `GET /api/blitz/current` (no batch, generating, ready, active states).
+- `POST /api/blitz/swipe` (valid swipe, duplicate rejection, batch
+  completion, next-batch trigger).
+- `GET /api/blitz/history` (pagination, clone scoping).
+- `POST /api/onboarding/bubbles` (≥5 validation, queue enqueue).
+- `GET /api/account/usage` (generation usage included).
+
+### Queue Handler Tests
+
+- Niche research: seed extraction to query storage.
+- Niche research: visual reference acceptance and rejection.
+- Generation: batch creation to job submission.
+- Generation: credit reservation, settlement, and refund.
+- Generation: batch completion detection.
+- Generation: partial failure handling.
+- Generation: poll and retry lifecycle.
+
+### Integration Tests
+
+- Full pipeline: bubbles to niche research to generation to Blitz.
+- ScrapeCreators API real calls with staging key.
+- Workers AI Kimi K2.6 real calls.
+- Higgsfield MCP real generation.
+- Daily limit enforcement end-to-end.
 
 ## Documentation Sources
 
-- ScrapeCreators OpenAPI: `docs/scrape-creators-openapi.yaml`
-- Kimi K2.6 on OpenRouter: `https://openrouter.ai/moonshotai/kimi-k2.6`
-- Cloudflare Queues: `https://developers.cloudflare.com/queues/`
-- Existing niche research prototype: `../social-page/pipeline`
-- Existing Rust Worker: `workers/product/src/`
-- Existing schema: `config/d1/migrations/1000_rust_product_core.sql`
+- Workers AI Kimi K2.6:
+  https://developers.cloudflare.com/workers-ai/models/kimi-k2.6/
+- Workers AI structured output:
+  https://developers.cloudflare.com/workers-ai/
+- workers-rs D1, Queue, R2 bindings:
+  https://github.com/cloudflare/workers-rs
+- ScrapeCreators HTTP API:
+  https://api.scrapecreators.com (x-api-key auth)
+- ScrapeCreators OpenAPI spec:
+  docs/scrape-creators-openapi.yaml
+- Existing Rust Product Worker:
+  workers/product/src/
+- Existing D1 migrations:
+  config/d1/migrations/1000_rust_product_core.sql
+- Niche research concept prototype:
+  ../social-page/pipeline/
+- Higgsfield MCP endpoint:
+  https://mcp.higgsfield.ai/mcp
+- Previous design spec:
+  docs/superpowers/specs/2026-05-08-rust-product-backend-design.md
