@@ -26,7 +26,7 @@ use mirai_product_worker::services::provider_accounts::{
 };
 use mirai_product_worker::providers::scrapecreators::{
     build_scrape_request, normalize_instagram_reels_search, normalize_tiktok_keyword_search,
-    ScrapePlatform,
+    scrape_platform_from_str, ScrapePlatform,
 };
 use serde_json::json;
 
@@ -460,6 +460,18 @@ fn scrape_request_builder_allows_only_tiktok_and_instagram() {
         "https://api.scrapecreators.com/v1/tiktok/search/keyword?query=streetwear%20fit&sort_by=date-posted&date_posted=last-6-months&trim=true&region=US"
     );
 
+    let hashtag = build_scrape_request(
+        "https://api.scrapecreators.com",
+        ScrapePlatform::TikTokHashtag,
+        "streetwear",
+        "US",
+    )
+    .unwrap();
+    assert_eq!(
+        hashtag,
+        "https://api.scrapecreators.com/v1/tiktok/search/hashtag?hashtag=streetwear&trim=true&region=US"
+    );
+
     let instagram = build_scrape_request(
         "https://api.scrapecreators.com",
         ScrapePlatform::InstagramReels,
@@ -471,6 +483,13 @@ fn scrape_request_builder_allows_only_tiktok_and_instagram() {
         instagram,
         "https://api.scrapecreators.com/v2/instagram/reels/search?query=clean%20girl%20morning&date_posted=last-year"
     );
+}
+
+#[test]
+fn scrape_platform_parser_rejects_unsupported_platforms() {
+    let err = scrape_platform_from_str("youtube", "keyword").unwrap_err();
+
+    assert_eq!(err.to_string(), "unsupported scrape platform");
 }
 
 #[test]
