@@ -4,7 +4,7 @@ mod db;
 pub mod domain;
 mod env;
 mod http;
-mod providers;
+pub mod providers;
 mod queues;
 pub mod routes;
 pub mod services;

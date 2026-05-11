@@ -16,6 +16,10 @@ use mirai_product_worker::services::media::{media_storage_key, normalize_extensi
 use mirai_product_worker::services::provider_accounts::{
     choose_provider_account, ProviderAccountCandidate,
 };
+use mirai_product_worker::providers::scrapecreators::{
+    build_scrape_request, normalize_instagram_reels_search, normalize_tiktok_keyword_search,
+    ScrapePlatform,
+};
 use serde_json::json;
 
 #[test]
@@ -409,3 +413,92 @@ fn clone_handle_suffix_preserves_length_limit() {
     );
     assert_eq!(handle_with_suffix("my-soul", 3), "my-soul-3");
 }
+
+#[test]
+fn scrape_request_builder_allows_only_tiktok_and_instagram() {
+    let tiktok = build_scrape_request(
+        "https://api.scrapecreators.com",
+        ScrapePlatform::TikTokKeyword,
+        "streetwear fit",
+        "US",
+    )
+    .unwrap();
+    assert_eq!(
+        tiktok,
+        "https://api.scrapecreators.com/v1/tiktok/search/keyword?query=streetwear%20fit&sort_by=date-posted&date_posted=last-6-months&trim=true&region=US"
+    );
+
+    let instagram = build_scrape_request(
+        "https://api.scrapecreators.com",
+        ScrapePlatform::InstagramReels,
+        "clean girl morning",
+        "US",
+    )
+    .unwrap();
+    assert_eq!(
+        instagram,
+        "https://api.scrapecreators.com/v2/instagram/reels/search?query=clean%20girl%20morning&date_posted=last-year"
+    );
+}
+
+#[test]
+fn tiktok_keyword_normalizer_extracts_recent_image_candidates() {
+    let raw = serde_json::json!({
+        "search_item_list": [{
+            "aweme_info": {
+                "aweme_id": "725",
+                "desc": "city mirror fit",
+                "create_time": 1767225600,
+                "create_time_utc": "2026-01-01T00:00:00.000Z",
+                "share_url": "https://www.tiktok.com/@creator/video/725",
+                "statistics": { "digg_count": 23456 },
+                "author": { "unique_id": "creator" },
+                "video": {
+                    "cover": { "url_list": ["https://cdn.example/cover.jpg"] }
+                }
+            }
+        }]
+    });
+
+    let items = normalize_tiktok_keyword_search(&raw);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].external_id, "725");
+    assert_eq!(items[0].platform, "tiktok");
+    assert_eq!(items[0].title, "city mirror fit");
+    assert_eq!(items[0].like_count, Some(23456));
+    assert_eq!(
+        items[0].source_published_at.as_deref(),
+        Some("2026-01-01T00:00:00.000Z")
+    );
+    assert_eq!(
+        items[0].image_url.as_deref(),
+        Some("https://cdn.example/cover.jpg")
+    );
+}
+
+#[test]
+fn instagram_reels_normalizer_extracts_reel_candidates() {
+    let raw = serde_json::json!({
+        "reels": [{
+            "shortcode": "ABC123",
+            "caption": { "text": "neutral outfit morning" },
+            "thumbnail_url": "https://cdn.example/ig.jpg",
+            "url": "https://www.instagram.com/reel/ABC123/",
+            "like_count": 6000,
+            "owner": { "username": "igcreator" },
+            "taken_at": "2026-02-03T04:05:06.000Z"
+        }]
+    });
+
+    let items = normalize_instagram_reels_search(&raw);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].external_id, "ABC123");
+    assert_eq!(items[0].platform, "instagram");
+    assert_eq!(items[0].author_handle, "igcreator");
+    assert_eq!(items[0].like_count, Some(6000));
+    assert_eq!(
+        items[0].source_published_at.as_deref(),
+        Some("2026-02-03T04:05:06.000Z")
+    );
+}
+
