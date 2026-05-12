@@ -162,7 +162,7 @@ async fn generate_blitz_batch(
             "providerSoulId": provider_soul_id,
             "visualReferenceId": visual_reference_id,
         });
-        insert_generation_job(
+        if let Err(error) = insert_generation_job(
             db,
             &job_id,
             user_id,
@@ -171,7 +171,11 @@ async fn generate_blitz_batch(
             visual_reference_id,
             &request_json,
         )
-        .await?;
+        .await
+        {
+            refund_image(db, user_id).await?;
+            return Err(error);
+        }
 
         if let Err(error) = submit_generation_job(
             db,
@@ -296,18 +300,34 @@ async fn poll_generation(
             return Ok(());
         }
     };
-    let validation = validate_access_token(&token.access_token)
-        .await
-        .map_err(|error| Error::RustError(error.to_string()))?;
+    let validation = match validate_access_token(&token.access_token).await {
+        Ok(validation) => validation,
+        Err(error) => {
+            return handle_poll_failure(
+                db,
+                env,
+                job_id,
+                batch_id,
+                attempt,
+                max_attempts,
+                "provider_poll_auth_failed",
+                &error.to_string(),
+            )
+            .await
+        }
+    };
     if !validation.valid {
-        fail_generation_job(
+        return handle_poll_failure(
             db,
+            env,
             job_id,
+            batch_id,
+            attempt,
+            max_attempts,
             "provider_poll_token_invalid",
             "Higgsfield provider access token is invalid.",
         )
-        .await?;
-        return Ok(());
+        .await;
     }
 
     let provider_job_ids =
@@ -332,34 +352,48 @@ async fn poll_generation(
     {
         Ok(result) => result,
         Err(error) => {
-            record_poll_attempt(db, job_id, attempt, &json!({ "error": error.to_string() }))
-                .await?;
-            if attempt >= max_attempts {
-                fail_generation_job(db, job_id, "generation_poll_exhausted", &error.to_string())
-                    .await?;
-            } else {
-                enqueue_poll(
-                    env,
-                    job_id,
-                    batch_id,
-                    attempt.saturating_add(1),
-                    max_attempts,
-                )
-                .await?;
-            }
-            return Ok(());
+            return handle_poll_failure(
+                db,
+                env,
+                job_id,
+                batch_id,
+                attempt,
+                max_attempts,
+                "generation_poll_exhausted",
+                &error.to_string(),
+            )
+            .await;
         }
     };
 
     if let Some(final_url) = final_image_url(&result.raw_json) {
-        complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await?;
+        if let Err(error) =
+            complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await
+        {
+            return handle_poll_failure(
+                db,
+                env,
+                job_id,
+                batch_id,
+                attempt,
+                max_attempts,
+                "generation_completion_failed",
+                &error.to_string(),
+            )
+            .await;
+        }
         return Ok(());
     }
 
-    record_poll_attempt(db, job_id, attempt, &result.raw_json).await?;
+    let action = poll_failure_action(attempt, max_attempts);
     if provider_status(&result.raw_json).is_some_and(is_failed_provider_status)
-        || attempt >= max_attempts
+        || action == PollFailureAction::Fail
     {
+        if let Err(error) = record_poll_attempt(db, job_id, attempt, &result.raw_json).await {
+            web_sys::console::error_1(
+                &format!("failed to record terminal generation poll attempt: {error:?}").into(),
+            );
+        }
         fail_generation_job(
             db,
             job_id,
@@ -367,18 +401,43 @@ async fn poll_generation(
             "Generation provider returned a terminal failure or polling exhausted.",
         )
         .await?;
-    } else {
-        enqueue_poll(
-            env,
-            job_id,
-            batch_id,
-            attempt.saturating_add(1),
-            max_attempts,
-        )
-        .await?;
+    } else if let PollFailureAction::Retry(next_attempt) = action {
+        record_poll_attempt(db, job_id, attempt, &result.raw_json).await?;
+        enqueue_poll(env, job_id, batch_id, next_attempt, max_attempts).await?;
     }
 
     Ok(())
+}
+
+async fn handle_poll_failure(
+    db: &D1Database,
+    env: &Env,
+    job_id: &str,
+    batch_id: &str,
+    attempt: u8,
+    max_attempts: u8,
+    error_code: &str,
+    error_message: &str,
+) -> WorkerResult<()> {
+    let attempt_json = json!({
+        "errorCode": error_code,
+        "errorMessage": error_message,
+    });
+
+    match poll_failure_action(attempt, max_attempts) {
+        PollFailureAction::Fail => {
+            if let Err(error) = record_poll_attempt(db, job_id, attempt, &attempt_json).await {
+                web_sys::console::error_1(
+                    &format!("failed to record final generation poll attempt: {error:?}").into(),
+                );
+            }
+            fail_generation_job(db, job_id, error_code, error_message).await
+        }
+        PollFailureAction::Retry(next_attempt) => {
+            record_poll_attempt(db, job_id, attempt, &attempt_json).await?;
+            enqueue_poll(env, job_id, batch_id, next_attempt, max_attempts).await
+        }
+    }
 }
 
 async fn complete_generation_job(
@@ -1052,6 +1111,20 @@ fn is_failed_provider_status(status: String) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollFailureAction {
+    Retry(u8),
+    Fail,
+}
+
+fn poll_failure_action(attempt: u8, max_attempts: u8) -> PollFailureAction {
+    if attempt >= max_attempts {
+        PollFailureAction::Fail
+    } else {
+        PollFailureAction::Retry(attempt.saturating_add(1))
+    }
+}
+
 fn json_string_at(value: &Value, path: &str) -> Option<String> {
     value
         .pointer(path)
@@ -1093,4 +1166,21 @@ fn map_mcp_error(error: HiggsfieldMcpError) -> Error {
 
 fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{poll_failure_action, PollFailureAction};
+
+    #[test]
+    fn poll_failure_action_retries_before_final_attempt() {
+        assert_eq!(poll_failure_action(1, 3), PollFailureAction::Retry(2));
+        assert_eq!(poll_failure_action(2, 3), PollFailureAction::Retry(3));
+    }
+
+    #[test]
+    fn poll_failure_action_fails_on_final_or_exhausted_attempt() {
+        assert_eq!(poll_failure_action(3, 3), PollFailureAction::Fail);
+        assert_eq!(poll_failure_action(4, 3), PollFailureAction::Fail);
+    }
 }
