@@ -3,10 +3,11 @@
 The full lineup of generation models available through Higgsfield. Each entry has its own sweet spot — pick the one that matches your brief. For the actual `--model` ID to pass to `higgsfield generate create`, run `higgsfield model list --json` and look up by display name.
 
 Preferred defaults for examples and quick-start guidance in this repo:
-- **Images/design/text:** `gpt_image_2`, `nano_banana_2`.
-- **Video:** `seedance_2_0`.
-- **Character/stylized image work:** `text2image_soul_v2`
+- **Images/design/text:** `gpt_image_2` (general/high-fidelity) and `nano_banana_2` (character/cartoon).
+- **Video:** `seedance_2_0` (all-purpose serious video).
+- **Character/stylized image work:** `text2image_soul_v2`.
 - **Ads/UGC/product demos:** `marketing_studio_video` or `marketing_studio_image`.
+- **Video analysis:** Virality Predictor (`brain_activity`) for attention, hook, retention, and virality scoring. It may appear under text/analysis because the output is a report, but the input and intent are video analysis.
 
 ---
 
@@ -56,6 +57,14 @@ Preferred defaults for examples and quick-start guidance in this repo:
 
 ---
 
+## Text / analysis models
+
+| Model | Provider | What it's for |
+|---|---|---|
+| Virality Predictor (`brain_activity`) | Higgsfield | **Objective attention proxy for video creative testing.** Scores how effectively a clip captures and sustains attention, useful for hook validation, virality potential, ad review, and product/content focus. Takes a video input and returns a text report with overall score, peak second, sustain, and an Open report link. Raw `.glb` / `.bin` render artifacts stay in JSON/debug output. |
+
+---
+
 ## Picking flow
 
 Practical defaults from production use. Match by intent, not surface keyword. When two could apply, the higher entry wins.
@@ -96,12 +105,17 @@ Studio for ads and brand/product content.
 11. **Stylized cheap experimental** → Wan 2.6.
 12. **Anime / bold-style outputs where defaults feel flat** → Grok Imagine (video). Worth trying.
 
+### Video analysis — pick this default
+
+1. **Evaluate a finished clip's hook, virality potential, attention, retention, or distraction risk** → Virality Predictor (`brain_activity`). It takes `--video`, needs no prompt, and returns a text score/report plus an Open report link rather than generated media.
+
 ### Things to keep in mind
 
 - **Don't invent model names.** Run `higgsfield model list` if you're unsure — submitting an unknown model returns `unknown model "..."`.
 - **Don't downgrade for schema convenience.** If Seedance 2.0 fits the intent, validate or submit it first; do not choose Seedance 1.5 only because it lists a requested duration more explicitly.
+- **Do not misroute video analysis because the output is text.** A request like "analyze this video" or "score this ad" maps to Virality Predictor (`brain_activity`) when the user provides or references a finished video.
 - **Audio reference for Seedance 2.0** comes through the media inputs with role `audio`, not via a separate `generate_audio` flag.
-- **Text-only models reject reference images.** Z Image, Soul Cast, Soul Location, and some Wan configs are text-only; pass no media flags to them.
+- **Prompt-only models reject reference media.** Z Image, Soul Cast, Soul Location, and some Wan configs are prompt-only; pass no media flags to them. Virality Predictor is different: it returns text but requires a video input.
 - **Route branded product visuals through `higgsfield-product-photoshoot`** — its prompt enhancer adds 10 mode-specific templates on top of GPT Image 2. Direct GPT Image 2 generation here is the right call for everything that isn't a product photoshoot.
 - **For cinema video, prefer Cinema Studio Video 3.0** as the modern default; reach for the earlier Cinema Studio Video variants only when the user names them.
 - **When the user names a specific model, use it.** The defaults above cover the common intents — the rest of the catalog exists for users who know what they want.
@@ -120,8 +134,9 @@ Each model accepts a fixed set of media roles. When unsure, run `higgsfield mode
 | Veo 3.1 | `start_image` (max 1) |
 | Veo 3 | `image` (max 1) |
 | Marketing Studio (video) | `image`, `start_image`, `end_image` |
+| Virality Predictor (`brain_activity`) | `video` |
 | Most image models | `image` (1+) |
-| Z Image, Soul Cast, Soul Location | (no media — text-only) |
+| Z Image, Soul Cast, Soul Location | (no media — prompt-only) |
 
 For simple image-to-video, the `start_image` role is what you want. For pure video models that only declare `image`, the `image` flag is auto-remapped to `start_image` by the CLI.
 

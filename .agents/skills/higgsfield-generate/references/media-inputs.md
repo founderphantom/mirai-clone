@@ -1,6 +1,6 @@
 # Media Inputs
 
-How to pass reference images, videos, and audio. Mirrored from MCP server media-handling logic.
+How to pass reference images, videos, audio, and videos for analysis. Mirrored from MCP server media-handling logic.
 
 ## Path or UUID — both work
 
@@ -15,6 +15,10 @@ higgsfield generate create nano_banana_2 --prompt "..." --image <upload_id> --wa
 
 # Job id from a previous generation
 higgsfield generate create seedance_2_0 --prompt "anim" --start-image <previous_job_id> --wait
+
+# Video analysis — CLI uploads the file, Virality Predictor returns a text score/report plus an Open report link.
+# The output is text, but the task is still video analysis.
+higgsfield generate create brain_activity --video ./ad.mp4 --wait
 ```
 
 Type auto-detected from extension:
@@ -31,6 +35,7 @@ Each model declares a closed set of accepted roles via `MEDIA_ROLES`. Pass the r
 |---|---|---|
 | Most image models (`nano_banana_2`, `flux_2`, `seedream_v4_5`, `gpt_image_2`, …) | `image` | 1+ references, often up to 8. |
 | `seedance_2_0` | `image`, `start_image`, `end_image`, `video`, `audio` | Audio is via `medias` (role `audio`), NOT via `--generate-audio`. |
+| `brain_activity` | `video` | Virality Predictor analyzes one uploaded clip and returns a text score report plus an Open report link; no prompt required. Treat "analyze this video" / "score this ad" as this video-analysis flow even though the output is text. Raw `.glb` and `.bin` artifacts stay in JSON/debug output, not normal chat output. |
 | `kling3_0` | `start_image`, `end_image` | Image-to-video with optional last-frame transition. |
 | `kling2_6` | `start_image` | Single frame anchor. |
 | `veo3_1` | `start_image` | Max 1 reference. |
@@ -76,8 +81,9 @@ higgsfield generate create seedance_2_0 \
 The CLI returns specific error messages for known shape mismatches:
 
 - `Model accepts only --image (no roles)` — the model uses the legacy `input_images` shape, not `medias` with roles. Drop role-prefixed flags and use plain `--image`.
-- `Model does not accept media inputs` — the model is text-only (`z_image`, `soul_location`, `soul_cast`, `wan2_6` for some configs). Drop all media flags.
+- `Model does not accept media inputs` — the model is prompt-only (`z_image`, `soul_location`, `soul_cast`, `wan2_6` for some configs). Drop all media flags.
 - `Unknown media role "<role>"` — the role isn't in this model's `MEDIA_ROLES`. Run `higgsfield model get <model>` and check `medias[].roles`.
+- `Missing required params: medias` for `brain_activity` — pass exactly one clip with `--video <path-or-id>`.
 
 ## Seeing what a model accepts
 

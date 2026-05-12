@@ -23,7 +23,8 @@
     "SCRAPECREATORS_BASE_URL": "https://api.scrapecreators.com",
     "SCRAPECREATORS_CACHE_TTL_SECONDS": "1800",
     "DISCOVERY_DEFAULT_REGION": "US",
-    "HIGGSFIELD_MCP_GENERATION_TOOL": "text2image_soul_v2",
+    "HIGGSFIELD_MCP_CLONE_TRAINING_TOOL": "show_characters",
+    "HIGGSFIELD_MCP_GENERATION_TOOL": "generate_image",
     "BLITZ_BATCH_STALE_MINUTES": "45"
   },
   "services": [

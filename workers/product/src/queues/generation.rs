@@ -1,6 +1,8 @@
 use crate::db;
 use crate::providers::higgsfield_auth::{refresh_access_token, validate_access_token};
-use crate::providers::higgsfield_mcp::{call_tool, HiggsfieldMcpError};
+use crate::providers::higgsfield_mcp::{
+    call_tool, upload_media_files, HiggsfieldMcpError, HiggsfieldMcpMediaFile,
+};
 use crate::queues::messages::GenerationMessage;
 use crate::services::generation_usage::{
     current_utc_date, load_generation_limits, refund_image_for_date, reserve_image_for_date,
@@ -16,6 +18,7 @@ use worker::{
 
 const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER";
 const HIGGSFIELD_GENERATION_TOOL_VAR: &str = "HIGGSFIELD_MCP_GENERATION_TOOL";
+const HIGGSFIELD_JOB_STATUS_TOOL: &str = "job_status";
 const GENERATION_POLL_DELAY_SECONDS: u32 = 10;
 const MAX_GENERATED_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 
@@ -26,6 +29,9 @@ struct ClonePlanRow {
 
 #[derive(Debug, Deserialize)]
 struct VisualReferenceRow {
+    media_asset_id: Option<String>,
+    storage_key: Option<String>,
+    content_type: Option<String>,
     materialized_reference_url: Option<String>,
 }
 
@@ -147,14 +153,19 @@ async fn generate_blitz_batch(
         else {
             continue;
         };
-        let Some(materialized_reference_url) = reference
+        let materialized_reference_url = reference
             .materialized_reference_url
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
+            .filter(|value| !value.is_empty());
+        let storage_key = reference
+            .storage_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if materialized_reference_url.is_none() && storage_key.is_none() {
             continue;
-        };
+        }
 
         let job_id = deterministic_generation_job_id(batch_id, visual_reference_id);
         let usage_date = current_utc_date();
@@ -166,6 +177,9 @@ async fn generate_blitz_batch(
             "idempotencyKey": format!("{idempotency_key}:{visual_reference_id}"),
             "providerSoulId": provider_soul_id,
             "inputImageUrl": materialized_reference_url,
+            "inputMediaAssetId": reference.media_asset_id.clone(),
+            "inputStorageKey": reference.storage_key.clone(),
+            "inputContentType": reference.content_type.clone(),
             "visualReferenceId": visual_reference_id,
             "usageDate": usage_date,
             "prompt": "",
@@ -255,7 +269,7 @@ async fn submit_generation_job(
     idempotency_key: &str,
     visual_reference_id: &str,
     provider_soul_id: &str,
-    materialized_reference_url: &str,
+    materialized_reference_url: Option<&str>,
 ) -> WorkerResult<()> {
     let Some(job) = load_generation_job_by_id(db, job_id).await? else {
         return Ok(());
@@ -325,19 +339,25 @@ async fn submit_generation_job(
             "prompt": "",
         })
     });
-    let arguments = submission_arguments_from_request(job_id, &request)?;
-
-    let result = match call_tool(&token.access_token, json!(job_id), &tool_name, arguments).await {
+    let result = match submit_generation_to_provider(
+        env,
+        &token.access_token,
+        json!(job_id),
+        &tool_name,
+        job_id,
+        &request,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
-            let mapped = map_mcp_error(error);
             schedule_submission_retry(
                 db,
                 env,
                 job_id,
                 batch_id,
                 "provider_submission_retry",
-                &mapped.to_string(),
+                &error.to_string(),
             )
             .await?;
             return Ok(());
@@ -372,31 +392,17 @@ async fn retry_provider_submission_from_poll(
     access_token: &str,
     request_json: &Value,
 ) -> WorkerResult<()> {
-    let arguments = match submission_arguments_from_request(job_id, request_json) {
-        Ok(arguments) => arguments,
-        Err(error) => {
-            return handle_poll_failure(
-                db,
-                env,
-                job_id,
-                batch_id,
-                attempt,
-                max_attempts,
-                "generation_submission_request_invalid",
-                &error.to_string(),
-            )
-            .await;
-        }
-    };
     if !claim_generation_retry_submission(db, job_id, attempt).await? {
         return Ok(());
     }
 
-    let result = match call_tool(
+    let result = match submit_generation_to_provider(
+        env,
         access_token,
         json!(format!("submit:{job_id}:{attempt}")),
         tool_name,
-        arguments,
+        job_id,
+        request_json,
     )
     .await
     {
@@ -410,7 +416,7 @@ async fn retry_provider_submission_from_poll(
                 attempt,
                 max_attempts,
                 "provider_submission_retry_failed",
-                &map_mcp_error(error).to_string(),
+                &error.to_string(),
             )
             .await;
         }
@@ -678,18 +684,25 @@ async fn poll_generation(
         .await;
     }
 
+    let Some(provider_job_id) = first_provider_job_id(&provider_job_ids) else {
+        return handle_poll_failure(
+            db,
+            env,
+            job_id,
+            batch_id,
+            attempt,
+            max_attempts,
+            "provider_poll_job_id_missing",
+            "Provider job id was missing from stored generation response.",
+        )
+        .await;
+    };
+
     let result = match call_tool(
         &token.access_token,
         json!(format!("poll:{job_id}:{attempt}")),
-        &tool_name,
-        json!({
-            "action": "poll",
-            "jobId": job_id,
-            "batchId": batch_id,
-            "providerJobIds": provider_job_ids,
-            "attempt": attempt,
-            "request": original_request,
-        }),
+        HIGGSFIELD_JOB_STATUS_TOOL,
+        generation_poll_arguments(&provider_job_id),
     )
     .await
     {
@@ -1206,7 +1219,11 @@ async fn load_visual_reference(
 fn visual_reference_guidance_query() -> String {
     format!(
         r#"
-        SELECT {} AS materialized_reference_url
+        SELECT
+          ma.id AS media_asset_id,
+          ma.storage_key AS storage_key,
+          ma.content_type AS content_type,
+          {} AS materialized_reference_url
         FROM visual_references vr
         LEFT JOIN media_assets ma
           ON ma.id = vr.media_asset_id
@@ -1915,6 +1932,126 @@ fn generation_tool_name(env: &Env) -> WorkerResult<String> {
     }
 }
 
+async fn submit_generation_to_provider(
+    env: &Env,
+    access_token: &str,
+    request_id: Value,
+    tool_name: &str,
+    job_id: &str,
+    request_json: &Value,
+) -> WorkerResult<crate::providers::higgsfield_mcp::HiggsfieldMcpResponse> {
+    let upload_file = load_generation_reference_upload(env, job_id, request_json).await?;
+    let uploaded = upload_media_files(access_token, &[upload_file])
+        .await
+        .map_err(map_mcp_error)?;
+    let Some(uploaded_reference) = uploaded.first() else {
+        return Err(Error::RustError(
+            "generation_reference_upload_missing".to_string(),
+        ));
+    };
+
+    let mut provider_request = request_json.clone();
+    if let Some(object) = provider_request.as_object_mut() {
+        object.insert(
+            "uploadedReferenceUrl".to_string(),
+            json!(uploaded_reference.url.clone()),
+        );
+    }
+    let arguments = submission_arguments_from_request(job_id, &provider_request)?;
+    call_tool(access_token, request_id, tool_name, arguments)
+        .await
+        .map_err(map_mcp_error)
+}
+
+async fn load_generation_reference_upload(
+    env: &Env,
+    job_id: &str,
+    request_json: &Value,
+) -> WorkerResult<HiggsfieldMcpMediaFile> {
+    let content_type = json_string_at(request_json, "/inputContentType")
+        .map(|value| normalize_generated_content_type(&value).to_string())
+        .unwrap_or_else(|| "image/jpeg".to_string());
+
+    if let Some(storage_key) = json_string_at(request_json, "/inputStorageKey") {
+        let bytes = read_media_object_bytes(env, &storage_key).await?;
+        return Ok(HiggsfieldMcpMediaFile {
+            filename: provider_upload_filename(job_id, &content_type),
+            content_type,
+            bytes,
+        });
+    }
+
+    let input_url = required_json_string(request_json, "/inputImageUrl")?;
+    let (bytes, fetched_content_type) = fetch_reference_image(&input_url).await?;
+    Ok(HiggsfieldMcpMediaFile {
+        filename: provider_upload_filename(job_id, &fetched_content_type),
+        content_type: fetched_content_type,
+        bytes,
+    })
+}
+
+async fn read_media_object_bytes(env: &Env, storage_key: &str) -> WorkerResult<Vec<u8>> {
+    let object = env
+        .bucket("MEDIA")?
+        .get(storage_key.to_string())
+        .execute()
+        .await?
+        .ok_or_else(|| Error::RustError("generation_reference_media_missing".to_string()))?;
+    let body = object
+        .body()
+        .ok_or_else(|| Error::RustError("generation_reference_media_body_missing".to_string()))?;
+    body.bytes().await
+}
+
+async fn fetch_reference_image(reference_url: &str) -> WorkerResult<(Vec<u8>, String)> {
+    let request = Request::new(reference_url, Method::Get)?;
+    let mut response = Fetch::Request(request).send().await?;
+    let status = response.status_code();
+    if status >= 400 {
+        return Err(Error::RustError(format!(
+            "generation_reference_download_failed:{status}"
+        )));
+    }
+
+    let content_type = normalize_generated_content_type(
+        response
+            .headers()
+            .get("content-type")?
+            .as_deref()
+            .unwrap_or("image/jpeg"),
+    );
+    if content_length_exceeds_generated_image_limit(
+        response.headers().get("content-length")?.as_deref(),
+    ) {
+        return Err(Error::RustError(
+            "generation_reference_download_too_large".to_string(),
+        ));
+    }
+    let bytes = response.bytes().await?;
+    if bytes.is_empty() {
+        return Err(Error::RustError(
+            "generation_reference_download_empty".to_string(),
+        ));
+    }
+    if generated_image_size_too_large(bytes.len()) {
+        return Err(Error::RustError(
+            "generation_reference_download_too_large".to_string(),
+        ));
+    }
+
+    Ok((bytes, content_type.to_string()))
+}
+
+fn provider_upload_filename(job_id: &str, content_type: &str) -> String {
+    let extension = match normalize_generated_content_type(content_type) {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        _ => "jpg",
+    };
+    format!("{}.{}", generation_id_suffix(job_id), extension)
+}
+
 fn final_image_url(raw_json: &Value) -> Option<String> {
     provider_payloads(raw_json)
         .iter()
@@ -1968,10 +2105,20 @@ fn direct_final_image_url(value: &Value) -> Option<String> {
     [
         "/result/image_url",
         "/result/url",
+        "/result/output_url",
         "/image_url",
         "/url",
+        "/output_url",
         "/result/imageUrl",
         "/imageUrl",
+        "/result/assets/0/url",
+        "/result/images/0/url",
+        "/result/outputs/0/url",
+        "/result/generations/0/url",
+        "/assets/0/url",
+        "/images/0/url",
+        "/outputs/0/url",
+        "/generations/0/url",
     ]
     .into_iter()
     .find_map(|path| json_string_at(value, path))
@@ -2028,17 +2175,26 @@ fn request_has_usage_reservation_marker(request_json: &str) -> bool {
         })
 }
 
-fn submission_arguments_from_request(job_id: &str, request_json: &Value) -> WorkerResult<Value> {
+fn submission_arguments_from_request(_job_id: &str, request_json: &Value) -> WorkerResult<Value> {
     Ok(json!({
-        "jobId": json_string_at(request_json, "/jobId").unwrap_or_else(|| job_id.to_string()),
-        "batchId": required_json_string(request_json, "/batchId")?,
-        "cloneId": required_json_string(request_json, "/cloneId")?,
-        "userId": required_json_string(request_json, "/userId")?,
-        "idempotencyKey": required_json_string(request_json, "/idempotencyKey")?,
-        "providerSoulId": required_json_string(request_json, "/providerSoulId")?,
-        "inputImageUrl": required_json_string(request_json, "/inputImageUrl")?,
-        "prompt": json_string_at(request_json, "/prompt").unwrap_or_default(),
+        "params": {
+            "model": "soul_2",
+            "prompt": "",
+            "soul_id": required_json_string(request_json, "/providerSoulId")?,
+            "medias": [{
+                "value": required_json_string(request_json, "/uploadedReferenceUrl")?,
+                "role": "image",
+            }],
+            "count": 1,
+        }
     }))
+}
+
+fn generation_poll_arguments(provider_job_id: &str) -> Value {
+    json!({
+        "jobId": provider_job_id,
+        "sync": true,
+    })
 }
 
 fn required_json_string(value: &Value, path: &str) -> WorkerResult<String> {
@@ -2055,6 +2211,17 @@ fn provider_ids_are_empty(provider_job_ids: &Value) -> bool {
                 .all(|value| value.trim().is_empty())
         })
         .unwrap_or(true)
+}
+
+fn first_provider_job_id(provider_job_ids: &Value) -> Option<String> {
+    provider_job_ids
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn response_has_usage_refund_marker(response_json: &str) -> bool {
@@ -2297,9 +2464,10 @@ mod tests {
         completion_claim_failure_action, content_length_exceeds_generated_image_limit,
         deterministic_generation_job_id, failed_generation_refund_action, final_image_url,
         generated_image_size_too_large, generation_media_id, generation_output_id,
-        poll_attempt_response_json, poll_failure_action, provider_asset_id, provider_ids_are_empty,
-        provider_job_ids, provider_status, request_has_usage_reservation_marker,
-        response_has_usage_refund_marker, retry_submission_claim_sql, retryable_completion_attempt,
+        generation_poll_arguments, poll_attempt_response_json, poll_failure_action,
+        provider_asset_id, provider_ids_are_empty, provider_job_ids, provider_status,
+        request_has_usage_reservation_marker, response_has_usage_refund_marker,
+        retry_submission_claim_sql, retryable_completion_attempt,
         submission_arguments_from_request, terminal_failure_allowed_for_job_state,
         usage_date_from_request_json, visual_reference_guidance_query,
         visual_reference_guidance_url_expr, CompletionClaimFailureAction,
@@ -2551,7 +2719,7 @@ mod tests {
     }
 
     #[test]
-    fn submission_arguments_are_rebuilt_from_request_json() {
+    fn submission_arguments_match_validated_generate_image_payload() {
         let request = json!({
             "jobId": "gen_1",
             "batchId": "batch_1",
@@ -2562,20 +2730,34 @@ mod tests {
             "inputImageUrl": "https://cdn.example/input.jpg",
             "visualReferenceId": "vref_1",
             "usageDate": "2026-05-11",
-            "prompt": ""
+            "prompt": "",
+            "uploadedReferenceUrl": "https://higgsfield.example/uploaded.jpg"
         });
 
         assert_eq!(
             submission_arguments_from_request("fallback", &request).unwrap(),
             json!({
-                "jobId": "gen_1",
-                "batchId": "batch_1",
-                "cloneId": "clone_1",
-                "userId": "user_1",
-                "idempotencyKey": "blitz_gen:batch_1:vref_1",
-                "providerSoulId": "soul_1",
-                "inputImageUrl": "https://cdn.example/input.jpg",
-                "prompt": ""
+                "params": {
+                    "model": "soul_2",
+                    "prompt": "",
+                    "soul_id": "soul_1",
+                    "medias": [{
+                        "value": "https://higgsfield.example/uploaded.jpg",
+                        "role": "image"
+                    }],
+                    "count": 1
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn generation_poll_arguments_use_job_status_payload() {
+        assert_eq!(
+            generation_poll_arguments("hf_job_1"),
+            json!({
+                "jobId": "hf_job_1",
+                "sync": true
             })
         );
     }

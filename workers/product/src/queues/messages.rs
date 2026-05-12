@@ -13,6 +13,15 @@ pub enum CloneTrainingMessage {
         user_id: String,
         idempotency_key: String,
     },
+    PollCloneTraining {
+        job_id: String,
+        clone_id: String,
+        user_id: String,
+        idempotency_key: String,
+        provider_soul_id: String,
+        attempt: u8,
+        max_attempts: u8,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +76,33 @@ mod tests {
         assert!(value.get("clone_id").is_none());
         assert!(value.get("user_id").is_none());
         assert!(value.get("idempotency_key").is_none());
+    }
+
+    #[test]
+    fn poll_clone_training_serializes_fields_as_camel_case() {
+        let message = CloneTrainingMessage::PollCloneTraining {
+            job_id: "train_1".to_string(),
+            clone_id: "clone_1".to_string(),
+            user_id: "user_1".to_string(),
+            idempotency_key: "clone_upload:user_1:abc".to_string(),
+            provider_soul_id: "soul_1".to_string(),
+            attempt: 1,
+            max_attempts: 90,
+        };
+
+        assert_eq!(
+            serde_json::to_value(message).unwrap(),
+            json!({
+                "type": "poll_clone_training",
+                "jobId": "train_1",
+                "cloneId": "clone_1",
+                "userId": "user_1",
+                "idempotencyKey": "clone_upload:user_1:abc",
+                "providerSoulId": "soul_1",
+                "attempt": 1,
+                "maxAttempts": 90,
+            })
+        );
     }
 
     #[test]
