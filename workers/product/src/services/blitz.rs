@@ -353,12 +353,16 @@ pub async fn start_waiting_ready_pools(env: &Env) -> WorkerResult<u32> {
         r#"
         SELECT user_id,
                id AS clone_id,
-               provider_soul_id
+               TRIM(provider_soul_id) AS provider_soul_id
         FROM clone_profiles
         WHERE soul_status = 'ready'
           AND provider_soul_id IS NOT NULL
+          AND TRIM(provider_soul_id) <> ''
           AND deleted_at IS NULL
-          AND json_extract(provider_config_json, '$.nicheResearchStatus') = 'pool_ready_awaiting_soul'
+          AND CASE
+                WHEN json_valid(provider_config_json)
+                THEN json_extract(provider_config_json, '$.nicheResearchStatus')
+              END = 'pool_ready_awaiting_soul'
         ORDER BY updated_at ASC
         LIMIT 20
         "#,
@@ -379,7 +383,7 @@ pub async fn start_waiting_ready_pools(env: &Env) -> WorkerResult<u32> {
         .is_some()
         {
             let now = now_iso_string();
-            db::exec(
+            let update_result = db::run(
                 &db,
                 r#"
                 UPDATE clone_profiles
@@ -391,20 +395,34 @@ pub async fn start_waiting_ready_pools(env: &Env) -> WorkerResult<u32> {
                       '$.nicheResearchStatus',
                       'batch_generation_started',
                       '$.nicheResearchDetail',
-                      'First Blitz batch queued after Soul readiness.'
+                      'First Blitz batch queued after Soul readiness.',
+                      '$.nicheResearchUpdatedAt',
+                      ?
                     ),
                     updated_at = ?
                 WHERE user_id = ?
                   AND id = ?
                   AND soul_status = 'ready'
                   AND provider_soul_id IS NOT NULL
+                  AND TRIM(provider_soul_id) = ?
                   AND deleted_at IS NULL
-                  AND json_extract(provider_config_json, '$.nicheResearchStatus') = 'pool_ready_awaiting_soul'
+                  AND CASE
+                        WHEN json_valid(provider_config_json)
+                        THEN json_extract(provider_config_json, '$.nicheResearchStatus')
+                      END = 'pool_ready_awaiting_soul'
                 "#,
-                vec![json!(now), json!(row.user_id), json!(row.clone_id)],
+                vec![
+                    json!(now),
+                    json!(now),
+                    json!(row.user_id),
+                    json!(row.clone_id),
+                    json!(row.provider_soul_id),
+                ],
             )
             .await?;
-            started += 1;
+            if changed_rows(&update_result)? > 0 {
+                started += 1;
+            }
         }
     }
 
