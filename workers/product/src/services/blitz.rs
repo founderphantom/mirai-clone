@@ -372,15 +372,9 @@ pub async fn start_waiting_ready_pools(env: &Env) -> WorkerResult<u32> {
 
     let mut started = 0;
     for row in rows {
-        if create_next_batch(
-            &db,
-            env,
-            &row.user_id,
-            &row.clone_id,
-            &row.provider_soul_id,
-        )
-        .await?
-        .is_some()
+        if create_next_batch(&db, env, &row.user_id, &row.clone_id, &row.provider_soul_id)
+            .await?
+            .is_some()
         {
             let now = now_iso_string();
             let update_result = db::run(
@@ -427,6 +421,46 @@ pub async fn start_waiting_ready_pools(env: &Env) -> WorkerResult<u32> {
     }
 
     Ok(started)
+}
+
+pub async fn reconcile_stale_batches(env: &Env) -> WorkerResult<()> {
+    let db = env.d1("DB")?;
+    start_waiting_ready_pools(env).await?;
+
+    let stale_minutes = parse_stale_minutes_config(
+        env.var("BLITZ_BATCH_STALE_MINUTES")
+            .ok()
+            .map(|value| value.to_string()),
+    );
+    let now = now_iso_string();
+    let cutoff = stale_cutoff_iso(stale_minutes);
+
+    db::exec(
+        &db,
+        r#"
+        UPDATE blitz_batches
+        SET status = CASE
+              WHEN generation_count > 0 THEN 'ready'
+              ELSE 'failed'
+            END,
+            ready_at = CASE
+              WHEN generation_count > 0 THEN COALESCE(ready_at, ?)
+              ELSE ready_at
+            END,
+            error_code = CASE
+              WHEN generation_count > 0 THEN error_code
+              ELSE 'stale_generation_batch'
+            END,
+            error_message = CASE
+              WHEN generation_count > 0 THEN error_message
+              ELSE 'Batch was generating beyond the configured timeout.'
+            END
+        WHERE status = 'generating'
+          AND created_at < ?
+        "#,
+        vec![json!(now), json!(cutoff)],
+    )
+    .await
 }
 
 pub async fn current_batch(
@@ -1335,4 +1369,36 @@ fn prefixed_id(prefix: &str) -> String {
 
 fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
+}
+
+fn parse_stale_minutes_config(value: Option<String>) -> i64 {
+    value
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(45)
+}
+
+fn stale_cutoff_iso(minutes: i64) -> String {
+    let millis = js_sys::Date::now() - (minutes as f64 * 60_000.0);
+    js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(millis))
+        .to_iso_string()
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stale_minutes_config;
+
+    #[test]
+    fn parse_stale_minutes_config_uses_positive_override() {
+        assert_eq!(parse_stale_minutes_config(Some("30".to_string())), 30);
+    }
+
+    #[test]
+    fn parse_stale_minutes_config_defaults_for_missing_or_invalid_values() {
+        assert_eq!(parse_stale_minutes_config(None), 45);
+        assert_eq!(
+            parse_stale_minutes_config(Some("not-a-number".to_string())),
+            45
+        );
+    }
 }

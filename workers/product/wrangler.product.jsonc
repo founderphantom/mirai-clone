@@ -12,6 +12,9 @@
   "observability": {
     "enabled": true
   },
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
   "vars": {
     "APP_NAME": "Mirai",
     "APP_URL": "https://mirai.founder-968.workers.dev",

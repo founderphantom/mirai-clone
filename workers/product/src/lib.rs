@@ -12,7 +12,10 @@ pub mod services;
 pub use providers::scrapecreators;
 
 use serde_json::Value;
-use worker::{event, Context, Env, MessageBatch, Request, Response, Result as WorkerResult};
+use worker::{
+    console_error, event, Context, Env, MessageBatch, Request, Response, Result as WorkerResult,
+    ScheduleContext, ScheduledEvent,
+};
 
 #[event(fetch, respond_with_errors)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> WorkerResult<Response> {
@@ -31,4 +34,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
 #[event(queue)]
 pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> WorkerResult<()> {
     queues::handle_batch(batch, env).await
+}
+
+#[event(scheduled)]
+pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    if let Err(error) = services::blitz::reconcile_stale_batches(&env).await {
+        console_error!("scheduled blitz reconciliation failed: {}", error);
+    }
 }
