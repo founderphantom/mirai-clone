@@ -314,6 +314,7 @@ pub async fn save_bubbles(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
             clone_id: active_clone.id.clone(),
             bubble_ids: selected_bubble_ids,
             moderation_level,
+            platforms: vec!["tiktok".to_string(), "instagram".to_string()],
         })
         .await?;
 

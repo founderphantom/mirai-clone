@@ -270,14 +270,23 @@ pub fn human_presence_prompt() -> String {
 
 Return strict JSON with:
 {
-  "accepted": boolean,
-  "reason": string,
-  "human_count": number,
-  "render_like": boolean,
-  "organic_photo": boolean
+  "hasHuman": boolean,
+  "humanCount": number,
+  "humanType": "person" | "partial_body" | "face" | "unknown",
+  "confidence": number,
+  "organicPhotoScore": number,
+  "freshnessVisualScore": number,
+  "captureStyle": string,
+  "aestheticTags": string[],
+  "rejectionReason": string | null
 }
 
 Accept only organic creator content with exactly one human person clearly visible. Reject images with zero people, multiple people, mannequins, illustrations, synthetic/generation artifacts, render_like lighting or skin, CGI, heavy face distortion, or product-only compositions.
+
+Scoring:
+- confidence, organicPhotoScore, and freshnessVisualScore must be numbers from 0 to 1.
+- Use low organicPhotoScore for studio/editorial/product/catalog/render_like images.
+- Use low freshnessVisualScore for stale visual styles, dated reposts, or non-current platform aesthetics.
 "#
     .to_string()
 }
