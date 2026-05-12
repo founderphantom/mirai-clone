@@ -1518,17 +1518,24 @@ async fn record_poll_attempt(
         db,
         r#"
         UPDATE generation_jobs
-        SET response_json = ?,
+        SET response_json = json_set(
+              CASE
+                WHEN json_valid(response_json) AND json_type(response_json) = 'object'
+                  THEN response_json
+                ELSE '{}'
+              END,
+              '$.pollAttempt',
+              ?,
+              '$.response',
+              json(?)
+            ),
             updated_at = ?
         WHERE id = ?
           AND status IN ('queued', 'submitted')
         "#,
         vec![
-            json!(json!({
-                "pollAttempt": attempt,
-                "response": raw_json,
-            })
-            .to_string()),
+            json!(attempt),
+            json!(raw_json.to_string()),
             json!(now),
             json!(job_id),
         ],
@@ -2233,6 +2240,24 @@ fn generated_image_size_too_large(byte_count: usize) -> bool {
     byte_count > MAX_GENERATED_IMAGE_BYTES
 }
 
+#[cfg(test)]
+fn poll_attempt_response_json(
+    existing_response_json: &str,
+    attempt: u8,
+    raw_json: &Value,
+) -> String {
+    let mut value =
+        serde_json::from_str::<Value>(existing_response_json).unwrap_or_else(|_| json!({}));
+    if !value.is_object() {
+        value = json!({});
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert("pollAttempt".to_string(), json!(attempt));
+        object.insert("response".to_string(), raw_json.clone());
+    }
+    value.to_string()
+}
+
 fn changed_rows(result: &worker::D1Result) -> WorkerResult<usize> {
     Ok(result
         .meta()?
@@ -2272,9 +2297,9 @@ mod tests {
         completion_claim_failure_action, content_length_exceeds_generated_image_limit,
         deterministic_generation_job_id, failed_generation_refund_action, final_image_url,
         generated_image_size_too_large, generation_media_id, generation_output_id,
-        poll_failure_action, provider_asset_id, provider_ids_are_empty, provider_job_ids,
-        provider_status, request_has_usage_reservation_marker, response_has_usage_refund_marker,
-        retry_submission_claim_sql, retryable_completion_attempt,
+        poll_attempt_response_json, poll_failure_action, provider_asset_id, provider_ids_are_empty,
+        provider_job_ids, provider_status, request_has_usage_reservation_marker,
+        response_has_usage_refund_marker, retry_submission_claim_sql, retryable_completion_attempt,
         submission_arguments_from_request, terminal_failure_allowed_for_job_state,
         usage_date_from_request_json, visual_reference_guidance_query,
         visual_reference_guidance_url_expr, CompletionClaimFailureAction,
@@ -2311,6 +2336,40 @@ mod tests {
         assert!(sql.contains("provider_job_ids_json"));
         assert!(sql.contains("$.submissionRetryClaim.attempt"));
         assert!(sql.contains("!= ?"));
+    }
+
+    #[test]
+    fn poll_attempt_response_merge_preserves_retry_claim() {
+        let existing = json!({
+            "submissionRetry": true,
+            "submissionRetryClaim": {
+                "attempt": 2,
+                "claimedAt": "2026-05-12T00:00:00.000Z"
+            }
+        })
+        .to_string();
+        let merged = poll_attempt_response_json(
+            &existing,
+            2,
+            &json!({
+                "errorCode": "provider_submission_retry_failed",
+                "errorMessage": "network ambiguity"
+            }),
+        );
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(value["submissionRetryClaim"]["attempt"], 2);
+        assert_eq!(value["pollAttempt"], 2);
+        assert_eq!(
+            value["response"]["errorCode"],
+            "provider_submission_retry_failed"
+        );
+
+        let later_attempt = 3;
+        assert_ne!(
+            value["submissionRetryClaim"]["attempt"].as_u64().unwrap(),
+            later_attempt
+        );
     }
 
     #[test]
