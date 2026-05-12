@@ -3,7 +3,7 @@ use crate::providers::higgsfield_auth::{refresh_access_token, validate_access_to
 use crate::providers::higgsfield_mcp::{call_tool, HiggsfieldMcpError};
 use crate::queues::messages::GenerationMessage;
 use crate::services::generation_usage::{
-    current_utc_date, refund_image, refund_image_for_date, reserve_image_for_date,
+    current_utc_date, refund_image_for_date, reserve_image_for_date,
 };
 use crate::services::media::media_storage_key;
 use serde::Deserialize;
@@ -43,6 +43,7 @@ struct GenerationJobRow {
     status: String,
     provider_job_ids_json: String,
     request_json: String,
+    response_json: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +132,7 @@ async fn generate_blitz_batch(
     provider_soul_id: &str,
 ) -> WorkerResult<()> {
     let Some(clone) = load_ready_clone_plan(db, clone_id, user_id).await? else {
+        mark_batch_failed_without_jobs(db, batch_id).await?;
         return Ok(());
     };
     let (free_daily_limit, pro_daily_limit) = load_generation_limits(db).await?;
@@ -540,7 +542,9 @@ async fn complete_generation_job(
     };
     if job.status == "completed" || generation_output_count(db, job_id).await? > 0 {
         if mark_generation_job_completed(db, job_id, raw_response).await? {
-            increment_completed_generation_counters(db, &job).await?;
+            repair_completed_generation_side_effects(db, &job).await?;
+        } else {
+            repair_completed_generation_side_effects(db, &job).await?;
         }
         mark_batch_ready_if_complete(db, job.blitz_batch_id.as_deref().unwrap_or_default()).await?;
         return Ok(());
@@ -645,7 +649,9 @@ async fn complete_generation_job(
 
     let completed = mark_generation_job_completed(db, job_id, raw_response).await?;
     if completed {
-        increment_completed_generation_counters(db, &job).await?;
+        repair_completed_generation_side_effects(db, &job).await?;
+    } else {
+        repair_completed_generation_side_effects(db, &job).await?;
     }
 
     if let Some(batch_id) = job.blitz_batch_id.as_deref() {
@@ -664,7 +670,14 @@ async fn fail_generation_job(
     let Some(job) = load_generation_job_by_id(db, job_id).await? else {
         return Ok(());
     };
-    if matches!(job.status.as_str(), "completed" | "failed") {
+    if job.status == "completed" {
+        if let Some(batch_id) = job.blitz_batch_id.as_deref() {
+            mark_batch_ready_if_complete(db, batch_id).await?;
+        }
+        return Ok(());
+    }
+    if job.status == "failed" {
+        repair_failed_generation_refund(db, job_id, &job).await?;
         if let Some(batch_id) = job.blitz_batch_id.as_deref() {
             mark_batch_ready_if_complete(db, batch_id).await?;
         }
@@ -695,11 +708,7 @@ async fn fail_generation_job(
     .await?;
 
     if changed_rows(&result)? > 0 {
-        if let Some(usage_date) = usage_date_from_request_json(&job.request_json) {
-            refund_image_for_date(db, &job.user_id, &usage_date).await?;
-        } else {
-            refund_image(db, &job.user_id).await?;
-        }
+        repair_failed_generation_refund(db, job_id, &job).await?;
     }
     if let Some(batch_id) = job.blitz_batch_id.as_deref() {
         mark_batch_ready_if_complete(db, batch_id).await?;
@@ -1074,7 +1083,7 @@ async fn mark_generation_job_completed(
     Ok(changed_rows(&result)? > 0)
 }
 
-async fn increment_completed_generation_counters(
+async fn repair_completed_generation_side_effects(
     db: &D1Database,
     job: &GenerationJobRow,
 ) -> WorkerResult<()> {
@@ -1083,11 +1092,22 @@ async fn increment_completed_generation_counters(
             db,
             r#"
             UPDATE visual_references
-            SET generation_use_count = generation_use_count + 1,
+            SET generation_use_count = (
+                    SELECT COUNT(DISTINCT gj.id)
+                    FROM generation_jobs gj
+                    INNER JOIN generation_outputs go
+                      ON go.job_id = gj.id
+                    WHERE gj.input_visual_reference_id = ?
+                      AND gj.status = 'completed'
+                ),
                 last_used_batch_id = ?
             WHERE id = ?
             "#,
-            vec![json!(job.blitz_batch_id), json!(visual_reference_id)],
+            vec![
+                json!(visual_reference_id),
+                json!(job.blitz_batch_id),
+                json!(visual_reference_id),
+            ],
         )
         .await?;
     }
@@ -1097,13 +1117,88 @@ async fn increment_completed_generation_counters(
             db,
             r#"
             UPDATE blitz_batches
-            SET generation_count = generation_count + 1
+            SET generation_count = (
+                SELECT COUNT(DISTINCT gj.id)
+                FROM generation_jobs gj
+                INNER JOIN generation_outputs go
+                  ON go.job_id = gj.id
+                WHERE gj.blitz_batch_id = ?
+                  AND gj.status = 'completed'
+            )
             WHERE id = ?
             "#,
-            vec![json!(batch_id)],
+            vec![json!(batch_id), json!(batch_id)],
         )
         .await?;
     }
+
+    Ok(())
+}
+
+async fn repair_failed_generation_refund(
+    db: &D1Database,
+    job_id: &str,
+    job: &GenerationJobRow,
+) -> WorkerResult<()> {
+    if response_has_usage_refund_marker(&job.response_json) {
+        return Ok(());
+    }
+
+    let usage_date =
+        usage_date_from_request_json(&job.request_json).unwrap_or_else(current_utc_date);
+    let now = now_iso_string();
+    db::batch(
+        db,
+        vec![
+            (
+                r#"
+                UPDATE generation_daily_usage
+                SET images_generated = CASE
+                      WHEN images_generated > 0 THEN images_generated - 1
+                      ELSE 0
+                    END,
+                    updated_at = ?
+                WHERE user_id = ?
+                  AND usage_date = ?
+                  AND EXISTS (
+                    SELECT 1
+                    FROM generation_jobs
+                    WHERE id = ?
+                      AND json_extract(
+                        CASE WHEN json_valid(response_json) THEN response_json ELSE '{}' END,
+                        '$.usageRefundedAt'
+                      ) IS NULL
+                  )
+                "#,
+                vec![
+                    json!(now),
+                    json!(job.user_id),
+                    json!(usage_date),
+                    json!(job_id),
+                ],
+            ),
+            (
+                r#"
+                UPDATE generation_jobs
+                SET response_json = json_set(
+                      CASE WHEN json_valid(response_json) THEN response_json ELSE '{}' END,
+                      '$.usageRefundedAt',
+                      ?,
+                      '$.usageRefundedDate',
+                      ?
+                    ),
+                    updated_at = ?
+                WHERE id = ?
+                  AND json_extract(
+                    CASE WHEN json_valid(response_json) THEN response_json ELSE '{}' END,
+                    '$.usageRefundedAt'
+                  ) IS NULL
+                "#,
+                vec![json!(now), json!(usage_date), json!(now), json!(job_id)],
+            ),
+        ],
+    )
+    .await?;
 
     Ok(())
 }
@@ -1123,7 +1218,8 @@ async fn load_generation_job(
           input_visual_reference_id,
           status,
           provider_job_ids_json,
-          request_json
+          request_json,
+          response_json
         FROM generation_jobs
         WHERE id = ?
           AND blitz_batch_id = ?
@@ -1147,7 +1243,8 @@ async fn load_generation_job_by_id(
           input_visual_reference_id,
           status,
           provider_job_ids_json,
-          request_json
+          request_json,
+          response_json
         FROM generation_jobs
         WHERE id = ?
         "#,
@@ -1328,6 +1425,13 @@ fn usage_date_from_request_json(request_json: &str) -> Option<String> {
         .and_then(|value| json_string_at(&value, "/usageDate"))
 }
 
+fn response_has_usage_refund_marker(response_json: &str) -> bool {
+    serde_json::from_str::<Value>(response_json)
+        .ok()
+        .and_then(|value| json_string_at(&value, "/usageRefundedAt"))
+        .is_some()
+}
+
 fn generation_media_id(job_id: &str) -> String {
     format!("media_{}", generation_id_suffix(job_id))
 }
@@ -1424,8 +1528,8 @@ fn now_iso_string() -> String {
 mod tests {
     use super::{
         final_image_url, generation_media_id, generation_output_id, poll_failure_action,
-        provider_asset_id, provider_job_ids, provider_status, usage_date_from_request_json,
-        PollFailureAction,
+        provider_asset_id, provider_job_ids, provider_status, response_has_usage_refund_marker,
+        usage_date_from_request_json, PollFailureAction,
     };
     use serde_json::json;
 
@@ -1474,5 +1578,14 @@ mod tests {
             Some("2026-05-11".to_string())
         );
         assert_eq!(usage_date_from_request_json("{}"), None);
+    }
+
+    #[test]
+    fn usage_refund_marker_is_read_from_response_json() {
+        assert!(response_has_usage_refund_marker(
+            r#"{"usageRefundedAt":"2026-05-11T01:02:03.000Z"}"#
+        ));
+        assert!(!response_has_usage_refund_marker("{}"));
+        assert!(!response_has_usage_refund_marker("not json"));
     }
 }
