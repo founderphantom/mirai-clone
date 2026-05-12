@@ -388,6 +388,9 @@ async fn retry_provider_submission_from_poll(
             .await;
         }
     };
+    if !claim_generation_retry_submission(db, job_id, attempt).await? {
+        return Ok(());
+    }
 
     let result = match call_tool(
         access_token,
@@ -1298,6 +1301,57 @@ async fn mark_generation_job_submitting(db: &D1Database, job_id: &str) -> Worker
     )
     .await?;
     Ok(changed_rows(&result)? > 0)
+}
+
+async fn claim_generation_retry_submission(
+    db: &D1Database,
+    job_id: &str,
+    attempt: u8,
+) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    let claim_json = json!({
+        "attempt": attempt,
+        "claimedAt": now,
+    });
+    let result = db::run(
+        db,
+        retry_submission_claim_sql(),
+        vec![
+            json!(now),
+            json!(claim_json.to_string()),
+            json!(now),
+            json!(job_id),
+            json!(attempt),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+fn retry_submission_claim_sql() -> &'static str {
+    r#"
+        UPDATE generation_jobs
+        SET status = CASE WHEN status = 'queued' THEN 'submitted' ELSE status END,
+            started_at = COALESCE(started_at, ?),
+            response_json = json_set(
+              CASE WHEN json_valid(response_json) THEN response_json ELSE '{}' END,
+              '$.submissionRetryClaim',
+              json(?)
+            ),
+            updated_at = ?
+        WHERE id = ?
+          AND status IN ('queued', 'submitted')
+          AND json_array_length(
+            CASE WHEN json_valid(provider_job_ids_json) THEN provider_job_ids_json ELSE '[]' END
+          ) = 0
+          AND COALESCE(
+            json_extract(
+              CASE WHEN json_valid(response_json) THEN response_json ELSE '{}' END,
+              '$.submissionRetryClaim.attempt'
+            ),
+            -1
+          ) != ?
+        "#
 }
 
 async fn persist_generation_usage_marker_or_refund(
@@ -2220,11 +2274,11 @@ mod tests {
         generated_image_size_too_large, generation_media_id, generation_output_id,
         poll_failure_action, provider_asset_id, provider_ids_are_empty, provider_job_ids,
         provider_status, request_has_usage_reservation_marker, response_has_usage_refund_marker,
-        retryable_completion_attempt, submission_arguments_from_request,
-        terminal_failure_allowed_for_job_state, usage_date_from_request_json,
-        visual_reference_guidance_query, visual_reference_guidance_url_expr,
-        CompletionClaimFailureAction, FailedGenerationRefundAction, PollFailureAction,
-        MAX_GENERATED_IMAGE_BYTES,
+        retry_submission_claim_sql, retryable_completion_attempt,
+        submission_arguments_from_request, terminal_failure_allowed_for_job_state,
+        usage_date_from_request_json, visual_reference_guidance_query,
+        visual_reference_guidance_url_expr, CompletionClaimFailureAction,
+        FailedGenerationRefundAction, PollFailureAction, MAX_GENERATED_IMAGE_BYTES,
     };
     use serde_json::json;
 
@@ -2246,6 +2300,17 @@ mod tests {
         assert_eq!(retryable_completion_attempt(7, 30), 7);
         assert_eq!(retryable_completion_attempt(31, 30), 30);
         assert_eq!(retryable_completion_attempt(1, 0), 1);
+    }
+
+    #[test]
+    fn retry_submission_claim_guards_provider_call_by_attempt() {
+        let sql = retry_submission_claim_sql();
+
+        assert!(sql.contains("status IN ('queued', 'submitted')"));
+        assert!(sql.contains("json_array_length"));
+        assert!(sql.contains("provider_job_ids_json"));
+        assert!(sql.contains("$.submissionRetryClaim.attempt"));
+        assert!(sql.contains("!= ?"));
     }
 
     #[test]
