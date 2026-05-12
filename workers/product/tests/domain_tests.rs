@@ -99,10 +99,11 @@ fn partial_blitz_batches_store_selected_reference_count() {
 }
 
 #[test]
-fn blitz_prefetch_repair_runs_when_only_one_swipe_exists() {
+fn blitz_prefetch_repair_runs_after_any_recorded_swipe() {
     assert!(first_swipe_prefetch_should_run(1));
+    assert!(first_swipe_prefetch_should_run(2));
+    assert!(first_swipe_prefetch_should_run(5));
     assert!(!first_swipe_prefetch_should_run(0));
-    assert!(!first_swipe_prefetch_should_run(2));
 }
 
 #[test]

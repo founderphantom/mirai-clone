@@ -210,7 +210,7 @@ pub fn stored_batch_size_for_selected_refs(
 }
 
 pub fn first_swipe_prefetch_should_run(swipes_after_attempt: u32) -> bool {
-    swipes_after_attempt == 1
+    swipes_after_attempt > 0
 }
 
 pub fn batch_complete_for_swipe_count(swipe_count: u32, output_count: u32) -> bool {
