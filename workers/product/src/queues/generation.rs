@@ -2,13 +2,11 @@ use crate::db;
 use crate::providers::higgsfield_auth::{refresh_access_token, validate_access_token};
 use crate::providers::higgsfield_mcp::{call_tool, HiggsfieldMcpError};
 use crate::queues::messages::GenerationMessage;
-use crate::services::generation_usage::{
-    current_utc_date, refund_image_for_date, reserve_image_for_date,
-};
+use crate::services::generation_usage::{current_utc_date, reserve_image_for_date};
 use crate::services::media::media_storage_key;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use uuid::Uuid;
+use sha2::{Digest, Sha256};
 use worker::{
     D1Database, Env, Error, Fetch, HttpMetadata, MessageBatch, MessageBuilder, MessageExt, Method,
     Request, Result as WorkerResult,
@@ -36,6 +34,7 @@ struct VisualReferenceRow {
 
 #[derive(Debug, Deserialize)]
 struct GenerationJobRow {
+    id: String,
     user_id: String,
     clone_id: String,
     blitz_batch_id: Option<String>,
@@ -138,7 +137,10 @@ async fn generate_blitz_batch(
     let (free_daily_limit, pro_daily_limit) = load_generation_limits(db).await?;
 
     for visual_reference_id in visual_reference_ids {
-        if existing_batch_reference_job(db, batch_id, visual_reference_id).await? {
+        if let Some(existing) =
+            load_generation_job_by_batch_reference(db, batch_id, visual_reference_id).await?
+        {
+            repair_terminal_generation_job(db, &existing.id, &existing).await?;
             continue;
         }
 
@@ -156,7 +158,37 @@ async fn generate_blitz_batch(
             continue;
         };
 
+        let job_id = deterministic_generation_job_id(batch_id, visual_reference_id);
         let usage_date = current_utc_date();
+        let request_json = json!({
+            "jobId": job_id,
+            "batchId": batch_id,
+            "cloneId": clone_id,
+            "userId": user_id,
+            "idempotencyKey": format!("{idempotency_key}:{visual_reference_id}"),
+            "providerSoulId": provider_soul_id,
+            "inputImageUrl": materialized_reference_url,
+            "visualReferenceId": visual_reference_id,
+            "usageDate": usage_date,
+            "prompt": "",
+        });
+        if !insert_generation_job(
+            db,
+            &job_id,
+            user_id,
+            clone_id,
+            batch_id,
+            visual_reference_id,
+            &request_json,
+        )
+        .await?
+        {
+            if let Some(existing) = load_generation_job_by_id(db, &job_id).await? {
+                repair_terminal_generation_job(db, &job_id, &existing).await?;
+            }
+            continue;
+        }
+
         if !reserve_image_for_date(
             db,
             user_id,
@@ -167,29 +199,14 @@ async fn generate_blitz_batch(
         )
         .await?
         {
+            fail_generation_job_without_refund(
+                db,
+                &job_id,
+                "daily_generation_limit_reached",
+                "Daily generation limit was reached before provider submission.",
+            )
+            .await?;
             continue;
-        }
-
-        let job_id = format!("gen_{}", Uuid::new_v4().simple());
-        let request_json = json!({
-            "idempotencyKey": idempotency_key,
-            "providerSoulId": provider_soul_id,
-            "visualReferenceId": visual_reference_id,
-            "usageDate": usage_date,
-        });
-        if let Err(error) = insert_generation_job(
-            db,
-            &job_id,
-            user_id,
-            clone_id,
-            batch_id,
-            visual_reference_id,
-            &request_json,
-        )
-        .await
-        {
-            refund_image_for_date(db, user_id, &usage_date).await?;
-            return Err(error);
         }
 
         if let Err(error) = submit_generation_job(
@@ -269,17 +286,41 @@ async fn submit_generation_job(
         }
     };
     if !validation.valid {
-        return Err(Error::RustError(
-            "higgsfield_generation_token_invalid".to_string(),
-        ));
+        schedule_submission_retry(
+            db,
+            env,
+            job_id,
+            batch_id,
+            "provider_submission_token_invalid",
+            "Higgsfield provider access token is invalid.",
+        )
+        .await?;
+        return Ok(());
     }
 
     mark_generation_job_submitting(db, job_id).await?;
 
-    let result = match call_tool(
-        &token.access_token,
-        json!(job_id),
-        &tool_name,
+    let request = db::first::<GenerationJobRow>(
+        db,
+        r#"
+        SELECT
+          id,
+          user_id,
+          clone_id,
+          blitz_batch_id,
+          input_visual_reference_id,
+          status,
+          provider_job_ids_json,
+          request_json,
+          response_json
+        FROM generation_jobs
+        WHERE id = ?
+        "#,
+        vec![json!(job_id)],
+    )
+    .await?
+    .and_then(|job| serde_json::from_str::<Value>(&job.request_json).ok())
+    .unwrap_or_else(|| {
         json!({
             "jobId": job_id,
             "batchId": batch_id,
@@ -288,11 +329,13 @@ async fn submit_generation_job(
             "idempotencyKey": format!("{idempotency_key}:{visual_reference_id}"),
             "providerSoulId": provider_soul_id,
             "inputImageUrl": materialized_reference_url,
+            "visualReferenceId": visual_reference_id,
             "prompt": "",
-        }),
-    )
-    .await
-    {
+        })
+    });
+    let arguments = submission_arguments_from_request(job_id, &request)?;
+
+    let result = match call_tool(&token.access_token, json!(job_id), &tool_name, arguments).await {
         Ok(result) => result,
         Err(error) => {
             let mapped = map_mcp_error(error);
@@ -316,6 +359,109 @@ async fn submit_generation_job(
 
     record_provider_generation_response(db, job_id, &result.raw_json).await?;
     enqueue_poll(env, job_id, batch_id, 1, 30).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retry_provider_submission_from_poll(
+    db: &D1Database,
+    env: &Env,
+    job_id: &str,
+    batch_id: &str,
+    attempt: u8,
+    max_attempts: u8,
+    tool_name: &str,
+    access_token: &str,
+    request_json: &Value,
+) -> WorkerResult<()> {
+    let arguments = match submission_arguments_from_request(job_id, request_json) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return handle_poll_failure(
+                db,
+                env,
+                job_id,
+                batch_id,
+                attempt,
+                max_attempts,
+                "generation_submission_request_invalid",
+                &error.to_string(),
+            )
+            .await;
+        }
+    };
+
+    let result = match call_tool(
+        access_token,
+        json!(format!("submit:{job_id}:{attempt}")),
+        tool_name,
+        arguments,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return handle_poll_failure(
+                db,
+                env,
+                job_id,
+                batch_id,
+                attempt,
+                max_attempts,
+                "provider_submission_retry_failed",
+                &map_mcp_error(error).to_string(),
+            )
+            .await;
+        }
+    };
+
+    if let Some(final_url) = final_image_url(&result.raw_json) {
+        if let Err(error) =
+            complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await
+        {
+            return handle_poll_failure(
+                db,
+                env,
+                job_id,
+                batch_id,
+                attempt,
+                max_attempts,
+                "generation_completion_failed",
+                &error.to_string(),
+            )
+            .await;
+        }
+        return Ok(());
+    }
+
+    if provider_ids_are_empty(&provider_job_ids(&result.raw_json)) {
+        return handle_poll_failure(
+            db,
+            env,
+            job_id,
+            batch_id,
+            attempt,
+            max_attempts,
+            "provider_submission_missing_job_id",
+            "Provider submission did not return a job id.",
+        )
+        .await;
+    }
+
+    record_provider_generation_response(db, job_id, &result.raw_json).await?;
+    match poll_failure_action(attempt, max_attempts) {
+        PollFailureAction::Fail => {
+            fail_generation_job(
+                db,
+                job_id,
+                "generation_poll_exhausted",
+                "Provider submission succeeded on final attempt but polling is exhausted.",
+            )
+            .await
+        }
+        PollFailureAction::Retry(next_attempt) => {
+            enqueue_poll(env, job_id, batch_id, next_attempt, max_attempts).await
+        }
+    }
 }
 
 async fn schedule_submission_retry(
@@ -353,6 +499,7 @@ async fn poll_generation(
         return Ok(());
     };
     if matches!(job.status.as_str(), "completed" | "failed") {
+        repair_terminal_generation_job(db, job_id, &job).await?;
         return Ok(());
     }
     if attempt > max_attempts {
@@ -420,10 +567,25 @@ async fn poll_generation(
         .await;
     }
 
-    let provider_job_ids =
-        serde_json::from_str::<Value>(&job.provider_job_ids_json).unwrap_or_else(|_| json!([]));
     let original_request =
         serde_json::from_str::<Value>(&job.request_json).unwrap_or_else(|_| json!({}));
+    let provider_job_ids =
+        serde_json::from_str::<Value>(&job.provider_job_ids_json).unwrap_or_else(|_| json!([]));
+
+    if provider_ids_are_empty(&provider_job_ids) {
+        return retry_provider_submission_from_poll(
+            db,
+            env,
+            job_id,
+            batch_id,
+            attempt,
+            max_attempts,
+            &tool_name,
+            &token.access_token,
+            &original_request,
+        )
+        .await;
+    }
 
     let result = match call_tool(
         &token.access_token,
@@ -558,9 +720,10 @@ async fn complete_generation_job(
         let Some(reloaded) = load_generation_job_by_id(db, job_id).await? else {
             return Ok(());
         };
-        if reloaded.status != "completing" {
-            return Ok(());
+        if reloaded.status == "completed" || generation_output_count(db, job_id).await? > 0 {
+            repair_terminal_generation_job(db, job_id, &reloaded).await?;
         }
+        return Ok(());
     }
 
     let (bytes, content_type) = download_generated_image(provider_url).await?;
@@ -714,6 +877,72 @@ async fn fail_generation_job(
         mark_batch_ready_if_complete(db, batch_id).await?;
     }
 
+    Ok(())
+}
+
+async fn fail_generation_job_without_refund(
+    db: &D1Database,
+    job_id: &str,
+    error_code: &str,
+    error_message: &str,
+) -> WorkerResult<()> {
+    let now = now_iso_string();
+    db::exec(
+        db,
+        r#"
+        UPDATE generation_jobs
+        SET status = 'failed',
+            error_code = ?,
+            error_message = ?,
+            response_json = json_set(
+              CASE WHEN json_valid(response_json) THEN response_json ELSE '{}' END,
+              '$.usageRefundedAt',
+              ?,
+              '$.usageRefundedDate',
+              json_extract(
+                CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,
+                '$.usageDate'
+              ),
+              '$.usageRefundSkipped',
+              1
+            ),
+            completed_at = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND status NOT IN ('completed', 'failed')
+        "#,
+        vec![
+            json!(error_code),
+            json!(error_message),
+            json!(now),
+            json!(now),
+            json!(now),
+            json!(job_id),
+        ],
+    )
+    .await
+}
+
+async fn repair_terminal_generation_job(
+    db: &D1Database,
+    job_id: &str,
+    job: &GenerationJobRow,
+) -> WorkerResult<()> {
+    match job.status.as_str() {
+        "completed" => {
+            repair_completed_generation_side_effects(db, job).await?;
+            if let Some(batch_id) = job.blitz_batch_id.as_deref() {
+                mark_batch_ready_if_complete(db, batch_id).await?;
+            }
+        }
+        "failed" => {
+            repair_failed_generation_refund(db, job_id, job).await?;
+            if let Some(batch_id) = job.blitz_batch_id.as_deref() {
+                mark_batch_ready_if_complete(db, batch_id).await?;
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -887,25 +1116,6 @@ async fn load_visual_reference(
     .await
 }
 
-async fn existing_batch_reference_job(
-    db: &D1Database,
-    batch_id: &str,
-    visual_reference_id: &str,
-) -> WorkerResult<bool> {
-    let row = db::first::<CountRow>(
-        db,
-        r#"
-        SELECT COUNT(*) AS count
-        FROM generation_jobs
-        WHERE blitz_batch_id = ?
-          AND input_visual_reference_id = ?
-        "#,
-        vec![json!(batch_id), json!(visual_reference_id)],
-    )
-    .await?;
-    Ok(row.map(|row| row.count).unwrap_or(0) > 0)
-}
-
 async fn batch_has_generation_jobs(db: &D1Database, batch_id: &str) -> WorkerResult<bool> {
     let row = db::first::<CountRow>(
         db,
@@ -928,12 +1138,12 @@ async fn insert_generation_job(
     batch_id: &str,
     visual_reference_id: &str,
     request_json: &Value,
-) -> WorkerResult<()> {
+) -> WorkerResult<bool> {
     let now = now_iso_string();
-    db::exec(
+    let result = db::run(
         db,
         r#"
-        INSERT INTO generation_jobs (
+        INSERT OR IGNORE INTO generation_jobs (
           id,
           user_id,
           clone_id,
@@ -957,7 +1167,8 @@ async fn insert_generation_job(
             json!(now),
         ],
     )
-    .await
+    .await?;
+    Ok(changed_rows(&result)? > 0)
 }
 
 async fn mark_generation_job_submitting(db: &D1Database, job_id: &str) -> WorkerResult<()> {
@@ -1212,6 +1423,7 @@ async fn load_generation_job(
         db,
         r#"
         SELECT
+          id,
           user_id,
           clone_id,
           blitz_batch_id,
@@ -1237,6 +1449,7 @@ async fn load_generation_job_by_id(
         db,
         r#"
         SELECT
+          id,
           user_id,
           clone_id,
           blitz_batch_id,
@@ -1249,6 +1462,35 @@ async fn load_generation_job_by_id(
         WHERE id = ?
         "#,
         vec![json!(job_id)],
+    )
+    .await
+}
+
+async fn load_generation_job_by_batch_reference(
+    db: &D1Database,
+    batch_id: &str,
+    visual_reference_id: &str,
+) -> WorkerResult<Option<GenerationJobRow>> {
+    db::first::<GenerationJobRow>(
+        db,
+        r#"
+        SELECT
+          id,
+          user_id,
+          clone_id,
+          blitz_batch_id,
+          input_visual_reference_id,
+          status,
+          provider_job_ids_json,
+          request_json,
+          response_json
+        FROM generation_jobs
+        WHERE blitz_batch_id = ?
+          AND input_visual_reference_id = ?
+        ORDER BY queued_at ASC
+        LIMIT 1
+        "#,
+        vec![json!(batch_id), json!(visual_reference_id)],
     )
     .await
 }
@@ -1425,11 +1667,49 @@ fn usage_date_from_request_json(request_json: &str) -> Option<String> {
         .and_then(|value| json_string_at(&value, "/usageDate"))
 }
 
+fn submission_arguments_from_request(job_id: &str, request_json: &Value) -> WorkerResult<Value> {
+    Ok(json!({
+        "jobId": json_string_at(request_json, "/jobId").unwrap_or_else(|| job_id.to_string()),
+        "batchId": required_json_string(request_json, "/batchId")?,
+        "cloneId": required_json_string(request_json, "/cloneId")?,
+        "userId": required_json_string(request_json, "/userId")?,
+        "idempotencyKey": required_json_string(request_json, "/idempotencyKey")?,
+        "providerSoulId": required_json_string(request_json, "/providerSoulId")?,
+        "inputImageUrl": required_json_string(request_json, "/inputImageUrl")?,
+        "prompt": json_string_at(request_json, "/prompt").unwrap_or_default(),
+    }))
+}
+
+fn required_json_string(value: &Value, path: &str) -> WorkerResult<String> {
+    json_string_at(value, path)
+        .ok_or_else(|| Error::RustError(format!("missing_generation_request_field:{path}")))
+}
+
+fn provider_ids_are_empty(provider_job_ids: &Value) -> bool {
+    provider_job_ids
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .all(|value| value.trim().is_empty())
+        })
+        .unwrap_or(true)
+}
+
 fn response_has_usage_refund_marker(response_json: &str) -> bool {
     serde_json::from_str::<Value>(response_json)
         .ok()
         .and_then(|value| json_string_at(&value, "/usageRefundedAt"))
         .is_some()
+}
+
+fn deterministic_generation_job_id(batch_id: &str, visual_reference_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(batch_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(visual_reference_id.as_bytes());
+    let digest = hasher.finalize();
+    format!("gen_{}", &hex::encode(digest)[..24])
 }
 
 fn generation_media_id(job_id: &str) -> String {
@@ -1527,9 +1807,10 @@ fn now_iso_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        final_image_url, generation_media_id, generation_output_id, poll_failure_action,
-        provider_asset_id, provider_job_ids, provider_status, response_has_usage_refund_marker,
-        usage_date_from_request_json, PollFailureAction,
+        deterministic_generation_job_id, final_image_url, generation_media_id,
+        generation_output_id, poll_failure_action, provider_asset_id, provider_ids_are_empty,
+        provider_job_ids, provider_status, response_has_usage_refund_marker,
+        submission_arguments_from_request, usage_date_from_request_json, PollFailureAction,
     };
     use serde_json::json;
 
@@ -1549,6 +1830,15 @@ mod tests {
     fn generation_output_ids_are_deterministic_from_job_id() {
         assert_eq!(generation_media_id("gen_abc123"), "media_abc123");
         assert_eq!(generation_output_id("gen_abc123"), "gout_abc123");
+    }
+
+    #[test]
+    fn deterministic_generation_job_id_is_stable_and_safe() {
+        let id = deterministic_generation_job_id("batch/one", "vref:two");
+        assert_eq!(id, deterministic_generation_job_id("batch/one", "vref:two"));
+        assert!(id.starts_with("gen_"));
+        assert_eq!(id.len(), 28);
+        assert!(id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'));
     }
 
     #[test]
@@ -1578,6 +1868,44 @@ mod tests {
             Some("2026-05-11".to_string())
         );
         assert_eq!(usage_date_from_request_json("{}"), None);
+    }
+
+    #[test]
+    fn empty_provider_ids_trigger_submission_retry_decision() {
+        assert!(provider_ids_are_empty(&json!([])));
+        assert!(provider_ids_are_empty(&json!([""])));
+        assert!(!provider_ids_are_empty(&json!(["hf_job_1"])));
+        assert!(provider_ids_are_empty(&json!({})));
+    }
+
+    #[test]
+    fn submission_arguments_are_rebuilt_from_request_json() {
+        let request = json!({
+            "jobId": "gen_1",
+            "batchId": "batch_1",
+            "cloneId": "clone_1",
+            "userId": "user_1",
+            "idempotencyKey": "blitz_gen:batch_1:vref_1",
+            "providerSoulId": "soul_1",
+            "inputImageUrl": "https://cdn.example/input.jpg",
+            "visualReferenceId": "vref_1",
+            "usageDate": "2026-05-11",
+            "prompt": ""
+        });
+
+        assert_eq!(
+            submission_arguments_from_request("fallback", &request).unwrap(),
+            json!({
+                "jobId": "gen_1",
+                "batchId": "batch_1",
+                "cloneId": "clone_1",
+                "userId": "user_1",
+                "idempotencyKey": "blitz_gen:batch_1:vref_1",
+                "providerSoulId": "soul_1",
+                "inputImageUrl": "https://cdn.example/input.jpg",
+                "prompt": ""
+            })
+        );
     }
 
     #[test]
