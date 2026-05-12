@@ -15,6 +15,29 @@ pub enum CloneTrainingMessage {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum GenerationMessage {
+    GenerateBlitzBatch {
+        batch_id: String,
+        clone_id: String,
+        user_id: String,
+        idempotency_key: String,
+        visual_reference_ids: Vec<String>,
+        provider_soul_id: String,
+    },
+    PollGeneration {
+        job_id: String,
+        batch_id: String,
+        attempt: u8,
+        max_attempts: u8,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

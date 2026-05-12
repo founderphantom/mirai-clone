@@ -14,11 +14,12 @@ use mirai_product_worker::domain::media_validation::{
     is_supported_reference_content_type, validate_reference_count, ReferenceCountError,
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
+use mirai_product_worker::queues::messages::GenerationMessage;
+use mirai_product_worker::routes::onboarding::default_bubbles;
 use mirai_product_worker::scrapecreators::{
     build_scrape_request, normalize_instagram_reels_search, normalize_tiktok_keyword_search,
     scrape_platform_from_str, ScrapePlatform,
 };
-use mirai_product_worker::routes::onboarding::default_bubbles;
 use mirai_product_worker::services::accounts::{
     account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
     account_usage_limits, VerifiedIdentity,
@@ -29,6 +30,41 @@ use mirai_product_worker::services::provider_accounts::{
     choose_provider_account, ProviderAccountCandidate,
 };
 use serde_json::json;
+
+#[test]
+fn generation_messages_serialize_blitz_fields_as_camel_case() {
+    let message = GenerationMessage::GenerateBlitzBatch {
+        batch_id: "batch_1".to_string(),
+        clone_id: "clone_1".to_string(),
+        user_id: "user_1".to_string(),
+        idempotency_key: "blitz_gen:batch_1".to_string(),
+        visual_reference_ids: vec!["vref_1".to_string()],
+        provider_soul_id: "soul_1".to_string(),
+    };
+    assert_eq!(
+        serde_json::to_value(message).unwrap(),
+        serde_json::json!({
+            "type": "generate_blitz_batch",
+            "batchId": "batch_1",
+            "cloneId": "clone_1",
+            "userId": "user_1",
+            "idempotencyKey": "blitz_gen:batch_1",
+            "visualReferenceIds": ["vref_1"],
+            "providerSoulId": "soul_1"
+        })
+    );
+
+    let poll = GenerationMessage::PollGeneration {
+        job_id: "gen_1".to_string(),
+        batch_id: "batch_1".to_string(),
+        attempt: 1,
+        max_attempts: 30,
+    };
+    assert_eq!(
+        serde_json::to_value(poll).unwrap()["type"],
+        serde_json::json!("poll_generation")
+    );
+}
 
 #[test]
 fn text_only_models_are_not_chosen_for_vision_tasks() {
