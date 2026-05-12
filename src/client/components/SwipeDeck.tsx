@@ -9,6 +9,10 @@ export type SwipeCard = {
   imageUrl?: string | null;
 };
 
+export function swipeDeckKeyForCards(cards: Array<Pick<SwipeCard, "id">>) {
+  return JSON.stringify(cards.map((card) => card.id));
+}
+
 export function canAdvanceSwipeDeckAfterAwait(capturedDeckKey: string, currentDeckKey: string) {
   return capturedDeckKey === currentDeckKey;
 }
@@ -24,24 +28,24 @@ export function SwipeDeck({
 }) {
   const [index, setIndex] = useState(0);
   const [pending, setPending] = useState(false);
-  const cardIds = useMemo(() => cards.map((card) => card.id).join("|"), [cards]);
-  const cardIdsRef = useRef(cardIds);
+  const deckKey = useMemo(() => swipeDeckKeyForCards(cards), [cards]);
+  const deckKeyRef = useRef(deckKey);
+  deckKeyRef.current = deckKey;
   const current = cards[index];
   const remaining = useMemo(() => Math.max(0, cards.length - index), [cards.length, index]);
 
   useEffect(() => {
-    cardIdsRef.current = cardIds;
     setIndex(0);
-  }, [cardIds]);
+  }, [deckKey]);
 
   async function swipe(verdict: "like" | "dislike") {
     if (!current || pending) return;
-    const swipeDeckKey = cardIds;
+    const swipeDeckKey = deckKey;
     setPending(true);
     track("blitz_swipe_preview", { cardId: current.id, verdict });
     try {
       await onSwipe?.(current, verdict);
-      if (canAdvanceSwipeDeckAfterAwait(swipeDeckKey, cardIdsRef.current)) {
+      if (canAdvanceSwipeDeckAfterAwait(swipeDeckKey, deckKeyRef.current)) {
         setIndex((value) => value + 1);
       }
     } catch {

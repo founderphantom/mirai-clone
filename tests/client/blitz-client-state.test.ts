@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canAdvanceSwipeDeckAfterAwait } from "../../src/client/components/SwipeDeck";
+import { canAdvanceSwipeDeckAfterAwait, swipeDeckKeyForCards } from "../../src/client/components/SwipeDeck";
 import { isLoadedBlitzStateForClone } from "../../src/client/screens/BlitzScreen";
 import { dailyGenerationMeterValue } from "../../src/client/screens/MeScreen";
 import type { BlitzCurrent } from "../../src/client/types";
@@ -24,8 +24,14 @@ describe("Blitz client state guards", () => {
 
 describe("SwipeDeck async advancement guard", () => {
   it("only advances when the swipe resolves for the same deck key", () => {
-    expect(canAdvanceSwipeDeckAfterAwait("card-a|card-b", "card-a|card-b")).toBe(true);
-    expect(canAdvanceSwipeDeckAfterAwait("card-a|card-b", "card-c|card-d")).toBe(false);
+    const initialDeckKey = swipeDeckKeyForCards([{ id: "card-a" }, { id: "card-b" }]);
+
+    expect(canAdvanceSwipeDeckAfterAwait(initialDeckKey, swipeDeckKeyForCards([{ id: "card-a" }, { id: "card-b" }]))).toBe(true);
+    expect(canAdvanceSwipeDeckAfterAwait(initialDeckKey, swipeDeckKeyForCards([{ id: "card-c" }, { id: "card-d" }]))).toBe(false);
+  });
+
+  it("uses a non-ambiguous deck key for card ids containing delimiters", () => {
+    expect(swipeDeckKeyForCards([{ id: "a|b" }, { id: "c" }])).not.toBe(swipeDeckKeyForCards([{ id: "a" }, { id: "b|c" }]));
   });
 });
 
