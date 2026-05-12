@@ -140,7 +140,7 @@ async fn generate_blitz_batch(
         if let Some(existing) =
             load_generation_job_by_batch_reference(db, batch_id, visual_reference_id).await?
         {
-            repair_terminal_generation_job(db, &existing.id, &existing).await?;
+            resume_existing_generation_job(db, env, &existing).await?;
             continue;
         }
 
@@ -184,7 +184,7 @@ async fn generate_blitz_batch(
         .await?
         {
             if let Some(existing) = load_generation_job_by_id(db, &job_id).await? {
-                repair_terminal_generation_job(db, &job_id, &existing).await?;
+                resume_existing_generation_job(db, env, &existing).await?;
             }
             continue;
         }
@@ -223,13 +223,17 @@ async fn generate_blitz_batch(
         )
         .await
         {
-            fail_generation_job(
-                db,
-                &job_id,
-                "provider_submission_failed",
-                &error.to_string(),
-            )
-            .await?;
+            if is_permanent_submission_error(&error) {
+                fail_generation_job(
+                    db,
+                    &job_id,
+                    "provider_submission_failed",
+                    &error.to_string(),
+                )
+                .await?;
+            } else {
+                return Err(error);
+            }
         }
     }
 
@@ -353,7 +357,15 @@ async fn submit_generation_job(
     };
 
     if let Some(final_url) = final_image_url(&result.raw_json) {
-        complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await?;
+        record_provider_generation_response(db, job_id, &result.raw_json).await?;
+        if let Err(error) =
+            complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await
+        {
+            web_sys::console::error_1(
+                &format!("generation completion scheduled for retry: {error:?}").into(),
+            );
+            enqueue_completion_retry(env, job_id, batch_id, 1, 30).await?;
+        }
         return Ok(());
     }
 
@@ -415,20 +427,14 @@ async fn retry_provider_submission_from_poll(
     };
 
     if let Some(final_url) = final_image_url(&result.raw_json) {
+        record_provider_generation_response(db, job_id, &result.raw_json).await?;
         if let Err(error) =
             complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await
         {
-            return handle_poll_failure(
-                db,
-                env,
-                job_id,
-                batch_id,
-                attempt,
-                max_attempts,
-                "generation_completion_failed",
-                &error.to_string(),
-            )
-            .await;
+            web_sys::console::error_1(
+                &format!("generation completion scheduled for retry: {error:?}").into(),
+            );
+            enqueue_completion_retry(env, job_id, batch_id, attempt, max_attempts).await?;
         }
         return Ok(());
     }
@@ -448,20 +454,11 @@ async fn retry_provider_submission_from_poll(
     }
 
     record_provider_generation_response(db, job_id, &result.raw_json).await?;
-    match poll_failure_action(attempt, max_attempts) {
-        PollFailureAction::Fail => {
-            fail_generation_job(
-                db,
-                job_id,
-                "generation_poll_exhausted",
-                "Provider submission succeeded on final attempt but polling is exhausted.",
-            )
-            .await
-        }
-        PollFailureAction::Retry(next_attempt) => {
-            enqueue_poll(env, job_id, batch_id, next_attempt, max_attempts).await
-        }
-    }
+    let next_attempt = match poll_failure_action(attempt, max_attempts) {
+        PollFailureAction::Retry(next_attempt) => next_attempt,
+        PollFailureAction::Fail => max_attempts.max(1),
+    };
+    enqueue_poll(env, job_id, batch_id, next_attempt, max_attempts).await
 }
 
 async fn schedule_submission_retry(
@@ -487,6 +484,33 @@ async fn schedule_submission_retry(
     enqueue_poll(env, job_id, batch_id, 1, 30).await
 }
 
+async fn resume_existing_generation_job(
+    db: &D1Database,
+    env: &Env,
+    job: &GenerationJobRow,
+) -> WorkerResult<()> {
+    let output_count = generation_output_count(db, &job.id).await?;
+    if job.status == "completed" || output_count > 0 {
+        let raw_response =
+            serde_json::from_str::<Value>(&job.response_json).unwrap_or_else(|_| json!({}));
+        repair_completed_generation_job(db, &job.id, job, &raw_response).await?;
+        return Ok(());
+    }
+    if job.status == "failed" {
+        repair_terminal_generation_job(db, &job.id, job).await?;
+        return Ok(());
+    }
+
+    if let Some(batch_id) = job
+        .blitz_batch_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        enqueue_poll(env, &job.id, batch_id, 1, 30).await?;
+    }
+    Ok(())
+}
+
 async fn poll_generation(
     db: &D1Database,
     env: &Env,
@@ -498,10 +522,34 @@ async fn poll_generation(
     let Some(job) = load_generation_job(db, job_id, batch_id).await? else {
         return Ok(());
     };
-    if matches!(job.status.as_str(), "completed" | "failed") {
+    let output_count = generation_output_count(db, job_id).await?;
+    if job.status == "completed" || output_count > 0 {
+        let raw_response =
+            serde_json::from_str::<Value>(&job.response_json).unwrap_or_else(|_| json!({}));
+        repair_completed_generation_job(db, job_id, &job, &raw_response).await?;
+        return Ok(());
+    }
+    if job.status == "failed" {
         repair_terminal_generation_job(db, job_id, &job).await?;
         return Ok(());
     }
+
+    let original_request =
+        serde_json::from_str::<Value>(&job.request_json).unwrap_or_else(|_| json!({}));
+    let stored_response =
+        serde_json::from_str::<Value>(&job.response_json).unwrap_or_else(|_| json!({}));
+    if let Some(final_url) = final_image_url(&stored_response) {
+        if let Err(error) =
+            complete_generation_job(db, env, job_id, &final_url, &stored_response).await
+        {
+            web_sys::console::error_1(
+                &format!("generation completion scheduled for retry: {error:?}").into(),
+            );
+            enqueue_completion_retry(env, job_id, batch_id, attempt, max_attempts).await?;
+        }
+        return Ok(());
+    }
+
     if attempt > max_attempts {
         fail_generation_job(
             db,
@@ -567,8 +615,6 @@ async fn poll_generation(
         .await;
     }
 
-    let original_request =
-        serde_json::from_str::<Value>(&job.request_json).unwrap_or_else(|_| json!({}));
     let provider_job_ids =
         serde_json::from_str::<Value>(&job.provider_job_ids_json).unwrap_or_else(|_| json!([]));
 
@@ -619,20 +665,14 @@ async fn poll_generation(
     };
 
     if let Some(final_url) = final_image_url(&result.raw_json) {
+        record_provider_generation_response(db, job_id, &result.raw_json).await?;
         if let Err(error) =
             complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await
         {
-            return handle_poll_failure(
-                db,
-                env,
-                job_id,
-                batch_id,
-                attempt,
-                max_attempts,
-                "generation_completion_failed",
-                &error.to_string(),
-            )
-            .await;
+            web_sys::console::error_1(
+                &format!("generation completion scheduled for retry: {error:?}").into(),
+            );
+            enqueue_completion_retry(env, job_id, batch_id, attempt, max_attempts).await?;
         }
         return Ok(());
     }
@@ -703,16 +743,11 @@ async fn complete_generation_job(
         return Ok(());
     };
     if job.status == "completed" || generation_output_count(db, job_id).await? > 0 {
-        if mark_generation_job_completed(db, job_id, raw_response).await? {
-            repair_completed_generation_side_effects(db, &job).await?;
-        } else {
-            repair_completed_generation_side_effects(db, &job).await?;
-        }
-        mark_batch_ready_if_complete(db, job.blitz_batch_id.as_deref().unwrap_or_default()).await?;
+        repair_completed_generation_job(db, job_id, &job, raw_response).await?;
         return Ok(());
     }
     if job.status == "failed" {
-        mark_batch_ready_if_complete(db, job.blitz_batch_id.as_deref().unwrap_or_default()).await?;
+        repair_terminal_generation_job(db, job_id, &job).await?;
         return Ok(());
     }
 
@@ -720,8 +755,20 @@ async fn complete_generation_job(
         let Some(reloaded) = load_generation_job_by_id(db, job_id).await? else {
             return Ok(());
         };
-        if reloaded.status == "completed" || generation_output_count(db, job_id).await? > 0 {
-            repair_terminal_generation_job(db, job_id, &reloaded).await?;
+        let output_exists = generation_output_count(db, job_id).await? > 0;
+        match completion_claim_failure_action(&reloaded.status, output_exists) {
+            CompletionClaimFailureAction::RepairCompleted => {
+                repair_completed_generation_job(db, job_id, &reloaded, raw_response).await?;
+            }
+            CompletionClaimFailureAction::RepairFailed => {
+                repair_terminal_generation_job(db, job_id, &reloaded).await?;
+            }
+            CompletionClaimFailureAction::RetryLater => {
+                return Err(Error::RustError(
+                    "generation_completion_in_progress".to_string(),
+                ));
+            }
+            CompletionClaimFailureAction::Ignore => {}
         }
         return Ok(());
     }
@@ -810,18 +857,7 @@ async fn complete_generation_job(
     )
     .await?;
 
-    let completed = mark_generation_job_completed(db, job_id, raw_response).await?;
-    if completed {
-        repair_completed_generation_side_effects(db, &job).await?;
-    } else {
-        repair_completed_generation_side_effects(db, &job).await?;
-    }
-
-    if let Some(batch_id) = job.blitz_batch_id.as_deref() {
-        mark_batch_ready_if_complete(db, batch_id).await?;
-    }
-
-    Ok(())
+    repair_completed_generation_job(db, job_id, &job, raw_response).await
 }
 
 async fn fail_generation_job(
@@ -942,6 +978,20 @@ async fn repair_terminal_generation_job(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+async fn repair_completed_generation_job(
+    db: &D1Database,
+    job_id: &str,
+    job: &GenerationJobRow,
+    raw_response: &Value,
+) -> WorkerResult<()> {
+    mark_generation_job_completed(db, job_id, raw_response).await?;
+    repair_completed_generation_side_effects(db, job).await?;
+    if let Some(batch_id) = job.blitz_batch_id.as_deref() {
+        mark_batch_ready_if_complete(db, batch_id).await?;
     }
     Ok(())
 }
@@ -1190,6 +1240,7 @@ async fn mark_generation_job_submitting(db: &D1Database, job_id: &str) -> Worker
 
 async fn claim_generation_completion(db: &D1Database, job_id: &str) -> WorkerResult<bool> {
     let now = now_iso_string();
+    let reclaim_cutoff = completion_reclaim_cutoff_iso();
     let result = db::run(
         db,
         r#"
@@ -1197,14 +1248,22 @@ async fn claim_generation_completion(db: &D1Database, job_id: &str) -> WorkerRes
         SET status = 'completing',
             updated_at = ?
         WHERE id = ?
-          AND status IN ('queued', 'submitted')
+          AND (
+            status IN ('queued', 'submitted')
+            OR (status = 'completing' AND updated_at <= ?)
+          )
           AND NOT EXISTS (
             SELECT 1
             FROM generation_outputs
             WHERE job_id = ?
           )
         "#,
-        vec![json!(now), json!(job_id), json!(job_id)],
+        vec![
+            json!(now),
+            json!(job_id),
+            json!(reclaim_cutoff),
+            json!(job_id),
+        ],
     )
     .await?;
     Ok(changed_rows(&result)? > 0)
@@ -1530,6 +1589,23 @@ async fn enqueue_poll(
         .await
 }
 
+async fn enqueue_completion_retry(
+    env: &Env,
+    job_id: &str,
+    batch_id: &str,
+    attempt: u8,
+    max_attempts: u8,
+) -> WorkerResult<()> {
+    enqueue_poll(
+        env,
+        job_id,
+        batch_id,
+        retryable_completion_attempt(attempt, max_attempts),
+        max_attempts,
+    )
+    .await
+}
+
 async fn download_generated_image(provider_url: &str) -> WorkerResult<(Vec<u8>, String)> {
     let request = Request::new(provider_url, Method::Get)?;
     let mut response = Fetch::Request(request).send().await?;
@@ -1753,12 +1829,49 @@ enum PollFailureAction {
     Fail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionClaimFailureAction {
+    RepairCompleted,
+    RepairFailed,
+    RetryLater,
+    Ignore,
+}
+
 fn poll_failure_action(attempt: u8, max_attempts: u8) -> PollFailureAction {
     if attempt >= max_attempts {
         PollFailureAction::Fail
     } else {
         PollFailureAction::Retry(attempt.saturating_add(1))
     }
+}
+
+fn retryable_completion_attempt(attempt: u8, max_attempts: u8) -> u8 {
+    if max_attempts == 0 {
+        1
+    } else {
+        attempt.max(1).min(max_attempts)
+    }
+}
+
+fn completion_claim_failure_action(
+    status: &str,
+    output_exists: bool,
+) -> CompletionClaimFailureAction {
+    if output_exists || status == "completed" {
+        CompletionClaimFailureAction::RepairCompleted
+    } else if status == "failed" {
+        CompletionClaimFailureAction::RepairFailed
+    } else if matches!(status, "queued" | "submitted" | "completing") {
+        CompletionClaimFailureAction::RetryLater
+    } else {
+        CompletionClaimFailureAction::Ignore
+    }
+}
+
+fn is_permanent_submission_error(error: &Error) -> bool {
+    let message = error.to_string();
+    message.contains("higgsfield_generation_tool_missing")
+        || message.contains("missing_generation_request_field")
 }
 
 fn json_string_at(value: &Value, path: &str) -> Option<String> {
@@ -1804,13 +1917,22 @@ fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
 }
 
+fn completion_reclaim_cutoff_iso() -> String {
+    let cutoff_ms = js_sys::Date::now() - 120_000.0;
+    js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(cutoff_ms))
+        .to_iso_string()
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        deterministic_generation_job_id, final_image_url, generation_media_id,
-        generation_output_id, poll_failure_action, provider_asset_id, provider_ids_are_empty,
-        provider_job_ids, provider_status, response_has_usage_refund_marker,
-        submission_arguments_from_request, usage_date_from_request_json, PollFailureAction,
+        completion_claim_failure_action, deterministic_generation_job_id, final_image_url,
+        generation_media_id, generation_output_id, poll_failure_action, provider_asset_id,
+        provider_ids_are_empty, provider_job_ids, provider_status,
+        response_has_usage_refund_marker, retryable_completion_attempt,
+        submission_arguments_from_request, usage_date_from_request_json,
+        CompletionClaimFailureAction, PollFailureAction,
     };
     use serde_json::json;
 
@@ -1824,6 +1946,34 @@ mod tests {
     fn poll_failure_action_fails_on_final_or_exhausted_attempt() {
         assert_eq!(poll_failure_action(3, 3), PollFailureAction::Fail);
         assert_eq!(poll_failure_action(4, 3), PollFailureAction::Fail);
+    }
+
+    #[test]
+    fn retryable_completion_attempt_stays_within_poll_bounds() {
+        assert_eq!(retryable_completion_attempt(0, 30), 1);
+        assert_eq!(retryable_completion_attempt(7, 30), 7);
+        assert_eq!(retryable_completion_attempt(31, 30), 30);
+        assert_eq!(retryable_completion_attempt(1, 0), 1);
+    }
+
+    #[test]
+    fn completion_claim_failure_action_retries_reclaimable_states() {
+        assert_eq!(
+            completion_claim_failure_action("completing", false),
+            CompletionClaimFailureAction::RetryLater
+        );
+        assert_eq!(
+            completion_claim_failure_action("submitted", false),
+            CompletionClaimFailureAction::RetryLater
+        );
+        assert_eq!(
+            completion_claim_failure_action("completing", true),
+            CompletionClaimFailureAction::RepairCompleted
+        );
+        assert_eq!(
+            completion_claim_failure_action("failed", false),
+            CompletionClaimFailureAction::RepairFailed
+        );
     }
 
     #[test]
