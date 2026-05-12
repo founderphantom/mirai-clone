@@ -8,7 +8,7 @@ DROP TABLE IF EXISTS visual_references;
 DROP TABLE IF EXISTS visual_reference_candidates;
 DROP TABLE IF EXISTS niche_knowledge;
 DROP TABLE IF EXISTS niche_research_queries;
-DROP TABLE IF EXISTS inspiration_bubbles;
+DROP TABLE IF EXISTS moodboards;
 DROP TABLE IF EXISTS discovery_items;
 DROP TABLE IF EXISTS discovery_sources;
 DROP TABLE IF EXISTS blitz_batches;
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS discovery_items (
   UNIQUE(source_id, platform, external_id)
 );
 
-CREATE TABLE IF NOT EXISTS inspiration_bubbles (
+CREATE TABLE IF NOT EXISTS moodboards (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   clone_id TEXT NOT NULL,
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS niche_research_queries (
   id TEXT PRIMARY KEY,
   user_id TEXT,
   clone_id TEXT NOT NULL,
-  bubble_id TEXT,
+  moodboard_id TEXT,
   query TEXT NOT NULL,
   source TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'new',
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS niche_research_queries (
   created_at TEXT NOT NULL,
   used_at TEXT,
   FOREIGN KEY (clone_id) REFERENCES clone_profiles(id) ON DELETE CASCADE,
-  FOREIGN KEY (bubble_id) REFERENCES inspiration_bubbles(id) ON DELETE SET NULL
+  FOREIGN KEY (moodboard_id) REFERENCES moodboards(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS niche_knowledge (
@@ -217,14 +217,14 @@ CREATE TABLE IF NOT EXISTS user_inspiration_pool (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   clone_id TEXT NOT NULL,
-  bubble_id TEXT,
+  moodboard_id TEXT,
   visual_reference_id TEXT,
   discovery_item_id TEXT,
   score REAL NOT NULL DEFAULT 1,
   used_at TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY (clone_id) REFERENCES clone_profiles(id) ON DELETE CASCADE,
-  FOREIGN KEY (bubble_id) REFERENCES inspiration_bubbles(id) ON DELETE SET NULL,
+  FOREIGN KEY (moodboard_id) REFERENCES moodboards(id) ON DELETE SET NULL,
   FOREIGN KEY (visual_reference_id) REFERENCES visual_references(id) ON DELETE CASCADE,
   FOREIGN KEY (discovery_item_id) REFERENCES discovery_items(id) ON DELETE CASCADE,
   UNIQUE(clone_id, visual_reference_id),
@@ -281,7 +281,7 @@ INSERT INTO blitz_config (key, value, updated_at) VALUES
   ('max_reference_generation_uses', '4', '2026-05-11T00:00:00.000Z'),
   ('scrape_delay_ms', '1000', '2026-05-11T00:00:00.000Z');
 
-CREATE INDEX IF NOT EXISTS idx_inspiration_bubbles_user_clone ON inspiration_bubbles(user_id, clone_id, sort_order);
+CREATE INDEX IF NOT EXISTS idx_moodboards_user_clone ON moodboards(user_id, clone_id, sort_order);
 CREATE INDEX IF NOT EXISTS idx_blitz_batches_clone_status ON blitz_batches(clone_id, status, batch_number DESC);
 CREATE INDEX IF NOT EXISTS idx_blitz_batches_user_date ON blitz_batches(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_blitz_swipes_batch ON blitz_swipes(batch_id, swipe_index);

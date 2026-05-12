@@ -62,12 +62,12 @@ pub async fn run(req: Request, env: Env) -> WorkerResult<Response> {
             crate::routes::onboarding::adopt_starter,
         )
         .post_async(
-            "/api/onboarding/bubbles/generate",
-            crate::routes::onboarding::generate_bubbles,
+            "/api/onboarding/moodboards/generate",
+            crate::routes::onboarding::generate_moodboards,
         )
         .post_async(
-            "/api/onboarding/bubbles",
-            crate::routes::onboarding::save_bubbles,
+            "/api/onboarding/moodboards",
+            crate::routes::onboarding::save_moodboards,
         )
         .post_async(
             "/api/clones/manual-upload",

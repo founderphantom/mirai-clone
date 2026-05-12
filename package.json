@@ -17,6 +17,7 @@
     "higgsfield:session": "python scripts/higgsfield_session.py",
     "higgsfield:session:publish": "python scripts/higgsfield_session.py --publish-wrangler",
     "higgsfield:clone:create": "node scripts/create_higgsfield_clone.mjs",
+    "higgsfield:moodboards": "node scripts/generate_higgsfield_moodboards.mjs",
     "product:check": "cd workers/product && cargo check --target wasm32-unknown-unknown",
     "product:test": "bash scripts/test_product_worker.sh",
     "product:build": "bash scripts/build_product_worker.sh",

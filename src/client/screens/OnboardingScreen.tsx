@@ -7,12 +7,12 @@ import { track } from "../lib/analytics";
 import { UploadReferencePanel } from "./onboarding/UploadReferencePanel";
 import type {
   Clone,
-  InspirationBubble,
   InstagramHarvestJob,
+  Moodboard,
   OnboardingState,
   StarterCharacter
 } from "../types";
-import { bubbleVisualFor } from "./onboarding-visuals";
+import { moodboardVisualFor } from "./onboarding-visuals";
 
 type HarvestResponse = {
   job: InstagramHarvestJob;
@@ -20,7 +20,7 @@ type HarvestResponse = {
   acceptedAssets?: Array<{ id: string }>;
 };
 
-type OnboardingMode = "instagram" | "upload" | "starter" | "bubbles";
+type OnboardingMode = "instagram" | "upload" | "starter" | "moodboards";
 
 const starterImages: Record<string, string> = {
   starter_amara_cherry_grwm: "/landing/starters/starter-amara.jpg",
@@ -53,15 +53,15 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
   const [mode, setMode] = useState<OnboardingMode>("upload");
   const [activeClone, setActiveClone] = useState<Clone | null>(null);
   const [harvest, setHarvest] = useState<InstagramHarvestJob | null>(null);
-  const [selectedBubbles, setSelectedBubbles] = useState<string[]>([]);
+  const [selectedMoodboards, setSelectedMoodboards] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
-  const bubbles = state?.bubbles ?? [];
+  const moodboards = state?.moodboards ?? [];
   const starters = state?.starters ?? [];
   const clone = activeClone ?? state?.activeClone ?? null;
-  const canPickBubbles = Boolean(clone?.id);
+  const canPickMoodboards = Boolean(clone?.id);
 
   useEffect(() => {
     let ignore = false;
@@ -71,8 +71,8 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         setState(next);
         setActiveClone(next.activeClone);
         setHarvest(next.latestHarvest ?? null);
-        setSelectedBubbles(next.bubbles.filter((bubble) => bubble.selected).map((bubble) => bubble.id));
-        if (next.bubbles.length > 0) setMode("bubbles");
+        setSelectedMoodboards(next.moodboards.filter((moodboard) => moodboard.selected).map((moodboard) => moodboard.id));
+        if (next.moodboards.length > 0) setMode("moodboards");
       })
       .catch(() => undefined);
     return () => {
@@ -90,7 +90,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         setHarvest(response.job);
         if (response.clone) {
           setActiveClone(response.clone);
-          await ensureBubbles(response.clone.id);
+          await ensureMoodboards(response.clone.id);
         }
         if (terminalHarvestStatus(response.job.status)) await refreshState();
       } catch {
@@ -108,7 +108,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
     setState(next);
     if (next.activeClone) setActiveClone(next.activeClone);
     if (next.latestHarvest) setHarvest(next.latestHarvest);
-    setSelectedBubbles(next.bubbles.filter((bubble) => bubble.selected).map((bubble) => bubble.id));
+    setSelectedMoodboards(next.moodboards.filter((moodboard) => moodboard.selected).map((moodboard) => moodboard.id));
     return next;
   }
 
@@ -121,8 +121,8 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         body: form
       });
       setActiveClone(response.clone);
-      await ensureBubbles(response.clone.id);
-      setMode("bubbles");
+      await ensureMoodboards(response.clone.id);
+      setMode("moodboards");
       setNotice("Reference photos saved. Your Soul is waiting for the creation script.");
       track("onboarding_upload_created", { cloneId: response.clone.id });
     } catch (err) {
@@ -141,8 +141,8 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         body: JSON.stringify({ starterId: starter.id })
       });
       setActiveClone(response.clone);
-      await ensureBubbles(response.clone.id);
-      setMode("bubbles");
+      await ensureMoodboards(response.clone.id);
+      setMode("moodboards");
       setNotice(`${starter.name} is adopted. You can swap to your own Instagram or uploads later.`);
       track("onboarding_starter_adopted", { starterId: starter.id });
     } catch (err) {
@@ -152,37 +152,37 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
     }
   }
 
-  async function ensureBubbles(cloneId: string) {
-    const response = await api<{ bubbles: InspirationBubble[] }>("/api/onboarding/bubbles/generate", {
+  async function ensureMoodboards(cloneId: string) {
+    const response = await api<{ moodboards: Moodboard[] }>("/api/onboarding/moodboards/generate", {
       method: "POST",
       body: JSON.stringify({ cloneId })
     });
-    setState((current) => current ? { ...current, bubbles: response.bubbles } : current);
-    setSelectedBubbles(response.bubbles.filter((bubble) => bubble.selected).map((bubble) => bubble.id));
-    setMode("bubbles");
+    setState((current) => current ? { ...current, moodboards: response.moodboards } : current);
+    setSelectedMoodboards(response.moodboards.filter((moodboard) => moodboard.selected).map((moodboard) => moodboard.id));
+    setMode("moodboards");
   }
 
-  async function submitBubbles() {
+  async function submitMoodboards() {
     if (!clone) return;
     setBusy(true);
     setError("");
     try {
-      await api("/api/onboarding/bubbles", {
+      await api("/api/onboarding/moodboards", {
         method: "POST",
-        body: JSON.stringify({ cloneId: clone.id, bubbleIds: selectedBubbles })
+        body: JSON.stringify({ cloneId: clone.id, moodboardIds: selectedMoodboards })
       });
-      track("onboarding_bubbles_selected", { count: selectedBubbles.length });
+      track("onboarding_moodboards_selected", { count: selectedMoodboards.length });
       await onCreated();
-      setNotice("Inspiration bubbles saved. Your personal pool is seeding in the background.");
+      setNotice("Inspiration moodboards saved. Your personal pool is seeding in the background.");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save inspiration bubbles.");
+      setError(err instanceof Error ? err.message : "Could not save inspiration moodboards.");
     } finally {
       setBusy(false);
     }
   }
 
-  function toggleBubble(id: string) {
-    setSelectedBubbles((current) => {
+  function toggleMoodboard(id: string) {
+    setSelectedMoodboards((current) => {
       if (current.includes(id)) return current.filter((value) => value !== id);
       if (current.length >= 5) return current;
       return [...current, id];
@@ -200,15 +200,15 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
             <span>Instagram</span>
             <span>Uploads</span>
             <span>Starters</span>
-            <span>Bubbles</span>
+            <span>Moodboards</span>
           </div>
         </div>
         <div className="onboarding-hero-visual" aria-hidden="true">
           <img className="onboarding-hero-main" src="/landing/clone-y2k-cafe.jpg" alt="" />
           <img className="onboarding-hero-float" src="/landing/clone-tokyo-neon.jpg" alt="" />
           <div className="onboarding-hero-status">
-            <span>{selectedBubbles.length}/5</span>
-            <small>bubbles selected</small>
+            <span>{selectedMoodboards.length}/5</span>
+            <small>moodboards selected</small>
           </div>
         </div>
       </section>
@@ -229,9 +229,9 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
           <strong>Starters</strong>
           <span>Preset creators</span>
         </button>
-        <button type="button" className={sourceTabClass(mode, "bubbles", "source-tab-bubbles")} disabled={!canPickBubbles} onClick={() => setMode("bubbles")}>
+        <button type="button" className={sourceTabClass(mode, "moodboards", "source-tab-moodboards")} disabled={!canPickMoodboards} onClick={() => setMode("moodboards")}>
           <WandSparkles size={18} />
-          <strong>Bubbles</strong>
+          <strong>Moodboards</strong>
           <span>Visual direction</span>
         </button>
       </section>
@@ -289,44 +289,44 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         </motion.section>
       )}
 
-      {mode === "bubbles" && (
-        <motion.section className="moment-card onboarding-bubbles-card" initial={{ y: 12, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
+      {mode === "moodboards" && (
+        <motion.section className="moment-card onboarding-moodboards-card" initial={{ y: 12, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
           <div className="onboarding-card-header">
             <div>
               <WandSparkles size={24} />
-              <h2>Choose up to 5 inspiration bubbles</h2>
-              <p>These seed ScrapeCreators searches for your personal inspiration pool.</p>
+              <h2>Choose 5 moodboards</h2>
+              <p>Defines style and creative direction</p>
             </div>
-            <span>{selectedBubbles.length}/5</span>
+            <span>{selectedMoodboards.length}/5</span>
           </div>
-          <div className="bubble-grid onboarding-bubble-grid">
-            {bubbles.map((bubble) => {
-              const active = selectedBubbles.includes(bubble.id);
-              const visual = bubbleVisualFor(bubble);
-              const style = { "--bubble-image": `url(${visual.src})` } as CSSProperties;
+          <div className="moodboard-grid onboarding-moodboard-grid">
+            {moodboards.map((moodboard) => {
+              const active = selectedMoodboards.includes(moodboard.id);
+              const visual = moodboardVisualFor(moodboard);
+              const style = { "--moodboard-image": `url(${visual.src})` } as CSSProperties;
               return (
                 <button
-                  aria-label={`${active ? "Remove" : "Select"} ${bubble.title} inspiration bubble`}
+                  aria-label={`${active ? "Remove" : "Select"} ${moodboard.title} inspiration moodboard`}
                   aria-pressed={active}
-                  className={active ? "bubble-chip onboarding-bubble selected" : "bubble-chip onboarding-bubble"}
-                  key={bubble.id}
-                  onClick={() => toggleBubble(bubble.id)}
+                  className={active ? "moodboard-chip onboarding-moodboard selected" : "moodboard-chip onboarding-moodboard"}
+                  key={moodboard.id}
+                  onClick={() => toggleMoodboard(moodboard.id)}
                   style={style}
                   type="button"
                 >
-                  <span className="bubble-checkmark" aria-hidden="true">{active && <Check size={14} />}</span>
-                  <span className="bubble-copy">
+                  <span className="moodboard-checkmark" aria-hidden="true">{active && <Check size={14} />}</span>
+                  <span className="moodboard-copy">
                     <small>{visual.label}</small>
-                    <strong>{bubble.title}</strong>
-                    <span className="bubble-summary">{bubble.vibe_summary}</span>
+                    <strong>{moodboard.title}</strong>
+                    <span className="moodboard-summary">{moodboard.vibe_summary}</span>
                   </span>
                 </button>
               );
             })}
           </div>
-          <button className="primary" disabled={busy || selectedBubbles.length === 0} onClick={submitBubbles}>
+          <button className="primary" disabled={busy || selectedMoodboards.length !== 5} onClick={submitMoodboards}>
             {busy ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-            Save {selectedBubbles.length || ""} bubbles
+            Save 5 moodboards
           </button>
         </motion.section>
       )}

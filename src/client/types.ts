@@ -64,7 +64,7 @@ export type StarterCharacter = {
   status: string;
 };
 
-export type InspirationBubble = {
+export type Moodboard = {
   id: string;
   slug: string;
   title: string;
@@ -117,7 +117,7 @@ export type OnboardingState = {
   clones: Clone[];
   activeClone: Clone | null;
   latestHarvest?: InstagramHarvestJob | null;
-  bubbles: InspirationBubble[];
+  moodboards: Moodboard[];
   inspirationPoolCount: number;
   starters: StarterCharacter[];
   instagram?: { enabled: boolean; status: string };

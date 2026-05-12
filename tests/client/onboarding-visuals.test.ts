@@ -1,80 +1,50 @@
 import { describe, expect, it } from "vitest";
-import { bubbleVisualFor } from "../../src/client/screens/onboarding-visuals";
+import { moodboardVisualFor } from "../../src/client/screens/onboarding-visuals";
 
-describe("onboarding bubble visuals", () => {
-  it("maps beauty and skincare bubbles to the beauty asset", () => {
-    const visual = bubbleVisualFor({
-      slug: "dewy-skin",
-      title: "Dewy Skin",
-      vibe_summary: "skincare, makeup, soft glow"
+describe("onboarding moodboard visuals", () => {
+  it("maps curated moodboard slugs to generated moodboard assets", () => {
+    const visual = moodboardVisualFor({
+      slug: "warm-ambient",
+      title: "Warm ambient",
+      vibe_summary: "warm ambient creator styling"
     });
 
     expect(visual).toMatchObject({
-      src: "/landing/onboarding-bubbles/bubble-beauty.png",
-      label: "Beauty"
+      src: "/landing/moodboards/warm-ambient.webp",
+      label: "Warm ambient"
     });
   });
 
-  it("maps travel bubbles to the travel asset", () => {
+  it("slugifies moodboard titles when a slug is not present", () => {
     expect(
-      bubbleVisualFor({
-        slug: "coastal-escape",
-        title: "Coastal Escape",
-        vibe_summary: "hotel balcony, ocean views, suitcase"
+      moodboardVisualFor({
+        title: "Y2K studio",
+        vibe_summary: "glossy studio styling"
       }).src
-    ).toBe("/landing/onboarding-bubbles/bubble-travel.png");
+    ).toBe("/landing/moodboards/y2k-studio.webp");
   });
 
-  it("maps creator and content bubbles to the content asset", () => {
+  it("normalizes special moodboard casing and numerals", () => {
     expect(
-      bubbleVisualFor({
-        slug: "creator-kit",
-        title: "Creator Kit",
-        vibe_summary: "camera, ring light, social content"
+      moodboardVisualFor({
+        slug: "bw-film",
+        title: "BW film",
+        vibe_summary: "black and white film stock"
       }).src
-    ).toBe("/landing/onboarding-bubbles/bubble-content.png");
+    ).toBe("/landing/moodboards/bw-film.webp");
+
+    expect(
+      moodboardVisualFor({
+        title: "80s horror",
+        vibe_summary: "retro horror lighting"
+      }).src
+    ).toBe("/landing/moodboards/80s-horror.webp");
   });
 
-  it("prefers the vibes asset for neon nightlife bubbles", () => {
-    expect(
-      bubbleVisualFor({
-        slug: "tokyo-neon",
-        title: "Tokyo Neon",
-        vibe_summary: "Night city color, glossy styling, and bright social hooks"
-      }).src
-    ).toBe("/landing/onboarding-bubbles/bubble-vibes.png");
-  });
-
-  it("prefers the wellness asset for Pilates bubbles even when the summary mentions content", () => {
-    expect(
-      bubbleVisualFor({
-        slug: "pilates-morning",
-        title: "Pilates Morning",
-        vibe_summary: "Wellness studio energy, activewear sets, and calm routine content"
-      }).src
-    ).toBe("/landing/onboarding-bubbles/bubble-wellness.png");
-  });
-
-  it("maps fashion and streetwear bubbles to the fashion asset", () => {
-    expect(
-      bubbleVisualFor({
-        slug: "street-style",
-        title: "Street Style",
-        vibe_summary: "fashion, outfit checks, editorial styling"
-      }).src
-    ).toBe("/landing/onboarding-bubbles/bubble-fashion.png");
-  });
-
-  it("falls back to the vibes asset for unknown aesthetics", () => {
-    expect(
-      bubbleVisualFor({
-        slug: "abstract",
-        title: "Abstract",
-        vibe_summary: "experimental visual language"
-      })
-    ).toMatchObject({
-      src: "/landing/onboarding-bubbles/bubble-vibes.png",
-      label: "Vibes"
+  it("falls back to the generic moodboard asset for empty input", () => {
+    expect(moodboardVisualFor({})).toMatchObject({
+      src: "/landing/moodboards/moodboard.webp",
+      label: "Moodboard"
     });
   });
 });

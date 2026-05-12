@@ -5,7 +5,7 @@ DROP TABLE IF EXISTS visual_references;
 DROP TABLE IF EXISTS visual_reference_candidates;
 DROP TABLE IF EXISTS niche_research_queries;
 DROP TABLE IF EXISTS niche_knowledge;
-DROP TABLE IF EXISTS inspiration_bubbles;
+DROP TABLE IF EXISTS moodboards;
 DROP TABLE IF EXISTS generation_outputs;
 DROP TABLE IF EXISTS generation_jobs;
 DROP TABLE IF EXISTS soul_training_jobs;
@@ -228,7 +228,7 @@ CREATE TABLE IF NOT EXISTS ai_model_invocations (
   created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS inspiration_bubbles (
+CREATE TABLE IF NOT EXISTS moodboards (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   clone_id TEXT,
@@ -247,14 +247,14 @@ CREATE TABLE IF NOT EXISTS inspiration_bubbles (
 CREATE TABLE IF NOT EXISTS niche_research_queries (
   id TEXT PRIMARY KEY,
   user_id TEXT,
-  bubble_id TEXT,
+  moodboard_id TEXT,
   query TEXT NOT NULL,
   source TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'new',
   cluster TEXT,
   created_at TEXT NOT NULL,
   used_at TEXT,
-  FOREIGN KEY (bubble_id) REFERENCES inspiration_bubbles(id) ON DELETE SET NULL
+  FOREIGN KEY (moodboard_id) REFERENCES moodboards(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS niche_knowledge (
@@ -338,13 +338,13 @@ CREATE TABLE IF NOT EXISTS visual_references (
 CREATE TABLE IF NOT EXISTS user_inspiration_pool (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
-  bubble_id TEXT,
+  moodboard_id TEXT,
   visual_reference_id TEXT,
   discovery_item_id TEXT,
   score REAL NOT NULL DEFAULT 1,
   used_at TEXT,
   created_at TEXT NOT NULL,
-  FOREIGN KEY (bubble_id) REFERENCES inspiration_bubbles(id) ON DELETE SET NULL,
+  FOREIGN KEY (moodboard_id) REFERENCES moodboards(id) ON DELETE SET NULL,
   FOREIGN KEY (visual_reference_id) REFERENCES visual_references(id) ON DELETE CASCADE,
   FOREIGN KEY (discovery_item_id) REFERENCES discovery_items(id) ON DELETE CASCADE,
   UNIQUE(user_id, visual_reference_id),

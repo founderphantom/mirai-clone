@@ -140,9 +140,9 @@
 
 .starter-section { display: grid; gap: 14px; }
 
-.bubble-grid { display: grid; gap: 10px; }
+.moodboard-grid { display: grid; gap: 10px; }
 
-.bubble-chip {
+.moodboard-chip {
   display: grid;
   grid-template-columns: auto 1fr;
   gap: 4px 8px;
@@ -154,18 +154,18 @@
   text-align: left;
 }
 
-.bubble-chip strong { grid-column: 2; }
+.moodboard-chip strong { grid-column: 2; }
 
-.bubble-chip span {
+.moodboard-chip span {
   grid-column: 1 / -1;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.4;
 }
 
-.bubble-chip:not(.selected) strong { grid-column: 1 / -1; }
+.moodboard-chip:not(.selected) strong { grid-column: 1 / -1; }
 
-.bubble-chip.selected {
+.moodboard-chip.selected {
   border-color: var(--green);
   background: var(--green-soft);
 }

@@ -14,7 +14,7 @@ type AuthScreenProps = {
 const HERO_IMAGES = [
   "/landing/clone-y2k-cafe.jpg",
   "/landing/clone-tokyo-neon.jpg",
-  "/landing/step-bubbles.jpg"
+  "/landing/step-moodboards.jpg"
 ];
 
 export function AuthScreen({ initialMode = "signup", onDone, onModeChange }: AuthScreenProps) {
@@ -116,7 +116,7 @@ export function AuthScreen({ initialMode = "signup", onDone, onModeChange }: Aut
             <h1 id={titleId}>{isSignup ? "Create your Mirai account" : "Welcome back to Mirai"}</h1>
             <p>
               {isSignup
-                ? "Start with Instagram, manual uploads, or a preset Soul, then pick your first inspiration bubbles."
+                ? "Start with Instagram, manual uploads, or a preset Soul, then pick your first inspiration moodboards."
                 : "Jump back into Blitz, create new looks, and keep building your creator library."}
             </p>
           </div>
@@ -126,7 +126,7 @@ export function AuthScreen({ initialMode = "signup", onDone, onModeChange }: Aut
             ))}
             <div className="auth-preview-caption">
               <strong>First Blitz in progress</strong>
-              <span>5 cards seeded from your Soul and bubble pool</span>
+              <span>5 cards seeded from your Soul and moodboard pool</span>
             </div>
           </div>
         </aside>
@@ -195,7 +195,7 @@ export function AuthScreen({ initialMode = "signup", onDone, onModeChange }: Aut
               <span>
                 {isSignup
                   ? "For now, Mirai collects the eligible Instagram/upload/preset inputs and parks them for your Soul script."
-                  : "Saved cards, clone profiles, and bubble taste signals stay attached to your account."}
+                  : "Saved cards, clone profiles, and moodboard taste signals stay attached to your account."}
               </span>
             </div>
           </div>

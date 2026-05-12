@@ -17,7 +17,7 @@ use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatu
 use mirai_product_worker::routes::blitz::{
     map_blitz_service_error, parse_history_limit, read_required_query_param,
 };
-use mirai_product_worker::routes::onboarding::default_bubbles;
+use mirai_product_worker::routes::onboarding::default_moodboards;
 use mirai_product_worker::scrapecreators::{
     build_scrape_request, normalize_instagram_reels_search, normalize_tiktok_keyword_search,
     scrape_platform_from_str, ScrapePlatform,
@@ -241,7 +241,7 @@ fn kimi_is_the_only_analysis_model_for_app_analysis_tasks() {
     for task in [
         AiTask::PhotoQualityReview,
         AiTask::HumanPresenceDetection,
-        AiTask::BubbleGeneration,
+        AiTask::MoodboardGeneration,
         AiTask::NicheSeedExtraction,
         AiTask::NicheKnowledgeExtraction,
         AiTask::NicheClusterExpansion,
@@ -278,14 +278,19 @@ fn moderation_level_is_bounded() {
 }
 
 #[test]
-fn default_bubbles_include_visual_queries() {
-    let bubbles = default_bubbles();
+fn default_moodboards_include_visual_queries() {
+    let moodboards = default_moodboards();
 
-    assert!(bubbles.len() >= 8);
-    assert!(bubbles
+    assert_eq!(moodboards.len(), 32);
+    assert!(moodboards
         .iter()
-        .all(|bubble| !bubble.search_queries.is_empty()));
-    assert!(bubbles.iter().any(|bubble| bubble.slug == "y2k-cafe"));
+        .all(|moodboard| !moodboard.search_queries.is_empty()));
+    assert!(moodboards
+        .iter()
+        .any(|moodboard| moodboard.slug == "warm-ambient"));
+    assert!(moodboards
+        .iter()
+        .any(|moodboard| moodboard.slug == "flash-editorial"));
 }
 
 #[test]
@@ -776,18 +781,21 @@ fn generation_limits_use_positive_config_values_with_defaults() {
 }
 
 #[test]
-fn default_bubbles_provide_enough_unique_research_choices() {
-    let bubbles = default_bubbles();
-    let unique_slugs = bubbles
+fn default_moodboards_provide_exact_curated_research_choices() {
+    let moodboards = default_moodboards();
+    let unique_slugs = moodboards
         .iter()
-        .map(|bubble| bubble.slug.as_str())
+        .map(|moodboard| moodboard.slug.as_str())
         .collect::<std::collections::HashSet<_>>();
 
-    assert!(bubbles.len() >= 5);
-    assert_eq!(unique_slugs.len(), bubbles.len());
-    assert!(bubbles
+    assert_eq!(moodboards.len(), 32);
+    assert_eq!(unique_slugs.len(), moodboards.len());
+    assert!(moodboards
         .iter()
-        .all(|bubble| !bubble.search_queries.is_empty()));
+        .all(|moodboard| !moodboard.search_queries.is_empty()));
+    assert!(moodboards
+        .iter()
+        .any(|moodboard| moodboard.slug == "muted-cool-film"));
 }
 
 #[test]

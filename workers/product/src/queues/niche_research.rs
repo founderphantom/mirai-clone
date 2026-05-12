@@ -27,10 +27,10 @@ use worker::{Ai, D1Database, Delay, Env, Error, MessageBatch, MessageExt, Result
     rename_all_fields = "camelCase"
 )]
 pub enum NicheResearchMessage {
-    SeedFromBubbles {
+    SeedFromMoodboards {
         user_id: String,
         clone_id: String,
-        bubble_ids: Vec<String>,
+        moodboard_ids: Vec<String>,
         moderation_level: u8,
         platforms: Vec<String>,
     },
@@ -58,19 +58,19 @@ pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<
 
         let db = env.d1("DB")?;
         match body {
-            NicheResearchMessage::SeedFromBubbles {
+            NicheResearchMessage::SeedFromMoodboards {
                 user_id,
                 clone_id,
-                bubble_ids,
+                moodboard_ids,
                 moderation_level,
                 platforms,
             } => {
-                handle_seed_from_bubbles(
+                handle_seed_from_moodboards(
                     &db,
                     &env,
                     user_id,
                     clone_id,
-                    bubble_ids,
+                    moodboard_ids,
                     moderation_level,
                     platforms,
                 )
@@ -91,12 +91,12 @@ pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<
     Ok(())
 }
 
-async fn handle_seed_from_bubbles(
+async fn handle_seed_from_moodboards(
     db: &D1Database,
     env: &Env,
     user_id: String,
     clone_id: String,
-    bubble_ids: Vec<String>,
+    moodboard_ids: Vec<String>,
     moderation_level: u8,
     platforms: Vec<String>,
 ) -> WorkerResult<()> {
@@ -107,21 +107,21 @@ async fn handle_seed_from_bubbles(
         return Ok(());
     };
     let ai = env.ai("AI")?;
-    let bubbles = load_selected_bubbles(db, &user_id, &clone_id, &bubble_ids).await?;
-    let selected_bubble_ids = bubbles
+    let moodboards = load_selected_moodboards(db, &user_id, &clone_id, &moodboard_ids).await?;
+    let selected_moodboard_ids = moodboards
         .iter()
-        .map(|bubble| bubble.id.as_str())
+        .map(|moodboard| moodboard.id.as_str())
         .collect::<Vec<_>>();
-    if !valid_loaded_bubble_count(bubbles.len()) {
+    if !valid_loaded_moodboard_count(moodboards.len()) {
         set_clone_research_status(
             db,
             &user_id,
             &clone_id,
-            "insufficient_bubbles",
+            "insufficient_moodboards",
             &format!(
-                "selected_bubbles={}, required=5, bubble_ids={}",
-                bubbles.len(),
-                selected_bubble_ids.join(",")
+                "selected_moodboards={}, required=5, moodboard_ids={}",
+                moodboards.len(),
+                selected_moodboard_ids.join(",")
             ),
         )
         .await?;
@@ -142,13 +142,13 @@ async fn handle_seed_from_bubbles(
         return Ok(());
     }
 
-    let active_niche = active_niche_from_bubbles(&bubbles);
-    let excluded_terms = bubble_search_queries(&bubbles);
+    let active_niche = active_niche_from_moodboards(&moodboards);
+    let excluded_terms = moodboard_search_queries(&moodboards);
     let seed_prompt = seed_extraction_prompt(&active_niche, &excluded_terms);
     let seed_response = run_text_json::<SeedExtractionResponse>(&ai, &seed_prompt).await?;
     let mut seed_queries = accepted_seed_queries(seed_response.seeds, &allowed_platforms);
     if seed_queries.is_empty() {
-        seed_queries = fallback_bubble_seed_queries(&excluded_terms, &allowed_platforms);
+        seed_queries = fallback_moodboard_seed_queries(&excluded_terms, &allowed_platforms);
     }
     let max_seed_queries_per_platform =
         config_u32(&config, "max_seed_queries_per_platform", 8) as usize;
@@ -194,13 +194,13 @@ async fn handle_refresh_pool(
     reason: String,
 ) -> WorkerResult<()> {
     set_clone_research_status(db, &user_id, &clone_id, "refresh_requested", &reason).await?;
-    let bubble_ids = load_selected_bubble_ids(db, &user_id, &clone_id).await?;
-    handle_seed_from_bubbles(
+    let moodboard_ids = load_selected_moodboard_ids(db, &user_id, &clone_id).await?;
+    handle_seed_from_moodboards(
         db,
         env,
         user_id,
         clone_id,
-        bubble_ids,
+        moodboard_ids,
         4,
         vec!["tiktok".to_string(), "instagram".to_string()],
     )
@@ -227,24 +227,24 @@ async fn load_clone_for_research(
     .await
 }
 
-async fn load_selected_bubbles(
+async fn load_selected_moodboards(
     db: &D1Database,
     user_id: &str,
     clone_id: &str,
-    bubble_ids: &[String],
-) -> WorkerResult<Vec<BubbleRow>> {
-    if bubble_ids.is_empty() {
+    moodboard_ids: &[String],
+) -> WorkerResult<Vec<MoodboardRow>> {
+    if moodboard_ids.is_empty() {
         return Ok(Vec::new());
     }
 
     let placeholders = std::iter::repeat("?")
-        .take(bubble_ids.len())
+        .take(moodboard_ids.len())
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
         r#"
         SELECT id, title, vibe_summary, search_queries_json
-        FROM inspiration_bubbles
+        FROM moodboards
         WHERE user_id = ?
           AND clone_id = ?
           AND selected = 1
@@ -253,11 +253,11 @@ async fn load_selected_bubbles(
         "#
     );
     let mut params = vec![json!(user_id), json!(clone_id)];
-    params.extend(bubble_ids.iter().map(|id| json!(id)));
+    params.extend(moodboard_ids.iter().map(|id| json!(id)));
     db::all(db, &sql, params).await
 }
 
-async fn load_selected_bubble_ids(
+async fn load_selected_moodboard_ids(
     db: &D1Database,
     user_id: &str,
     clone_id: &str,
@@ -266,7 +266,7 @@ async fn load_selected_bubble_ids(
         db,
         r#"
         SELECT id
-        FROM inspiration_bubbles
+        FROM moodboards
         WHERE user_id = ?
           AND clone_id = ?
           AND selected = 1
@@ -294,7 +294,7 @@ async fn insert_seed_queries(
             db,
             r#"
             INSERT OR IGNORE INTO niche_research_queries (
-              id, user_id, clone_id, bubble_id, query, source, status, raw_json, created_at
+              id, user_id, clone_id, moodboard_id, query, source, status, raw_json, created_at
             )
             VALUES (?, ?, ?, NULL, ?, ?, 'new', ?, ?)
             "#,
@@ -1284,19 +1284,25 @@ async fn set_clone_research_status(
     .await
 }
 
-fn active_niche_from_bubbles(bubbles: &[BubbleRow]) -> String {
-    bubbles
+fn active_niche_from_moodboards(moodboards: &[MoodboardRow]) -> String {
+    moodboards
         .iter()
-        .map(|bubble| format!("{}: {}", bubble.title.trim(), bubble.vibe_summary.trim()))
+        .map(|moodboard| {
+            format!(
+                "{}: {}",
+                moodboard.title.trim(),
+                moodboard.vibe_summary.trim()
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn bubble_search_queries(bubbles: &[BubbleRow]) -> Vec<String> {
+fn moodboard_search_queries(moodboards: &[MoodboardRow]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut queries = Vec::new();
-    for bubble in bubbles {
-        let Ok(values) = serde_json::from_str::<Vec<String>>(&bubble.search_queries_json) else {
+    for moodboard in moodboards {
+        let Ok(values) = serde_json::from_str::<Vec<String>>(&moodboard.search_queries_json) else {
             continue;
         };
         for value in values {
@@ -1309,7 +1315,7 @@ fn bubble_search_queries(bubbles: &[BubbleRow]) -> Vec<String> {
     queries
 }
 
-fn valid_loaded_bubble_count(count: usize) -> bool {
+fn valid_loaded_moodboard_count(count: usize) -> bool {
     count == 5
 }
 
@@ -1349,7 +1355,7 @@ fn accepted_seed_queries(
         .collect()
 }
 
-fn fallback_bubble_seed_queries(
+fn fallback_moodboard_seed_queries(
     queries: &[String],
     allowed_platforms: &[String],
 ) -> Vec<SeedQuery> {
@@ -1360,11 +1366,11 @@ fn fallback_bubble_seed_queries(
             allowed_platforms.iter().map(move |platform| SeedQuery {
                 query: query.trim().to_string(),
                 platform: platform.clone(),
-                source: "bubble_seed".to_string(),
+                source: "moodboard_seed".to_string(),
                 raw_json: json!({
                     "term": query,
                     "platform": platform,
-                    "source": "bubble_seed"
+                    "source": "moodboard_seed"
                 }),
             })
         })
@@ -1609,7 +1615,7 @@ fn now_iso_string() -> String {
 }
 
 #[derive(Debug, Deserialize)]
-struct BubbleRow {
+struct MoodboardRow {
     id: String,
     title: String,
     vibe_summary: String,
@@ -1730,20 +1736,20 @@ mod tests {
 
     #[test]
     fn niche_research_messages_serialize_platform_allowlist() {
-        let seed = NicheResearchMessage::SeedFromBubbles {
+        let seed = NicheResearchMessage::SeedFromMoodboards {
             user_id: "user_1".to_string(),
             clone_id: "clone_1".to_string(),
-            bubble_ids: vec!["bubble_1".to_string()],
+            moodboard_ids: vec!["moodboard_1".to_string()],
             moderation_level: 4,
             platforms: vec!["tiktok".to_string(), "instagram".to_string()],
         };
         assert_eq!(
             serde_json::to_value(seed).unwrap(),
             json!({
-                "type": "seed_from_bubbles",
+                "type": "seed_from_moodboards",
                 "userId": "user_1",
                 "cloneId": "clone_1",
-                "bubbleIds": ["bubble_1"],
+                "moodboardIds": ["moodboard_1"],
                 "moderationLevel": 4,
                 "platforms": ["tiktok", "instagram"]
             })
@@ -1824,10 +1830,10 @@ mod tests {
     }
 
     #[test]
-    fn loaded_bubble_count_must_be_exactly_five() {
-        assert!(!valid_loaded_bubble_count(4));
-        assert!(valid_loaded_bubble_count(5));
-        assert!(!valid_loaded_bubble_count(6));
+    fn loaded_moodboard_count_must_be_exactly_five() {
+        assert!(!valid_loaded_moodboard_count(4));
+        assert!(valid_loaded_moodboard_count(5));
+        assert!(!valid_loaded_moodboard_count(6));
     }
 
     #[test]

@@ -9,9 +9,9 @@ const STEPS = [
   },
   {
     num: '02',
-    img: '/landing/step-bubbles.jpg',
+    img: '/landing/step-moodboards.jpg',
     title: 'Pick your aesthetics',
-    desc: 'Choose from 50+ trending style bubbles. We build your personal inspiration pool.',
+    desc: 'Choose from 32 curated style moodboards. We build your personal inspiration pool.',
   },
   {
     num: '03',

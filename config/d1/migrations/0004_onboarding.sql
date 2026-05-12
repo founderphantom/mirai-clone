@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS starter_characters (
 CREATE INDEX IF NOT EXISTS idx_starter_characters_status_sort
 ON starter_characters(status, sort);
 
-CREATE TABLE IF NOT EXISTS inspiration_bubbles (
+CREATE TABLE IF NOT EXISTS moodboards (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   clone_id TEXT,
@@ -68,18 +68,18 @@ CREATE TABLE IF NOT EXISTS inspiration_bubbles (
   FOREIGN KEY (clone_id) REFERENCES clone_profiles(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_inspiration_bubbles_user_clone
-ON inspiration_bubbles(user_id, clone_id, sort);
+CREATE INDEX IF NOT EXISTS idx_moodboards_user_clone
+ON moodboards(user_id, clone_id, sort);
 
 CREATE TABLE IF NOT EXISTS user_inspiration_pool (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
-  bubble_id TEXT,
+  moodboard_id TEXT,
   discovery_item_id TEXT NOT NULL,
   score REAL NOT NULL DEFAULT 1,
   used_at TEXT,
   created_at TEXT NOT NULL,
-  FOREIGN KEY (bubble_id) REFERENCES inspiration_bubbles(id) ON DELETE SET NULL,
+  FOREIGN KEY (moodboard_id) REFERENCES moodboards(id) ON DELETE SET NULL,
   FOREIGN KEY (discovery_item_id) REFERENCES discovery_items(id) ON DELETE CASCADE,
   UNIQUE(user_id, discovery_item_id)
 );

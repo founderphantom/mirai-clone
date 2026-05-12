@@ -2,7 +2,7 @@
 pub enum AiTask {
     PhotoQualityReview,
     HumanPresenceDetection,
-    BubbleGeneration,
+    MoodboardGeneration,
     NicheSeedExtraction,
     NicheKnowledgeExtraction,
     NicheClusterExpansion,

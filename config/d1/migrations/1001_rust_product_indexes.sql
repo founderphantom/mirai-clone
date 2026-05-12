@@ -20,7 +20,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_events_provider_external_event
 ON billing_events(provider, external_event_id)
 WHERE external_event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ai_model_invocations_task ON ai_model_invocations(task, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_inspiration_bubbles_user_clone ON inspiration_bubbles(user_id, clone_id, sort_order);
+CREATE INDEX IF NOT EXISTS idx_moodboards_user_clone ON moodboards(user_id, clone_id, sort_order);
 CREATE INDEX IF NOT EXISTS idx_niche_research_queries_status ON niche_research_queries(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_niche_knowledge_cluster ON niche_knowledge(user_id, cluster, score DESC);
 CREATE INDEX IF NOT EXISTS idx_discovery_items_source ON discovery_items(source_id, discovered_at DESC);

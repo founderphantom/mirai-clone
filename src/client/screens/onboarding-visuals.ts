@@ -1,76 +1,36 @@
-export type BubbleVisualInput = {
+export type MoodboardVisualInput = {
   slug?: string;
   title?: string;
   vibe_summary?: string;
 };
 
-export type BubbleVisual = {
+export type MoodboardVisual = {
   src: string;
   label: string;
 };
 
-type BubbleVisualRule = BubbleVisual & {
-  terms: string[];
-};
+const MOODBOARD_VISUAL_BASE = "/landing/moodboards";
+const FALLBACK_SLUG = "moodboard";
 
-const BUBBLE_VISUAL_BASE = "/landing/onboarding-bubbles";
-
-const BUBBLE_VISUAL_RULES: BubbleVisualRule[] = [
-  {
-    src: `${BUBBLE_VISUAL_BASE}/bubble-beauty.png`,
-    label: "Beauty",
-    terms: ["beauty", "skincare", "skin", "makeup", "glam", "glow", "dewy", "grwm", "fragrance", "spa"]
-  },
-  {
-    src: `${BUBBLE_VISUAL_BASE}/bubble-travel.png`,
-    label: "Travel",
-    terms: ["travel", "coastal", "resort", "hotel", "balcony", "ocean", "beach", "airport", "vacation", "passport", "suitcase", "desert", "palm"]
-  },
-  {
-    src: `${BUBBLE_VISUAL_BASE}/bubble-wellness.png`,
-    label: "Wellness",
-    terms: ["wellness", "fitness", "pilates", "yoga", "gym", "matcha", "workout", "athleisure", "ritual"]
-  },
-  {
-    src: `${BUBBLE_VISUAL_BASE}/bubble-fashion.png`,
-    label: "Fashion",
-    terms: ["fashion", "style", "streetwear", "outfit", "editorial", "runway", "wardrobe", "luxe", "jewelry", "leather", "denim", "fit check"]
-  },
-  {
-    src: `${BUBBLE_VISUAL_BASE}/bubble-vibes.png`,
-    label: "Vibes",
-    terms: ["vibe", "vibes", "y2k", "retro", "neon", "night", "cinematic", "cafe", "coffee", "festival", "moody", "bokeh"]
-  },
-  {
-    src: `${BUBBLE_VISUAL_BASE}/bubble-content.png`,
-    label: "Content",
-    terms: ["content", "creator", "camera", "ring light", "studio", "youtube", "tiktok", "instagram"]
-  }
-];
-
-const FALLBACK_VISUAL = BUBBLE_VISUAL_RULES.find((rule) => rule.label === "Vibes") ?? BUBBLE_VISUAL_RULES[BUBBLE_VISUAL_RULES.length - 1];
-
-export function bubbleVisualFor(bubble: BubbleVisualInput): BubbleVisual {
-  const searchable = [bubble.slug, bubble.title, bubble.vibe_summary]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-
-  const match = BUBBLE_VISUAL_RULES.find((rule) =>
-    rule.terms.some((term) => hasSearchTerm(searchable, term))
-  ) ?? FALLBACK_VISUAL;
+export function moodboardVisualFor(moodboard: MoodboardVisualInput): MoodboardVisual {
+  const label = moodboard.title?.trim() || "Moodboard";
+  const slug = normalizeSlug(moodboard.slug) || slugify(label) || FALLBACK_SLUG;
 
   return {
-    src: match.src,
-    label: match.label
+    src: `${MOODBOARD_VISUAL_BASE}/${slug}.webp`,
+    label
   };
 }
 
-function hasSearchTerm(searchable: string, term: string) {
-  if (term.includes(" ")) return searchable.includes(term);
-  return new RegExp(`\\b${escapeRegExp(term)}\\b`).test(searchable);
+function normalizeSlug(value?: string) {
+  return slugify(value ?? "");
 }
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function slugify(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }

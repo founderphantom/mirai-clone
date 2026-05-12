@@ -10,7 +10,7 @@ use worker::{Request, Response, Result as WorkerResult, RouteContext};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BubbleSeed {
+pub struct MoodboardSeed {
     pub slug: String,
     pub title: String,
     pub vibe_summary: String,
@@ -30,7 +30,7 @@ struct CloneSummary {
 }
 
 #[derive(Debug, Deserialize)]
-struct BubbleRow {
+struct MoodboardRow {
     id: String,
     slug: String,
     title: String,
@@ -40,7 +40,7 @@ struct BubbleRow {
 }
 
 #[derive(Debug, Serialize)]
-struct BubbleResponse {
+struct MoodboardResponse {
     id: String,
     slug: String,
     title: String,
@@ -55,7 +55,7 @@ struct BubbleResponse {
 struct OnboardingStateResponse {
     clones: Vec<CloneSummary>,
     active_clone: Option<CloneSummary>,
-    bubbles: Vec<BubbleResponse>,
+    moodboards: Vec<MoodboardResponse>,
     inspiration_pool_count: u32,
     starters: Vec<serde_json::Value>,
     instagram: InstagramState,
@@ -70,22 +70,21 @@ struct InstagramState {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BubblesResponse {
-    bubbles: Vec<BubbleResponse>,
+struct MoodboardsResponse {
+    moodboards: Vec<MoodboardResponse>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SaveBubblesRequest {
-    #[serde(alias = "bubbleIds")]
-    selected_bubble_ids: Vec<String>,
+struct SaveMoodboardsRequest {
+    moodboard_ids: Vec<String>,
     clone_id: Option<String>,
     moderation_level: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GenerateBubblesRequest {
+struct GenerateMoodboardsRequest {
     clone_id: Option<String>,
 }
 
@@ -99,89 +98,55 @@ struct IdRow {
     id: String,
 }
 
-pub fn default_bubbles() -> Vec<BubbleSeed> {
+pub fn default_moodboards() -> Vec<MoodboardSeed> {
     vec![
-        BubbleSeed {
-            slug: "y2k-cafe".to_string(),
-            title: "Y2K Cafe".to_string(),
-            vibe_summary: "Glossy cafe snapshots, playful accessories, compact cameras, and early-2000s color pops.".to_string(),
-            search_queries: vec![
-                "y2k cafe outfit flash photography".to_string(),
-                "early 2000s cafe aesthetic fashion".to_string(),
-                "glossy y2k creator cafe photo".to_string(),
-            ],
-        },
-        BubbleSeed {
-            slug: "tokyo-neon".to_string(),
-            title: "Tokyo Neon".to_string(),
-            vibe_summary: "Night streets, vending-machine glow, reflective jackets, and saturated city color.".to_string(),
-            search_queries: vec![
-                "tokyo neon street fashion night".to_string(),
-                "japan city night creator portrait".to_string(),
-                "neon streetwear rain reflections".to_string(),
-            ],
-        },
-        BubbleSeed {
-            slug: "streetwear-fit".to_string(),
-            title: "Streetwear Fit".to_string(),
-            vibe_summary: "Layered fits, sneaker details, city backdrops, and confident full-body framing.".to_string(),
-            search_queries: vec![
-                "streetwear fit check city photo".to_string(),
-                "sneaker outfit creator street style".to_string(),
-                "urban layered fashion full body".to_string(),
-            ],
-        },
-        BubbleSeed {
-            slug: "clean-girl".to_string(),
-            title: "Clean Girl".to_string(),
-            vibe_summary: "Minimal styling, dewy skin, slick hair, calm rooms, and polished everyday routines.".to_string(),
-            search_queries: vec![
-                "clean girl aesthetic creator portrait".to_string(),
-                "minimal dewy skincare lifestyle photo".to_string(),
-                "neutral outfit slick hair apartment light".to_string(),
-            ],
-        },
-        BubbleSeed {
-            slug: "coastal-weekend".to_string(),
-            title: "Coastal Weekend".to_string(),
-            vibe_summary: "Linen layers, sea air, beach walks, patio lunches, and relaxed vacation polish.".to_string(),
-            search_queries: vec![
-                "coastal weekend linen outfit".to_string(),
-                "beach walk lifestyle fashion creator".to_string(),
-                "summer patio lunch vacation aesthetic".to_string(),
-            ],
-        },
-        BubbleSeed {
-            slug: "golden-hour".to_string(),
-            title: "Golden Hour".to_string(),
-            vibe_summary: "Warm sunlight, soft shadows, glowing skin, and outdoor portraits near sunset.".to_string(),
-            search_queries: vec![
-                "golden hour creator portrait fashion".to_string(),
-                "sunset lifestyle photo glowing skin".to_string(),
-                "warm outdoor editorial portrait".to_string(),
-            ],
-        },
-        BubbleSeed {
-            slug: "editorial-flash".to_string(),
-            title: "Editorial Flash".to_string(),
-            vibe_summary: "Direct flash, crisp styling, dramatic makeup, studio walls, and magazine energy.".to_string(),
-            search_queries: vec![
-                "direct flash editorial fashion portrait".to_string(),
-                "magazine style creator studio photo".to_string(),
-                "dramatic makeup flash photography".to_string(),
-            ],
-        },
-        BubbleSeed {
-            slug: "pilates-morning".to_string(),
-            title: "Pilates Morning".to_string(),
-            vibe_summary: "Bright activewear, studio mirrors, smoothie runs, and quiet wellness routines.".to_string(),
-            search_queries: vec![
-                "pilates morning activewear creator".to_string(),
-                "wellness routine smoothie lifestyle photo".to_string(),
-                "clean gym mirror fitness aesthetic".to_string(),
-            ],
-        },
+        moodboard_seed("warm-ambient", "Warm ambient", "Soft tungsten warmth, calm rooms, skin glow, and relaxed editorial framing."),
+        moodboard_seed("y2k-studio", "Y2K studio", "Glossy flash studio portraits, chrome accents, playful styling, and polished social poses."),
+        moodboard_seed("swag-era", "Swag era", "Bold accessories, confident casual poses, bright flash, and early social-era outfit energy."),
+        moodboard_seed("theatrical-light", "Theatrical light", "Dramatic spotlights, sculpted shadows, stage color, and cinematic portrait contrast."),
+        moodboard_seed("y2k-street", "Y2K street", "Street snapshots, low-rise layers, compact cameras, and saturated city color."),
+        moodboard_seed("flash-editorial", "Flash editorial", "Direct flash, crisp styling, strong makeup, studio walls, and magazine energy."),
+        moodboard_seed("old-smartphone", "Old smartphone", "Soft phone-camera grain, imperfect framing, casual mirror shots, and nostalgic texture."),
+        moodboard_seed("street-photography", "Street photography", "Candid sidewalks, real city motion, natural outfits, and documentary framing."),
+        moodboard_seed("asian-nostalgia", "Asian nostalgia", "Warm city evenings, intimate cafes, retro interiors, and soft nostalgic styling."),
+        moodboard_seed("retro-bw", "Retro BW", "High-grain black and white portraits, strong contrast, and vintage editorial attitude."),
+        moodboard_seed("subtle-flash", "Subtle flash", "Low-key direct flash, soft shadows, realistic skin, and understated nightlife polish."),
+        moodboard_seed("surreal-solarization", "Surreal solarization", "Experimental color inversions, glowing edges, and dreamlike fashion portrait effects."),
+        moodboard_seed("digital-camera", "Digital camera", "Compact-camera sharpness, glossy highlights, dated timestamps, and candid creator snaps."),
+        moodboard_seed("siren", "Siren", "Sleek glam, moody nightlife, sharp silhouettes, and magnetic editorial confidence."),
+        moodboard_seed("mystique-city", "Mystique city", "Dark urban atmosphere, reflective streets, elegant styling, and secretive cinematic light."),
+        moodboard_seed("candy-pop", "Candy pop", "Bright color blocking, playful beauty details, glossy styling, and upbeat studio energy."),
+        moodboard_seed("double-exposure", "Double exposure", "Layered portraits, ghosted motion, city overlays, and experimental photographic texture."),
+        moodboard_seed("2000s-band", "2000s band", "Indie band flash, backstage styling, instrument-room texture, and casual group-photo attitude."),
+        moodboard_seed("frutiger-aero", "Frutiger aero", "Glossy blue-green futurism, water reflections, glassy surfaces, and optimistic digital polish."),
+        moodboard_seed("drain", "Drain", "Washed-out cool tones, underground styling, stark flash, and melancholic street energy."),
+        moodboard_seed("extraterrestrial", "Extraterrestrial", "Alien color casts, metallic styling, unusual poses, and otherworldly editorial light."),
+        moodboard_seed("nature-light", "Nature light", "Clean daylight, greenery, soft skin tones, and organic outdoor portrait calm."),
+        moodboard_seed("editorial-street-style", "Editorial street style", "Runway-informed street outfits, confident full-body framing, and crisp city polish."),
+        moodboard_seed("new-indie", "New Indie", "Modern indie styling, casual interiors, soft flash, and intimate music-scene energy."),
+        moodboard_seed("underwater", "Underwater", "Blue cast light, floating fabric, softened movement, and submerged dreamlike portraits."),
+        moodboard_seed("80s-horror", "80s horror", "Hard colored light, suspenseful shadows, retro styling, and cinematic genre tension."),
+        moodboard_seed("disposable-camera", "Disposable camera", "Warm film grain, party flash, imperfect framing, and spontaneous memory-card texture."),
+        moodboard_seed("neutral-pastel-film", "Neutral pastel film", "Soft muted pastels, low contrast, delicate grain, and gentle daylight portraits."),
+        moodboard_seed("warm-vivid-film", "Warm vivid film", "Saturated warm film color, sunny skin tones, and energetic analog contrast."),
+        moodboard_seed("bw-film", "BW film", "Classic black and white film grain, silver highlights, and timeless portrait contrast."),
+        moodboard_seed("warm-contrast-film", "Warm contrast film", "Golden highlights, deep shadows, rich analog color, and confident editorial warmth."),
+        moodboard_seed("muted-cool-film", "Muted cool film", "Cool gray-green film tones, restrained contrast, and quiet cinematic mood."),
     ]
+}
+
+fn moodboard_seed(slug: &str, title: &str, vibe_summary: &str) -> MoodboardSeed {
+    let search_base = title.to_ascii_lowercase();
+    MoodboardSeed {
+        slug: slug.to_string(),
+        title: title.to_string(),
+        vibe_summary: vibe_summary.to_string(),
+        search_queries: vec![
+            format!("{search_base} creator aesthetic"),
+            format!("{search_base} fashion portrait"),
+            format!("{search_base} social photo style"),
+        ],
+    }
 }
 
 pub async fn onboarding_state(req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
@@ -193,7 +158,7 @@ pub async fn onboarding_state(req: Request, ctx: RouteContext<()>) -> WorkerResu
     let user_id = auth.user_id.as_str();
     let clones = load_clones(&db, user_id).await?;
     let active_clone = clones.first().cloned();
-    let bubbles = load_bubbles(
+    let moodboards = load_moodboards(
         &db,
         user_id,
         active_clone.as_ref().map(|clone| clone.id.as_str()),
@@ -204,7 +169,7 @@ pub async fn onboarding_state(req: Request, ctx: RouteContext<()>) -> WorkerResu
     Response::from_json(&OnboardingStateResponse {
         clones,
         active_clone,
-        bubbles,
+        moodboards,
         inspiration_pool_count,
         starters: Vec::new(),
         instagram: InstagramState {
@@ -239,37 +204,37 @@ pub async fn adopt_starter(req: Request, ctx: RouteContext<()>) -> WorkerResult<
     }
 }
 
-pub async fn generate_bubbles(req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
+pub async fn generate_moodboards(req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
     let auth = match verify_session(&ctx, req.headers()).await? {
         Some(auth) => auth,
         None => return ApiError::unauthorized().to_response(),
     };
     let db = ctx.env.d1("DB")?;
-    let input = read_optional_json::<GenerateBubblesRequest>(req).await?;
+    let input = read_optional_json::<GenerateMoodboardsRequest>(req).await?;
     let active_clone = match input.and_then(|input| input.clone_id) {
         Some(clone_id) => load_clone_by_id(&db, &auth.user_id, &clone_id).await?,
         None => load_active_clone(&db, &auth.user_id).await?,
     };
     let clone_id = active_clone.as_ref().map(|clone| clone.id.as_str());
 
-    ensure_default_bubbles(&db, &auth.user_id, clone_id).await?;
+    ensure_default_moodboards(&db, &auth.user_id, clone_id).await?;
 
-    Response::from_json(&BubblesResponse {
-        bubbles: load_bubbles(&db, &auth.user_id, clone_id).await?,
+    Response::from_json(&MoodboardsResponse {
+        moodboards: load_moodboards(&db, &auth.user_id, clone_id).await?,
     })
 }
 
-pub async fn save_bubbles(mut req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
+pub async fn save_moodboards(mut req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
     let auth = match verify_session(&ctx, req.headers()).await? {
         Some(auth) => auth,
         None => return ApiError::unauthorized().to_response(),
     };
-    let input = match req.json::<SaveBubblesRequest>().await {
+    let input = match req.json::<SaveMoodboardsRequest>().await {
         Ok(input) => input,
         Err(_) => {
             return ApiError::bad_request(
-                "invalid_bubbles_request",
-                "Expected selectedBubbleIds and optional moderationLevel.",
+                "invalid_moodboards_request",
+                "Expected moodboardIds and optional moderationLevel.",
             )
             .to_response()
         }
@@ -281,45 +246,55 @@ pub async fn save_bubbles(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
         None => load_active_clone(&db, &auth.user_id).await?,
     };
     let Some(active_clone) = active_clone else {
-        return ApiError::bad_request("missing_clone", "Create a clone before saving bubbles.")
+        return ApiError::bad_request("missing_clone", "Create a clone before saving moodboards.")
             .to_response();
     };
 
-    let requested_bubble_ids = unique_selected_bubble_ids(input.selected_bubble_ids);
-    if !valid_selected_bubble_count(requested_bubble_ids.len()) {
+    let requested_moodboard_ids = unique_selected_moodboard_ids(input.moodboard_ids);
+    if !valid_selected_moodboard_count(requested_moodboard_ids.len()) {
         return ApiError::bad_request(
-            "invalid_bubble_selection",
-            "Choose exactly 5 inspiration bubbles.",
+            "invalid_moodboard_selection",
+            "Choose exactly 5 moodboards.",
         )
         .to_response();
     }
 
-    let selected_bubble_ids =
-        load_matching_bubble_ids(&db, &auth.user_id, &active_clone.id, &requested_bubble_ids)
-            .await?;
-    if !all_requested_bubbles_matched(&selected_bubble_ids, &requested_bubble_ids) {
+    let selected_moodboard_ids = load_matching_moodboard_ids(
+        &db,
+        &auth.user_id,
+        &active_clone.id,
+        &requested_moodboard_ids,
+    )
+    .await?;
+    if !all_requested_moodboards_matched(&selected_moodboard_ids, &requested_moodboard_ids) {
         return ApiError::bad_request(
-            "invalid_bubble_selection",
-            "Choose only available inspiration bubbles.",
+            "invalid_moodboard_selection",
+            "Choose only available moodboards.",
         )
         .to_response();
     }
-    save_selected_bubbles(&db, &auth.user_id, &active_clone.id, &selected_bubble_ids).await?;
+    save_selected_moodboards(
+        &db,
+        &auth.user_id,
+        &active_clone.id,
+        &selected_moodboard_ids,
+    )
+    .await?;
 
     let moderation_level = clamp_moderation_level(input.moderation_level.unwrap_or(4));
     ctx.env
         .queue("NICHE_RESEARCH_QUEUE")?
-        .send(NicheResearchMessage::SeedFromBubbles {
+        .send(NicheResearchMessage::SeedFromMoodboards {
             user_id: auth.user_id.clone(),
             clone_id: active_clone.id.clone(),
-            bubble_ids: selected_bubble_ids,
+            moodboard_ids: selected_moodboard_ids,
             moderation_level,
             platforms: vec!["tiktok".to_string(), "instagram".to_string()],
         })
         .await?;
 
-    Response::from_json(&BubblesResponse {
-        bubbles: load_bubbles(&db, &auth.user_id, Some(&active_clone.id)).await?,
+    Response::from_json(&MoodboardsResponse {
+        moodboards: load_moodboards(&db, &auth.user_id, Some(&active_clone.id)).await?,
     })
 }
 
@@ -384,16 +359,16 @@ async fn load_clone_by_id(
     .await
 }
 
-async fn load_bubbles(
+async fn load_moodboards(
     db: &worker::D1Database,
     user_id: &str,
     clone_id: Option<&str>,
-) -> WorkerResult<Vec<BubbleResponse>> {
-    let rows = db::all::<BubbleRow>(
+) -> WorkerResult<Vec<MoodboardResponse>> {
+    let rows = db::all::<MoodboardRow>(
         db,
         r#"
         SELECT id, slug, title, vibe_summary, search_queries_json, selected
-        FROM inspiration_bubbles
+        FROM moodboards
         WHERE user_id = ?
           AND ((clone_id = ?) OR (clone_id IS NULL AND ? IS NULL))
         ORDER BY sort_order ASC, created_at ASC
@@ -402,10 +377,10 @@ async fn load_bubbles(
     )
     .await?;
 
-    Ok(rows.into_iter().map(BubbleResponse::from).collect())
+    Ok(rows.into_iter().map(MoodboardResponse::from).collect())
 }
 
-async fn ensure_default_bubbles(
+async fn ensure_default_moodboards(
     db: &worker::D1Database,
     user_id: &str,
     clone_id: Option<&str>,
@@ -414,7 +389,7 @@ async fn ensure_default_bubbles(
         db,
         r#"
         SELECT COUNT(*) AS count
-        FROM inspiration_bubbles
+        FROM moodboards
         WHERE user_id = ?
           AND ((clone_id = ?) OR (clone_id IS NULL AND ? IS NULL))
         "#,
@@ -426,16 +401,16 @@ async fn ensure_default_bubbles(
     }
 
     let now = now_iso_string();
-    let statements = default_bubbles()
+    let statements = default_moodboards()
         .into_iter()
         .enumerate()
         .map(|(index, seed)| {
-            let id = deterministic_bubble_id(user_id, clone_id, &seed.slug);
+            let id = deterministic_moodboard_id(user_id, clone_id, &seed.slug);
             let search_queries_json =
                 serde_json::to_string(&seed.search_queries).unwrap_or_else(|_| "[]".to_string());
             (
                 r#"
-                INSERT OR IGNORE INTO inspiration_bubbles (
+                INSERT OR IGNORE INTO moodboards (
                   id,
                   user_id,
                   clone_id,
@@ -470,22 +445,22 @@ async fn ensure_default_bubbles(
     Ok(())
 }
 
-async fn save_selected_bubbles(
+async fn save_selected_moodboards(
     db: &worker::D1Database,
     user_id: &str,
     clone_id: &str,
-    selected_bubble_ids: &[String],
+    selected_moodboard_ids: &[String],
 ) -> WorkerResult<()> {
-    let selected_json = serde_json::to_string(selected_bubble_ids)?;
+    let selected_json = serde_json::to_string(selected_moodboard_ids)?;
     db::exec(
         db,
         r#"
-        UPDATE inspiration_bubbles
+        UPDATE moodboards
         SET selected = CASE
           WHEN EXISTS (
             SELECT 1
             FROM json_each(?)
-            WHERE json_each.value = inspiration_bubbles.id
+            WHERE json_each.value = moodboards.id
           )
           THEN 1 ELSE 0 END
         WHERE user_id = ?
@@ -496,24 +471,24 @@ async fn save_selected_bubbles(
     .await
 }
 
-async fn load_matching_bubble_ids(
+async fn load_matching_moodboard_ids(
     db: &worker::D1Database,
     user_id: &str,
     clone_id: &str,
-    selected_bubble_ids: &[String],
+    selected_moodboard_ids: &[String],
 ) -> WorkerResult<Vec<String>> {
-    let selected_json = serde_json::to_string(selected_bubble_ids)?;
+    let selected_json = serde_json::to_string(selected_moodboard_ids)?;
     let rows = db::all::<IdRow>(
         db,
         r#"
         SELECT id
-        FROM inspiration_bubbles
+        FROM moodboards
         WHERE user_id = ?
           AND clone_id = ?
           AND EXISTS (
             SELECT 1
             FROM json_each(?)
-            WHERE json_each.value = inspiration_bubbles.id
+            WHERE json_each.value = moodboards.id
           )
         ORDER BY sort_order ASC, created_at ASC
         "#,
@@ -530,7 +505,7 @@ async fn read_optional_json<T: for<'de> Deserialize<'de>>(
     Ok(req.json::<T>().await.ok())
 }
 
-fn unique_selected_bubble_ids(ids: Vec<String>) -> Vec<String> {
+fn unique_selected_moodboard_ids(ids: Vec<String>) -> Vec<String> {
     let mut unique = Vec::new();
     for id in ids {
         let id = id.trim();
@@ -542,11 +517,11 @@ fn unique_selected_bubble_ids(ids: Vec<String>) -> Vec<String> {
     unique
 }
 
-fn all_requested_bubbles_matched(matched_ids: &[String], requested_ids: &[String]) -> bool {
+fn all_requested_moodboards_matched(matched_ids: &[String], requested_ids: &[String]) -> bool {
     matched_ids.len() == requested_ids.len()
 }
 
-fn valid_selected_bubble_count(count: usize) -> bool {
+fn valid_selected_moodboard_count(count: usize) -> bool {
     count == 5
 }
 
@@ -566,8 +541,8 @@ async fn count_inspiration_pool(db: &worker::D1Database, user_id: &str) -> Worke
     Ok(row.map(|row| row.count).unwrap_or(0))
 }
 
-impl From<BubbleRow> for BubbleResponse {
-    fn from(row: BubbleRow) -> Self {
+impl From<MoodboardRow> for MoodboardResponse {
+    fn from(row: MoodboardRow) -> Self {
         let search_queries = serde_json::from_str::<Vec<String>>(&row.search_queries_json)
             .unwrap_or_else(|_| Vec::new());
 
@@ -582,7 +557,7 @@ impl From<BubbleRow> for BubbleResponse {
     }
 }
 
-fn deterministic_bubble_id(user_id: &str, clone_id: Option<&str>, slug: &str) -> String {
+fn deterministic_moodboard_id(user_id: &str, clone_id: Option<&str>, slug: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(user_id.as_bytes());
     hasher.update(b":");
@@ -590,7 +565,7 @@ fn deterministic_bubble_id(user_id: &str, clone_id: Option<&str>, slug: &str) ->
     hasher.update(b":");
     hasher.update(slug.as_bytes());
     let hash = hex::encode(hasher.finalize());
-    format!("bubble_{}", &hash[..24])
+    format!("moodboard_{}", &hash[..24])
 }
 
 fn now_iso_string() -> String {
@@ -600,76 +575,82 @@ fn now_iso_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_requested_bubbles_matched, unique_selected_bubble_ids, valid_selected_bubble_count,
-        BubbleResponse, CloneSummary, SaveBubblesRequest,
+        all_requested_moodboards_matched, unique_selected_moodboard_ids,
+        valid_selected_moodboard_count, CloneSummary, MoodboardResponse, SaveMoodboardsRequest,
     };
     use serde_json::json;
 
     #[test]
-    fn save_bubbles_request_accepts_existing_bubble_ids_contract() {
-        let request = serde_json::from_value::<SaveBubblesRequest>(json!({
+    fn save_moodboards_request_accepts_moodboard_ids_contract() {
+        let request = serde_json::from_value::<SaveMoodboardsRequest>(json!({
             "cloneId": "clone_1",
-            "bubbleIds": ["bubble_1", "bubble_2", "bubble_3", "bubble_4", "bubble_5"],
+            "moodboardIds": ["moodboard_1", "moodboard_2", "moodboard_3", "moodboard_4", "moodboard_5"],
             "moderationLevel": 7
         }))
         .unwrap();
 
         assert_eq!(request.clone_id.as_deref(), Some("clone_1"));
         assert_eq!(
-            request.selected_bubble_ids,
-            vec!["bubble_1", "bubble_2", "bubble_3", "bubble_4", "bubble_5"]
+            request.moodboard_ids,
+            vec![
+                "moodboard_1",
+                "moodboard_2",
+                "moodboard_3",
+                "moodboard_4",
+                "moodboard_5"
+            ]
         );
         assert_eq!(request.moderation_level, Some(7));
     }
 
     #[test]
-    fn selected_bubble_ids_are_deduped_and_trimmed() {
+    fn selected_moodboard_ids_are_deduped_and_trimmed() {
         assert_eq!(
-            unique_selected_bubble_ids(vec![
-                " bubble_1 ".to_string(),
-                "bubble_1".to_string(),
+            unique_selected_moodboard_ids(vec![
+                " moodboard_1 ".to_string(),
+                "moodboard_1".to_string(),
                 "".to_string(),
-                "bubble_2".to_string(),
+                "moodboard_2".to_string(),
             ]),
-            vec!["bubble_1".to_string(), "bubble_2".to_string()]
+            vec!["moodboard_1".to_string(), "moodboard_2".to_string()]
         );
     }
 
     #[test]
-    fn selected_bubble_count_must_be_exactly_five_for_research() {
-        assert!(!valid_selected_bubble_count(0));
-        assert!(!valid_selected_bubble_count(4));
-        assert!(valid_selected_bubble_count(5));
-        assert!(!valid_selected_bubble_count(6));
+    fn selected_moodboard_count_must_be_exactly_five_for_research() {
+        assert!(!valid_selected_moodboard_count(0));
+        assert!(!valid_selected_moodboard_count(4));
+        assert!(valid_selected_moodboard_count(5));
+        assert!(!valid_selected_moodboard_count(6));
     }
 
     #[test]
-    fn bubble_selection_requires_five_unique_ids_for_research() {
-        let selected = unique_selected_bubble_ids(vec![
-            "bubble_1".to_string(),
-            "bubble_2".to_string(),
-            "bubble_2".to_string(),
-            "bubble_3".to_string(),
-            "bubble_4".to_string(),
-            "bubble_5".to_string(),
+    fn moodboard_selection_requires_five_unique_ids_for_research() {
+        let selected = unique_selected_moodboard_ids(vec![
+            "moodboard_1".to_string(),
+            "moodboard_2".to_string(),
+            "moodboard_2".to_string(),
+            "moodboard_3".to_string(),
+            "moodboard_4".to_string(),
+            "moodboard_5".to_string(),
         ]);
 
         assert_eq!(selected.len(), 5);
-        assert!(valid_selected_bubble_count(selected.len()));
-        assert!(!valid_selected_bubble_count(selected.len() - 1));
+        assert!(valid_selected_moodboard_count(selected.len()));
+        assert!(!valid_selected_moodboard_count(selected.len() - 1));
     }
 
     #[test]
-    fn all_requested_bubbles_must_match_available_bubbles() {
-        assert!(all_requested_bubbles_matched(
-            &["bubble_1".to_string(), "bubble_2".to_string()],
-            &["bubble_2".to_string(), "bubble_1".to_string()]
+    fn all_requested_moodboards_must_match_available_moodboards() {
+        assert!(all_requested_moodboards_matched(
+            &["moodboard_1".to_string(), "moodboard_2".to_string()],
+            &["moodboard_2".to_string(), "moodboard_1".to_string()]
         ));
-        assert!(!all_requested_bubbles_matched(
-            &["bubble_1".to_string()],
-            &["bubble_1".to_string(), "foreign".to_string()]
+        assert!(!all_requested_moodboards_matched(
+            &["moodboard_1".to_string()],
+            &["moodboard_1".to_string(), "foreign".to_string()]
         ));
-        assert!(!all_requested_bubbles_matched(
+        assert!(!all_requested_moodboards_matched(
             &Vec::<String>::new(),
             &["foreign".to_string()]
         ));
@@ -688,12 +669,12 @@ mod tests {
             reference_count_total: 5,
         })
         .unwrap();
-        let bubble = serde_json::to_value(BubbleResponse {
-            id: "bubble_1".to_string(),
-            slug: "y2k-cafe".to_string(),
-            title: "Y2K Cafe".to_string(),
-            vibe_summary: "Cafe flash.".to_string(),
-            search_queries: vec!["y2k cafe".to_string()],
+        let moodboard = serde_json::to_value(MoodboardResponse {
+            id: "moodboard_1".to_string(),
+            slug: "warm-ambient".to_string(),
+            title: "Warm ambient".to_string(),
+            vibe_summary: "Warm ambient light.".to_string(),
+            search_queries: vec!["warm ambient".to_string()],
             selected: true,
         })
         .unwrap();
@@ -701,7 +682,7 @@ mod tests {
         assert_eq!(clone["name"], json!("My Soul"));
         assert_eq!(clone["display_name"], json!("My Soul"));
         assert_eq!(clone["soul_status"], json!("queued"));
-        assert_eq!(bubble["vibe_summary"], json!("Cafe flash."));
-        assert_eq!(bubble["searchQueries"], json!(["y2k cafe"]));
+        assert_eq!(moodboard["vibe_summary"], json!("Warm ambient light."));
+        assert_eq!(moodboard["searchQueries"], json!(["warm ambient"]));
     }
 }

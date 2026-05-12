@@ -36,7 +36,7 @@ Unauthenticated users see:
 Authenticated users see:
 
 - `/onboarding`: Instagram URL, manual upload, Starter Souls, and inspiration
-  bubbles.
+  moodboards.
 - `/blitz`: swipe deck of completed generation jobs.
 - `/create`: discovery or uploaded inspiration image, prompt override, quality,
   batch size, and generation submit.
@@ -82,11 +82,11 @@ The Rust docs list `Ai`, `D1Database`, R2 `Bucket`, and `Queue` as available
   usage, limits, and support metadata.
 - Clone management: clone identity, source, Soul status, provider config,
   reference assets, and plan limits.
-- Onboarding: Instagram harvest, upload intake, Starter Soul adoption, bubble
+- Onboarding: Instagram harvest, upload intake, Starter Soul adoption, moodboard
   selection, and inspiration pool seeding.
 - Instagram photo selection: candidate collection, AI scoring, accepted/rejected
   audit records, fallback states, and consent metadata.
-- Niche research: dynamic research derived from `social-page`, bubble queries,
+- Niche research: dynamic research derived from `social-page`, moodboard queries,
   visual reference pools, liked-output metadata, and user inspiration pools.
 - Media: R2 storage, signed/private reads, remote materialization, lifecycle
   cleanup, and metadata.
@@ -106,13 +106,13 @@ prototype routes:
 - `GET /api/account/usage`: usage buckets shown on `/me`.
 - `/api/auth/*`: final auth implementation path, to be chosen during Rust build.
 - `GET/POST /api/clones`: list and create clone profiles.
-- `GET /api/onboarding/state`: active clone, latest harvest, bubbles, starters.
+- `GET /api/onboarding/state`: active clone, latest harvest, moodboards, starters.
 - `POST /api/onboarding/instagram`: enqueue public Instagram harvest.
 - `GET /api/onboarding/harvest/:id`: harvest progress and accepted assets.
 - `POST /api/onboarding/upload`: upload 5-15 reference photos.
 - `POST /api/onboarding/starter`: adopt a preset Starter Soul.
-- `POST /api/onboarding/bubbles/generate`: generate bubble options.
-- `POST /api/onboarding/bubbles`: save selected bubbles and enqueue research.
+- `POST /api/onboarding/moodboards/generate`: generate moodboard options.
+- `POST /api/onboarding/moodboards`: save selected moodboards and enqueue research.
 - `GET /api/discovery/feed`: return cached discovery/inspiration items.
 - `POST /api/discovery/refresh`: force refresh where allowed.
 - `POST /api/generations`: enqueue image generation.
@@ -148,10 +148,10 @@ Core target tables:
   accepted/rejected reason, face-quality metadata, and audit payload.
 - `starter_characters`: preset personas, display assets, provider config, sort,
   and readiness status.
-- `inspiration_bubbles`: generated bubble options, search queries, selected
+- `moodboards`: generated moodboard options, search queries, selected
   flag, weight, and sort order.
 - `niche_research_queries`: dynamic research queries derived from selected
-  bubbles and app-wide marketing niches.
+  moodboards and app-wide marketing niches.
 - `niche_knowledge`: extracted niche insights, source platform, source URL,
   cluster, score, and freshness.
 - `visual_references`: style archetypes, thumbnail/materialized image refs,
@@ -164,7 +164,7 @@ Core target tables:
   visible together when the full batch is ready.
 - `generation_daily_usage`: per-user daily counters for Soul image generation
   quotas and reset calculations.
-- `user_inspiration_pool`: user-specific discovery items linked to bubbles.
+- `user_inspiration_pool`: user-specific discovery items linked to moodboards.
 - `discovery_sources` and `discovery_items`: cached external discovery feeds.
 - `soul_training_jobs`: clone-training job state, queue state, provider account,
   accepted reference assets, provider Soul ID, and error fields.
@@ -231,12 +231,12 @@ latency, cost, capacity, and failure behavior.
 
 ### `niche_research_queue`
 
-Purpose: refresh dynamic inspiration pools from selected bubbles and global
+Purpose: refresh dynamic inspiration pools from selected moodboards and global
 marketing niches.
 
 Responsibilities:
 
-- Convert selected bubbles into search queries.
+- Convert selected moodboards into search queries.
 - Run ScrapeCreators API searches for TikTok and Instagram where enabled.
 - Extract queries, knowledge bits, clusters, visual style archetypes, and
   discovery items.
@@ -382,7 +382,7 @@ runtime:
 - high-engagement visual reference detection
 - style archetype records
 
-For app runtime, selected onboarding bubbles should feed `niche_research_queue`.
+For app runtime, selected onboarding moodboards should feed `niche_research_queue`.
 That queue refreshes the user's inspiration pool and gives Create/Blitz better
 dynamic ideas over time.
 
@@ -391,7 +391,7 @@ Soul generation. It should collect accepted public visual references for each
 user/clone, tag them with aesthetic metadata, and select each next batch of 10
 generation inputs from a mix of:
 
-- selected onboarding bubbles
+- selected onboarding moodboards
 - current niche research clusters
 - metadata from right-swiped/saved Blitz images
 - freshness and variety constraints so the deck does not collapse into one look
@@ -421,7 +421,7 @@ Other entitlement examples:
 
 - Free: one daily Blitz batch of 10, watermark exports, lower priority queues.
 - Pro: three daily Blitz batches of 10 at launch, no watermark, higher queue
-  priority, more bubbles and inspiration refreshes. Increase to five daily
+  priority, more moodboards and inspiration refreshes. Increase to five daily
   batches only after unit economics and provider capacity are validated.
 - Studio: larger batches, video when available, more aggressive pre-generation,
   priority support, and commercial/agency features later.

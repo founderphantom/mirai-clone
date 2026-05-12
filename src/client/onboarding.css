@@ -170,10 +170,10 @@
   background: linear-gradient(180deg, rgba(8, 12, 14, 0.1), rgba(8, 12, 14, 0.78));
 }
 
-.source-tab-instagram::before { background-image: url("/landing/onboarding-bubbles/bubble-content.png"); }
-.source-tab-upload::before { background-image: url("/landing/onboarding-bubbles/bubble-fashion.png"); }
+.source-tab-instagram::before { background-image: url("/landing/onboarding-upload/example-content.png"); }
+.source-tab-upload::before { background-image: url("/landing/onboarding-upload/example-fashion.png"); }
 .source-tab-starter::before { background-image: url("/landing/starters/starter-hana.jpg"); }
-.source-tab-bubbles::before { background-image: url("/landing/onboarding-bubbles/bubble-vibes.png"); }
+.source-tab-moodboards::before { background-image: url("/landing/step-moodboards.jpg"); }
 
 .onboarding-source-tabs .source-tab svg {
   width: 34px;
@@ -217,7 +217,7 @@
   opacity: 0.54;
 }
 
-.onboarding-bubbles-card {
+.onboarding-moodboards-card {
   overflow: hidden;
   border-color: rgba(255, 255, 255, 0.12);
   background:
@@ -226,11 +226,11 @@
   color: #fff;
 }
 
-.onboarding-bubbles-card h2 {
+.onboarding-moodboards-card h2 {
   color: #fff;
 }
 
-.onboarding-bubbles-card p {
+.onboarding-moodboards-card p {
   color: rgba(255, 255, 255, 0.66);
 }
 
@@ -257,12 +257,12 @@
   font-weight: 900;
 }
 
-.onboarding-bubble-grid {
+.onboarding-moodboard-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
 }
 
-.onboarding-bubble {
+.onboarding-moodboard {
   position: relative;
   isolation: isolate;
   display: grid;
@@ -274,7 +274,7 @@
   border-color: rgba(255, 255, 255, 0.2);
   background:
     radial-gradient(circle at 50% 50%, rgba(12, 18, 20, 0.22), rgba(8, 12, 14, 0.76)),
-    var(--bubble-image);
+    var(--moodboard-image);
   background-position: center;
   background-size: cover;
   color: #fff;
@@ -283,27 +283,27 @@
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1), 0 16px 30px rgba(0, 0, 0, 0.18);
 }
 
-.onboarding-bubble span,
-.onboarding-bubble strong,
-.onboarding-bubble small {
+.onboarding-moodboard span,
+.onboarding-moodboard strong,
+.onboarding-moodboard small {
   grid-column: auto;
 }
 
-.onboarding-bubble:not(.selected) strong {
+.onboarding-moodboard:not(.selected) strong {
   grid-column: auto;
 }
 
-.onboarding-bubble.selected {
+.onboarding-moodboard.selected {
   border-color: var(--onboarding-mint);
   background:
     radial-gradient(circle at 50% 50%, rgba(12, 18, 20, 0.12), rgba(8, 12, 14, 0.7)),
-    var(--bubble-image);
+    var(--moodboard-image);
   background-position: center;
   background-size: cover;
   box-shadow: 0 0 0 4px rgba(94, 224, 173, 0.16), 0 18px 32px rgba(0, 0, 0, 0.22);
 }
 
-.bubble-checkmark {
+.moodboard-checkmark {
   position: absolute;
   right: 13px;
   top: 13px;
@@ -318,11 +318,11 @@
   opacity: 0;
 }
 
-.onboarding-bubble.selected .bubble-checkmark {
+.onboarding-moodboard.selected .moodboard-checkmark {
   opacity: 1;
 }
 
-.bubble-copy {
+.moodboard-copy {
   position: relative;
   z-index: 1;
   display: grid;
@@ -331,7 +331,7 @@
   max-width: 86%;
 }
 
-.onboarding-bubble .bubble-copy small {
+.onboarding-moodboard .moodboard-copy small {
   display: inline-flex;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.14);
@@ -343,7 +343,7 @@
   text-transform: uppercase;
 }
 
-.onboarding-bubble .bubble-copy strong {
+.onboarding-moodboard .moodboard-copy strong {
   color: #fff;
   font-size: 16px;
   font-weight: 900;
@@ -351,7 +351,7 @@
   text-shadow: 0 2px 16px rgba(0, 0, 0, 0.4);
 }
 
-.onboarding-bubble .bubble-copy .bubble-summary {
+.onboarding-moodboard .moodboard-copy .moodboard-summary {
   display: -webkit-box;
   max-width: 100%;
   overflow: hidden;
@@ -364,7 +364,7 @@
   -webkit-line-clamp: 2;
 }
 
-.onboarding-bubbles-card .primary {
+.onboarding-moodboards-card .primary {
   justify-self: stretch;
 }
 
@@ -378,15 +378,15 @@
     padding: 11px;
   }
 
-  .onboarding-bubble {
+  .onboarding-moodboard {
     padding: 14px;
   }
 
-  .onboarding-bubble .bubble-copy strong {
+  .onboarding-moodboard .moodboard-copy strong {
     font-size: 14px;
   }
 
-  .onboarding-bubble .bubble-copy .bubble-summary {
+  .onboarding-moodboard .moodboard-copy .moodboard-summary {
     font-size: 10px;
   }
 }
@@ -428,13 +428,13 @@
     flex: initial;
   }
 
-  .onboarding-bubble-grid {
+  .onboarding-moodboard-grid {
     grid-template-columns: repeat(auto-fill, minmax(142px, 1fr));
   }
 }
 
 @media (min-width: 1180px) {
-  .onboarding-bubble-grid {
+  .onboarding-moodboard-grid {
     grid-template-columns: repeat(auto-fill, minmax(156px, 1fr));
   }
 }

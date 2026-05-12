@@ -9,7 +9,7 @@ current official Cloudflare docs.
 
 The current frontend is the clearest implemented reference for how the app
 works today. Mirai is a Soul-first creator app with a strong mobile shell,
-onboarding around Instagram/uploads/Starter Souls/bubbles, a Blitz deck, a
+onboarding around Instagram/uploads/Starter Souls/moodboards, a Blitz deck, a
 Create surface, active job inbox, library, and account screen.
 
 The existing TypeScript/Hono backend should be treated as a disposable
@@ -36,7 +36,7 @@ Current user-facing surfaces:
 - Auth: email/password and Google entry, with onboarding as the post-signup
   destination.
 - Onboarding: Instagram harvest, manual upload of 5-15 photos, Starter Soul
-  adoption, and up to 5 inspiration bubbles.
+  adoption, and exactly 5 inspiration moodboards.
 - Blitz: swipe deck of completed generation jobs.
 - Create: discovery feed or uploaded inspiration image plus prompt override,
   quality, batch size, and generation submit.
@@ -46,7 +46,7 @@ Current user-facing surfaces:
 - Clones: manual clone creation and direct Soul ID input.
 
 Frontend types already expect clone Soul source/status, Starter Characters,
-Instagram harvest jobs, inspiration bubbles, and app routes for Blitz/Create/
+Instagram harvest jobs, inspiration moodboards, and app routes for Blitz/Create/
 Inbox/Library/Me/Clones/Onboarding.
 
 ## Prototype Findings To Carry Forward
@@ -54,7 +54,7 @@ Inbox/Library/Me/Clones/Onboarding.
 The TypeScript backend is not the target, but these ideas are useful:
 
 - D1 tables for clone profiles, media assets, reference assets, discovery,
-  generation jobs/outputs, onboarding, bubbles, and starters.
+  generation jobs/outputs, onboarding, moodboards, and starters.
 - R2 as the private media store.
 - Separate onboarding and generation queues.
 - Discovery cache through ScrapeCreators.
@@ -92,8 +92,8 @@ The onboarding product contract is now:
     - Instagram public profile.
     - Manual upload of 5-15 reference photos.
     - Preset Starter Soul.
-3. Mirai generates or loads inspiration bubbles.
-4. User selects up to 5 bubbles.
+3. Mirai generates or loads inspiration moodboards.
+4. User selects exactly 5 moodboards.
 5. Mirai seeds a dynamic inspiration pool.
 6. Clone training runs separately and updates the clone when a Soul ID is ready.
 
@@ -187,7 +187,7 @@ The Rust backend should use three primary queues.
 `niche_research_queue`:
 
 - Dynamic inspiration-pool refresh.
-- Uses selected bubbles and app-wide niches to run research.
+- Uses selected moodboards and app-wide niches to run research.
 - Builds per-user visual reference pools for future image-guided Soul
   generation.
 - Feeds Create, Blitz, and eventually marketing automation.
@@ -228,10 +228,10 @@ What it already proves:
 
 How it should map into Mirai:
 
-- Onboarding bubbles become dynamic search seeds.
+- Onboarding moodboards become dynamic search seeds.
 - `niche_research_queue` refreshes user inspiration pools from those seeds.
 - Create uses the refreshed pool as better trend/inspiration input.
-- Blitz can learn from saved cards and selected bubbles.
+- Blitz can learn from saved cards and selected moodboards.
 - Marketing can keep using `produce.js` and `place-product.js` manually until a
   separate marketing automation path is needed.
 
@@ -245,7 +245,7 @@ The backend should not hardcode one model or one AI vendor.
 Use a small model router by task:
 
 - `photo_selection`
-- `persona_bubbles`
+- `persona_moodboards`
 - `niche_research`
 - `copywriting`
 - `moderation`

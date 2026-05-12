@@ -173,7 +173,7 @@ export function MeScreen({ account, onSignedOut }: { account: Account; onSignedO
             <span>Support</span>
             <strong>Need help?</strong>
           </div>
-          <AccountAction icon={<HelpCircle size={18} />} title="Help center" description="Guides for Souls, bubbles, and generations" />
+          <AccountAction icon={<HelpCircle size={18} />} title="Help center" description="Guides for Souls, moodboards, and generations" />
           <a className="account-action" href="mailto:support@phantomsys.dev">
             <span><LifeBuoy size={18} /></span>
             <div>

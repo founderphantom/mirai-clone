@@ -49,7 +49,7 @@ mod tests {
         for task in [
             AiTask::PhotoQualityReview,
             AiTask::HumanPresenceDetection,
-            AiTask::BubbleGeneration,
+            AiTask::MoodboardGeneration,
             AiTask::NicheSeedExtraction,
             AiTask::NicheKnowledgeExtraction,
             AiTask::NicheClusterExpansion,
