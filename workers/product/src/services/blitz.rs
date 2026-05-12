@@ -216,8 +216,11 @@ pub fn stored_batch_size_for_selected_refs(
     u32::try_from(selected_reference_count).unwrap_or(configured_batch_size)
 }
 
-pub fn first_swipe_prefetch_should_run(swipes_after_attempt: u32) -> bool {
-    swipes_after_attempt > 0
+pub fn prefetch_should_run_after_swipe_attempt(
+    inserted_new_swipe: bool,
+    existing_swipes_in_batch: u32,
+) -> bool {
+    inserted_new_swipe && next_batch_should_trigger(existing_swipes_in_batch)
 }
 
 pub fn batch_complete_for_swipe_count(swipe_count: u32, output_count: u32) -> bool {
@@ -604,6 +607,7 @@ pub async fn record_swipe(
         return Err(Error::RustError("generation_output_not_found".to_string()));
     };
     let swipe_index = load_swipe_index(db, batch_id, output_id).await?;
+    let existing_swipes_before_attempt = count_swipes(db, batch_id).await?;
     let now = now_iso_string();
     let metadata = json!({
         "aestheticTags": parse_string_array(output.aesthetic_tags_json.as_deref().unwrap_or("[]")),
@@ -653,7 +657,7 @@ pub async fn record_swipe(
 
     let mut next_batch_triggered = false;
     let swipe_count = count_swipes(db, batch_id).await?;
-    if first_swipe_prefetch_should_run(swipe_count) {
+    if prefetch_should_run_after_swipe_attempt(inserted_new_swipe, existing_swipes_before_attempt) {
         let provider_soul_id = batch
             .provider_soul_id
             .as_deref()

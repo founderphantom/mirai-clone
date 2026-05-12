@@ -27,11 +27,14 @@ use mirai_product_worker::services::accounts::{
     account_usage_limits, VerifiedIdentity,
 };
 use mirai_product_worker::services::blitz::{
-    batch_complete_for_swipe_count, first_swipe_prefetch_should_run, next_batch_should_trigger,
-    stored_batch_size_for_selected_refs, swipe_action_to_db_value, swipeable_batch_status,
-    trigger_influence_cutoff_batch_number,
+    batch_complete_for_swipe_count, next_batch_should_trigger,
+    prefetch_should_run_after_swipe_attempt, stored_batch_size_for_selected_refs,
+    swipe_action_to_db_value, swipeable_batch_status, trigger_influence_cutoff_batch_number,
 };
 use mirai_product_worker::services::clones::{handle_with_suffix, slugify_handle};
+use mirai_product_worker::services::generation_usage::{
+    generation_limits_from_config_values, GenerationLimits,
+};
 use mirai_product_worker::services::media::{media_storage_key, normalize_extension, safe_segment};
 use mirai_product_worker::services::provider_accounts::{
     choose_provider_account, ProviderAccountCandidate,
@@ -160,11 +163,11 @@ fn partial_blitz_batches_store_selected_reference_count() {
 }
 
 #[test]
-fn blitz_prefetch_repair_runs_after_any_recorded_swipe() {
-    assert!(first_swipe_prefetch_should_run(1));
-    assert!(first_swipe_prefetch_should_run(2));
-    assert!(first_swipe_prefetch_should_run(5));
-    assert!(!first_swipe_prefetch_should_run(0));
+fn blitz_prefetch_runs_only_for_new_first_swipe_in_batch() {
+    assert!(prefetch_should_run_after_swipe_attempt(true, 0));
+    assert!(!prefetch_should_run_after_swipe_attempt(true, 1));
+    assert!(!prefetch_should_run_after_swipe_attempt(true, 5));
+    assert!(!prefetch_should_run_after_swipe_attempt(false, 0));
 }
 
 #[test]
@@ -741,6 +744,38 @@ fn daily_generation_limits_follow_plan() {
 }
 
 #[test]
+fn generation_limits_use_positive_config_values_with_defaults() {
+    assert_eq!(
+        generation_limits_from_config_values([]),
+        GenerationLimits {
+            free_daily_limit: 10,
+            pro_daily_limit: 50,
+        }
+    );
+    assert_eq!(
+        generation_limits_from_config_values([
+            ("free_daily_limit", "7"),
+            ("pro_daily_limit", "0"),
+            ("ignored", "999"),
+        ]),
+        GenerationLimits {
+            free_daily_limit: 7,
+            pro_daily_limit: 50,
+        }
+    );
+    assert_eq!(
+        generation_limits_from_config_values([
+            ("free_daily_limit", "-1"),
+            ("pro_daily_limit", "80"),
+        ]),
+        GenerationLimits {
+            free_daily_limit: 10,
+            pro_daily_limit: 80,
+        }
+    );
+}
+
+#[test]
 fn default_bubbles_provide_enough_unique_research_choices() {
     let bubbles = default_bubbles();
     let unique_slugs = bubbles
@@ -750,7 +785,9 @@ fn default_bubbles_provide_enough_unique_research_choices() {
 
     assert!(bubbles.len() >= 5);
     assert_eq!(unique_slugs.len(), bubbles.len());
-    assert!(bubbles.iter().all(|bubble| !bubble.search_queries.is_empty()));
+    assert!(bubbles
+        .iter()
+        .all(|bubble| !bubble.search_queries.is_empty()));
 }
 
 #[test]

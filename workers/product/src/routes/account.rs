@@ -6,7 +6,9 @@ use crate::services::accounts::{
     account_usage_limits, upsert_account_from_identity, EntitlementSnapshot, UsageLimits,
     VerifiedIdentity,
 };
-use crate::services::generation_usage::{usage_snapshot, GenerationUsageSnapshot};
+use crate::services::generation_usage::{
+    load_generation_limits, usage_snapshot, GenerationUsageSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use worker::{Request, Response, Result as WorkerResult, RouteContext};
@@ -120,7 +122,15 @@ pub async fn get_usage(req: Request, ctx: RouteContext<()>) -> WorkerResult<Resp
         vec![json!(user_id)],
     )
     .await?;
-    let generation_usage = usage_snapshot(&db, user_id, &auth.plan, 10, 50).await?;
+    let limits = load_generation_limits(&db).await?;
+    let generation_usage = usage_snapshot(
+        &db,
+        user_id,
+        &auth.plan,
+        limits.free_daily_limit,
+        limits.pro_daily_limit,
+    )
+    .await?;
 
     Response::from_json(&AccountUsageResponse {
         clones,

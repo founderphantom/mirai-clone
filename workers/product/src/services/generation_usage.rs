@@ -4,6 +4,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use worker::{D1Database, Result as WorkerResult};
 
+const DEFAULT_FREE_DAILY_LIMIT: u32 = 10;
+const DEFAULT_PRO_DAILY_LIMIT: u32 = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationLimits {
+    pub free_daily_limit: u32,
+    pub pro_daily_limit: u32,
+}
+
+impl Default for GenerationLimits {
+    fn default() -> Self {
+        Self {
+            free_daily_limit: DEFAULT_FREE_DAILY_LIMIT,
+            pro_daily_limit: DEFAULT_PRO_DAILY_LIMIT,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationUsageSnapshot {
@@ -16,6 +34,45 @@ pub struct GenerationUsageSnapshot {
 #[derive(Debug, Clone, Deserialize)]
 struct UsageRow {
     images_generated: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConfigRow {
+    key: String,
+    value: String,
+}
+
+pub async fn load_generation_limits(db: &D1Database) -> WorkerResult<GenerationLimits> {
+    let rows = db::all::<ConfigRow>(
+        db,
+        r#"
+        SELECT key, value
+        FROM blitz_config
+        WHERE key IN ('free_daily_limit', 'pro_daily_limit')
+        "#,
+        vec![],
+    )
+    .await?;
+
+    Ok(generation_limits_from_config_values(
+        rows.iter()
+            .map(|row| (row.key.as_str(), row.value.as_str())),
+    ))
+}
+
+pub fn generation_limits_from_config_values<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> GenerationLimits {
+    let mut limits = GenerationLimits::default();
+    for (key, value) in rows {
+        let parsed = value.parse::<u32>().unwrap_or(0);
+        match key {
+            "free_daily_limit" if parsed > 0 => limits.free_daily_limit = parsed,
+            "pro_daily_limit" if parsed > 0 => limits.pro_daily_limit = parsed,
+            _ => {}
+        }
+    }
+    limits
 }
 
 pub async fn usage_snapshot(

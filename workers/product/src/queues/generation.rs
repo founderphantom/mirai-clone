@@ -3,7 +3,7 @@ use crate::providers::higgsfield_auth::{refresh_access_token, validate_access_to
 use crate::providers::higgsfield_mcp::{call_tool, HiggsfieldMcpError};
 use crate::queues::messages::GenerationMessage;
 use crate::services::generation_usage::{
-    current_utc_date, refund_image_for_date, reserve_image_for_date,
+    current_utc_date, load_generation_limits, refund_image_for_date, reserve_image_for_date,
 };
 use crate::services::media::media_storage_key;
 use serde::Deserialize;
@@ -17,16 +17,11 @@ use worker::{
 const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FUFU";
 const HIGGSFIELD_GENERATION_TOOL_VAR: &str = "HIGGSFIELD_MCP_GENERATION_TOOL";
 const GENERATION_POLL_DELAY_SECONDS: u32 = 10;
+const MAX_GENERATED_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct ClonePlanRow {
     plan: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConfigRow {
-    key: String,
-    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,7 +132,7 @@ async fn generate_blitz_batch(
         mark_batch_failed_without_jobs(db, batch_id).await?;
         return Ok(());
     };
-    let (free_daily_limit, pro_daily_limit) = load_generation_limits(db).await?;
+    let generation_limits = load_generation_limits(db).await?;
 
     for visual_reference_id in visual_reference_ids {
         if let Some(existing) =
@@ -196,8 +191,8 @@ async fn generate_blitz_batch(
             db,
             user_id,
             &clone.plan,
-            free_daily_limit,
-            pro_daily_limit,
+            generation_limits.free_daily_limit,
+            generation_limits.pro_daily_limit,
             &usage_date,
         )
         .await?
@@ -313,7 +308,9 @@ async fn submit_generation_job(
         return Ok(());
     }
 
-    mark_generation_job_submitting(db, job_id).await?;
+    if !mark_generation_job_submitting(db, job_id).await? {
+        return Ok(());
+    }
 
     let request = serde_json::from_str::<Value>(&job.request_json).unwrap_or_else(|_| {
         json!({
@@ -522,15 +519,15 @@ async fn ensure_generation_usage_reserved(
         return Ok(false);
     };
 
-    let (free_daily_limit, pro_daily_limit) = load_generation_limits(db).await?;
+    let generation_limits = load_generation_limits(db).await?;
     let usage_date =
         usage_date_from_request_json(&job.request_json).unwrap_or_else(current_utc_date);
     if !reserve_image_for_date(
         db,
         &job.user_id,
         &clone.plan,
-        free_daily_limit,
-        pro_daily_limit,
+        generation_limits.free_daily_limit,
+        generation_limits.pro_daily_limit,
         &usage_date,
     )
     .await?
@@ -1183,54 +1180,51 @@ async fn load_ready_clone_plan(
     .await
 }
 
-async fn load_generation_limits(db: &D1Database) -> WorkerResult<(u32, u32)> {
-    let rows = db::all::<ConfigRow>(
-        db,
-        r#"
-        SELECT key, value
-        FROM blitz_config
-        WHERE key IN ('free_daily_limit', 'pro_daily_limit')
-        "#,
-        vec![],
-    )
-    .await?;
-
-    let mut free_daily_limit = 10;
-    let mut pro_daily_limit = 50;
-    for row in rows {
-        let parsed = row.value.parse::<u32>().unwrap_or(0);
-        match row.key.as_str() {
-            "free_daily_limit" if parsed > 0 => free_daily_limit = parsed,
-            "pro_daily_limit" if parsed > 0 => pro_daily_limit = parsed,
-            _ => {}
-        }
-    }
-
-    Ok((free_daily_limit, pro_daily_limit))
-}
-
 async fn load_visual_reference(
     db: &D1Database,
     clone_id: &str,
     user_id: &str,
     visual_reference_id: &str,
 ) -> WorkerResult<Option<VisualReferenceRow>> {
+    let sql = visual_reference_guidance_query();
     db::first::<VisualReferenceRow>(
         db,
+        &sql,
+        vec![
+            json!(user_id),
+            json!(visual_reference_id),
+            json!(clone_id),
+            json!(user_id),
+        ],
+    )
+    .await
+}
+
+fn visual_reference_guidance_query() -> String {
+    format!(
         r#"
-        SELECT COALESCE(ma.remote_url, vr.source_url) AS materialized_reference_url
+        SELECT {} AS materialized_reference_url
         FROM visual_references vr
         LEFT JOIN media_assets ma
           ON ma.id = vr.media_asset_id
          AND ma.deleted_at IS NULL
+        LEFT JOIN visual_reference_candidates vrc
+          ON vrc.id = vr.candidate_id
+         AND vrc.clone_id = vr.clone_id
+         AND (vrc.user_id IS NULL OR vrc.user_id = ?)
+        LEFT JOIN discovery_items di
+          ON di.id = vrc.discovery_item_id
         WHERE vr.id = ?
           AND vr.clone_id = ?
           AND (vr.user_id IS NULL OR vr.user_id = ?)
           AND vr.status = 'active'
         "#,
-        vec![json!(visual_reference_id), json!(clone_id), json!(user_id)],
+        visual_reference_guidance_url_expr()
     )
-    .await
+}
+
+fn visual_reference_guidance_url_expr() -> &'static str {
+    "COALESCE(ma.remote_url, vrc.image_url, di.image_url, di.thumbnail_url, vr.source_url)"
 }
 
 async fn batch_has_generation_jobs(db: &D1Database, batch_id: &str) -> WorkerResult<bool> {
@@ -1288,9 +1282,9 @@ async fn insert_generation_job(
     Ok(changed_rows(&result)? > 0)
 }
 
-async fn mark_generation_job_submitting(db: &D1Database, job_id: &str) -> WorkerResult<()> {
+async fn mark_generation_job_submitting(db: &D1Database, job_id: &str) -> WorkerResult<bool> {
     let now = now_iso_string();
-    db::exec(
+    let result = db::run(
         db,
         r#"
         UPDATE generation_jobs
@@ -1302,7 +1296,8 @@ async fn mark_generation_job_submitting(db: &D1Database, job_id: &str) -> Worker
         "#,
         vec![json!(now), json!(now), json!(job_id)],
     )
-    .await
+    .await?;
+    Ok(changed_rows(&result)? > 0)
 }
 
 async fn persist_generation_usage_marker_or_refund(
@@ -1828,10 +1823,22 @@ async fn download_generated_image(provider_url: &str) -> WorkerResult<(Vec<u8>, 
             .as_deref()
             .unwrap_or("image/jpeg"),
     );
+    if content_length_exceeds_generated_image_limit(
+        response.headers().get("content-length")?.as_deref(),
+    ) {
+        return Err(Error::RustError(
+            "generation_image_download_too_large".to_string(),
+        ));
+    }
     let bytes = response.bytes().await?;
     if bytes.is_empty() {
         return Err(Error::RustError(
             "generation_image_download_empty".to_string(),
+        ));
+    }
+    if generated_image_size_too_large(bytes.len()) {
+        return Err(Error::RustError(
+            "generation_image_download_too_large".to_string(),
         ));
     }
 
@@ -2161,6 +2168,17 @@ fn normalize_generated_content_type(content_type: &str) -> &'static str {
     }
 }
 
+fn content_length_exceeds_generated_image_limit(content_length: Option<&str>) -> bool {
+    content_length
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(generated_image_size_too_large)
+        .unwrap_or(false)
+}
+
+fn generated_image_size_too_large(byte_count: usize) -> bool {
+    byte_count > MAX_GENERATED_IMAGE_BYTES
+}
+
 fn changed_rows(result: &worker::D1Result) -> WorkerResult<usize> {
     Ok(result
         .meta()?
@@ -2197,14 +2215,16 @@ fn completion_updated_at_is_stale(updated_at: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_claim_failure_action, deterministic_generation_job_id,
-        failed_generation_refund_action, final_image_url, generation_media_id,
-        generation_output_id, poll_failure_action, provider_asset_id, provider_ids_are_empty,
-        provider_job_ids, provider_status, request_has_usage_reservation_marker,
-        response_has_usage_refund_marker, retryable_completion_attempt,
-        submission_arguments_from_request, terminal_failure_allowed_for_job_state,
-        usage_date_from_request_json, CompletionClaimFailureAction, FailedGenerationRefundAction,
-        PollFailureAction,
+        completion_claim_failure_action, content_length_exceeds_generated_image_limit,
+        deterministic_generation_job_id, failed_generation_refund_action, final_image_url,
+        generated_image_size_too_large, generation_media_id, generation_output_id,
+        poll_failure_action, provider_asset_id, provider_ids_are_empty, provider_job_ids,
+        provider_status, request_has_usage_reservation_marker, response_has_usage_refund_marker,
+        retryable_completion_attempt, submission_arguments_from_request,
+        terminal_failure_allowed_for_job_state, usage_date_from_request_json,
+        visual_reference_guidance_query, visual_reference_guidance_url_expr,
+        CompletionClaimFailureAction, FailedGenerationRefundAction, PollFailureAction,
+        MAX_GENERATED_IMAGE_BYTES,
     };
     use serde_json::json;
 
@@ -2261,6 +2281,37 @@ mod tests {
         assert!(id.starts_with("gen_"));
         assert_eq!(id.len(), 28);
         assert!(id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'));
+    }
+
+    #[test]
+    fn visual_reference_guidance_query_prefers_real_image_urls_before_source_posts() {
+        assert_eq!(
+            visual_reference_guidance_url_expr(),
+            "COALESCE(ma.remote_url, vrc.image_url, di.image_url, di.thumbnail_url, vr.source_url)"
+        );
+
+        let query = visual_reference_guidance_query();
+
+        assert!(query.contains("LEFT JOIN visual_reference_candidates vrc"));
+        assert!(query.contains("vrc.id = vr.candidate_id"));
+        assert!(query.contains("LEFT JOIN discovery_items di"));
+        assert!(query.contains("di.id = vrc.discovery_item_id"));
+    }
+
+    #[test]
+    fn generated_image_size_limit_rejects_large_downloads() {
+        assert!(!generated_image_size_too_large(MAX_GENERATED_IMAGE_BYTES));
+        assert!(generated_image_size_too_large(
+            MAX_GENERATED_IMAGE_BYTES + 1
+        ));
+        assert!(content_length_exceeds_generated_image_limit(Some(
+            "15728641"
+        )));
+        assert!(!content_length_exceeds_generated_image_limit(Some(
+            "15728640"
+        )));
+        assert!(!content_length_exceeds_generated_image_limit(Some("bad")));
+        assert!(!content_length_exceeds_generated_image_limit(None));
     }
 
     #[test]

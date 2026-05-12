@@ -1,7 +1,7 @@
 use crate::auth_client::verify_session;
 use crate::http::error::ApiError;
 use crate::services::blitz;
-use crate::services::generation_usage::usage_snapshot;
+use crate::services::generation_usage::{load_generation_limits, usage_snapshot};
 use serde::Deserialize;
 use worker::{Error, Request, Response, Result as WorkerResult, RouteContext, Url};
 
@@ -26,7 +26,15 @@ pub async fn current(req: Request, ctx: RouteContext<()>) -> WorkerResult<Respon
         }
     };
     let db = ctx.env.d1("DB")?;
-    let usage = usage_snapshot(&db, &auth.user_id, &auth.plan, 10, 50).await?;
+    let limits = load_generation_limits(&db).await?;
+    let usage = usage_snapshot(
+        &db,
+        &auth.user_id,
+        &auth.plan,
+        limits.free_daily_limit,
+        limits.pro_daily_limit,
+    )
+    .await?;
     let response = match blitz::current_batch(&db, &auth.user_id, &clone_id, usage).await {
         Ok(response) => response,
         Err(error) => return map_or_return_blitz_error(error),
