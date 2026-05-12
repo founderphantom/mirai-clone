@@ -4,10 +4,12 @@ mod db;
 pub mod domain;
 mod env;
 mod http;
-pub mod providers;
+mod providers;
 mod queues;
 pub mod routes;
 pub mod services;
+
+pub use providers::scrapecreators;
 
 use serde_json::Value;
 use worker::{event, Context, Env, MessageBatch, Request, Response, Result as WorkerResult};

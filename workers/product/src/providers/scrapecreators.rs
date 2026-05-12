@@ -55,6 +55,7 @@ pub fn build_scrape_request(
 ) -> Result<String, ScrapeCreatorsError> {
     let base = base_url.trim_end_matches('/');
     let encoded_query = url_encode(query);
+    let encoded_hashtag = url_encode(query.trim().trim_start_matches('#'));
     let encoded_region = url_encode(region);
 
     let url = match platform {
@@ -62,7 +63,7 @@ pub fn build_scrape_request(
             "{base}/v1/tiktok/search/keyword?query={encoded_query}&sort_by=date-posted&date_posted=last-6-months&trim=true&region={encoded_region}"
         ),
         ScrapePlatform::TikTokHashtag => format!(
-            "{base}/v1/tiktok/search/hashtag?hashtag={encoded_query}&trim=true&region={encoded_region}"
+            "{base}/v1/tiktok/search/hashtag?hashtag={encoded_hashtag}&trim=true&region={encoded_region}"
         ),
         ScrapePlatform::InstagramReels => format!(
             "{base}/v2/instagram/reels/search?query={encoded_query}&date_posted=last-year"
@@ -76,7 +77,10 @@ pub fn scrape_platform_from_str(
     platform: &str,
     search_kind: &str,
 ) -> Result<ScrapePlatform, ScrapeCreatorsError> {
-    match (platform, search_kind) {
+    let platform = platform.trim().to_ascii_lowercase();
+    let search_kind = search_kind.trim().to_ascii_lowercase();
+
+    match (platform.as_str(), search_kind.as_str()) {
         ("tiktok", "keyword") => Ok(ScrapePlatform::TikTokKeyword),
         ("tiktok", "hashtag") => Ok(ScrapePlatform::TikTokHashtag),
         ("instagram", "reels") => Ok(ScrapePlatform::InstagramReels),
@@ -98,7 +102,7 @@ pub async fn fetch_scrapecreators_json(
     let request = Request::new_with_init(url, &init)?;
     let mut response = Fetch::Request(request).send().await?;
     let status = response.status_code();
-    let response_text = response.text().await.unwrap_or_default();
+    let response_text = response.text().await?;
     let raw_json = serde_json::from_str::<Value>(&response_text).unwrap_or_else(|_| {
         json!({
             "rawText": response_text,
@@ -197,8 +201,8 @@ fn normalize_instagram_reel(reel: &Value) -> Option<NormalizedDiscoveryItem> {
         .or_else(|| text_at(reel, &["username"]))
         .unwrap_or_default();
     let like_count = number_at(reel, &["like_count"]).or_else(|| number_at(reel, &["likes"]));
-    let source_published_at = text_at(reel, &["taken_at"])
-        .or_else(|| number_at(reel, &["taken_at_timestamp"]).and_then(unix_seconds_to_iso));
+    let source_published_at =
+        timestamp_at(reel, &["taken_at"]).or_else(|| timestamp_at(reel, &["taken_at_timestamp"]));
 
     Some(NormalizedDiscoveryItem {
         external_id,
@@ -221,7 +225,10 @@ fn array_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Vec<Value>> {
 fn first_text_at(value: &Value, path: &[&str]) -> Option<String> {
     array_at(value, path)?
         .iter()
-        .find_map(|item| item.as_str().map(ToString::to_string))
+        .find_map(|item| match item.as_str() {
+            Some(text) if !text.is_empty() => Some(text.to_string()),
+            _ => None,
+        })
 }
 
 fn text_at(value: &Value, path: &[&str]) -> Option<String> {
@@ -244,6 +251,22 @@ fn number_at(value: &Value, path: &[&str]) -> Option<u64> {
     match value {
         Value::Number(number) => number.as_u64(),
         Value::String(text) => text.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn timestamp_at(value: &Value, path: &[&str]) -> Option<String> {
+    let value = path
+        .iter()
+        .try_fold(value, |current, key| current.get(*key))?;
+
+    match value {
+        Value::String(text) if !text.is_empty() => text
+            .parse::<u64>()
+            .ok()
+            .and_then(unix_seconds_to_iso)
+            .or_else(|| Some(text.to_string())),
+        Value::Number(number) => number.as_u64().and_then(unix_seconds_to_iso),
         _ => None,
     }
 }

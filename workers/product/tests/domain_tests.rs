@@ -24,7 +24,7 @@ use mirai_product_worker::services::media::{media_storage_key, normalize_extensi
 use mirai_product_worker::services::provider_accounts::{
     choose_provider_account, ProviderAccountCandidate,
 };
-use mirai_product_worker::providers::scrapecreators::{
+use mirai_product_worker::scrapecreators::{
     build_scrape_request, normalize_instagram_reels_search, normalize_tiktok_keyword_search,
     scrape_platform_from_str, ScrapePlatform,
 };
@@ -472,6 +472,18 @@ fn scrape_request_builder_allows_only_tiktok_and_instagram() {
         "https://api.scrapecreators.com/v1/tiktok/search/hashtag?hashtag=streetwear&trim=true&region=US"
     );
 
+    let hashtag_with_prefix = build_scrape_request(
+        "https://api.scrapecreators.com",
+        ScrapePlatform::TikTokHashtag,
+        "#streetwear",
+        "US",
+    )
+    .unwrap();
+    assert_eq!(
+        hashtag_with_prefix,
+        "https://api.scrapecreators.com/v1/tiktok/search/hashtag?hashtag=streetwear&trim=true&region=US"
+    );
+
     let instagram = build_scrape_request(
         "https://api.scrapecreators.com",
         ScrapePlatform::InstagramReels,
@@ -486,9 +498,24 @@ fn scrape_request_builder_allows_only_tiktok_and_instagram() {
 }
 
 #[test]
-fn scrape_platform_parser_rejects_unsupported_platforms() {
-    let err = scrape_platform_from_str("youtube", "keyword").unwrap_err();
+fn scrape_platform_parser_normalizes_supported_inputs_and_rejects_unsupported() {
+    assert_eq!(
+        scrape_platform_from_str(" TikTok ", " KEYWORD ").unwrap(),
+        ScrapePlatform::TikTokKeyword
+    );
+    assert_eq!(
+        scrape_platform_from_str("tiktok", "hashtag").unwrap(),
+        ScrapePlatform::TikTokHashtag
+    );
+    assert_eq!(
+        scrape_platform_from_str("INSTAGRAM", "reels").unwrap(),
+        ScrapePlatform::InstagramReels
+    );
 
+    let err = scrape_platform_from_str("youtube", "keyword").unwrap_err();
+    assert_eq!(err.to_string(), "unsupported scrape platform");
+
+    let err = scrape_platform_from_str("instagram", "keyword").unwrap_err();
     assert_eq!(err.to_string(), "unsupported scrape platform");
 }
 
@@ -505,7 +532,7 @@ fn tiktok_keyword_normalizer_extracts_recent_image_candidates() {
                 "statistics": { "digg_count": 23456 },
                 "author": { "unique_id": "creator" },
                 "video": {
-                    "cover": { "url_list": ["https://cdn.example/cover.jpg"] }
+                    "cover": { "url_list": ["", "https://cdn.example/cover.jpg"] }
                 }
             }
         }]
@@ -520,6 +547,10 @@ fn tiktok_keyword_normalizer_extracts_recent_image_candidates() {
     assert_eq!(
         items[0].source_published_at.as_deref(),
         Some("2026-01-01T00:00:00.000Z")
+    );
+    assert_eq!(
+        items[0].source_url.as_deref(),
+        Some("https://www.tiktok.com/@creator/video/725")
     );
     assert_eq!(
         items[0].image_url.as_deref(),
@@ -547,6 +578,10 @@ fn instagram_reels_normalizer_extracts_reel_candidates() {
     assert_eq!(items[0].platform, "instagram");
     assert_eq!(items[0].author_handle, "igcreator");
     assert_eq!(items[0].like_count, Some(6000));
+    assert_eq!(
+        items[0].source_url.as_deref(),
+        Some("https://www.instagram.com/reel/ABC123/")
+    );
     assert_eq!(
         items[0].source_published_at.as_deref(),
         Some("2026-02-03T04:05:06.000Z")
@@ -816,3 +851,39 @@ fn selection_caps_cluster_and_platform_variety() {
     assert_eq!(instagram_count, 3);
     assert!(selected.len() <= 5);
 }
+
+#[test]
+fn instagram_reels_normalizer_converts_numeric_taken_at_values() {
+    let raw = serde_json::json!({
+        "reels": [
+            {
+                "shortcode": "NUM123",
+                "caption": "numeric timestamp",
+                "thumbnail_url": "https://cdn.example/num.jpg",
+                "like_count": 5,
+                "owner": { "username": "numeric" },
+                "taken_at": 1767225600
+            },
+            {
+                "shortcode": "STR123",
+                "caption": "numeric string timestamp",
+                "thumbnail_url": "https://cdn.example/str.jpg",
+                "like_count": 6,
+                "owner": { "username": "numeric-string" },
+                "taken_at": "1767225600"
+            }
+        ]
+    });
+
+    let items = normalize_instagram_reels_search(&raw);
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0].source_published_at.as_deref(),
+        Some("2026-01-01T00:00:00.000Z")
+    );
+    assert_eq!(
+        items[1].source_published_at.as_deref(),
+        Some("2026-01-01T00:00:00.000Z")
+    );
+}
+
