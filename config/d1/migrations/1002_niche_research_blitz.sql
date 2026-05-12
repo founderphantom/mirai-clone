@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS discovery_items (
   expires_at TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY (source_id) REFERENCES discovery_sources(id) ON DELETE CASCADE,
-  UNIQUE(platform, external_id)
+  UNIQUE(source_id, platform, external_id)
 );
 
 CREATE TABLE IF NOT EXISTS inspiration_bubbles (

@@ -150,8 +150,16 @@ async fn handle_seed_from_bubbles(
     insert_seed_queries(db, &user_id, &clone_id, &seed_queries).await?;
 
     run_scrape_pass(db, env, &user_id, &clone_id, &seed_queries, &config).await?;
-    let deeper_queries =
-        run_knowledge_and_clustering(db, &ai, &user_id, &clone_id, &active_niche, &config).await?;
+    let deeper_queries = run_knowledge_and_clustering(
+        db,
+        &ai,
+        &user_id,
+        &clone_id,
+        &active_niche,
+        &allowed_platforms,
+        &config,
+    )
+    .await?;
     if !deeper_queries.is_empty() {
         insert_seed_queries(db, &user_id, &clone_id, &deeper_queries).await?;
         run_scrape_pass(db, env, &user_id, &clone_id, &deeper_queries, &config).await?;
@@ -428,7 +436,10 @@ async fn insert_discovery_items(
             continue;
         }
 
-        let item_id = deterministic_id("discovery_item", &[&item.platform, &item.external_id]);
+        let item_id = deterministic_id(
+            "discovery_item",
+            &[source_id, &item.platform, &item.external_id],
+        );
         db::exec(
             db,
             r#"
@@ -479,6 +490,7 @@ async fn run_knowledge_and_clustering(
     user_id: &str,
     clone_id: &str,
     active_niche: &str,
+    allowed_platforms: &[String],
     config: &HashMap<String, String>,
 ) -> WorkerResult<Vec<SeedQuery>> {
     let items = load_clone_discovery_items(db, clone_id, 120).await?;
@@ -515,7 +527,7 @@ async fn run_knowledge_and_clustering(
         serde_json::to_string_pretty(&context_items).unwrap_or_else(|_| "[]".to_string())
     );
     let knowledge = run_text_json::<KnowledgeExtractionResponse>(ai, &knowledge_prompt).await?;
-    let deeper_from_knowledge = knowledge_seed_queries(&knowledge);
+    let deeper_from_knowledge = knowledge_seed_queries(&knowledge, allowed_platforms);
     insert_knowledge_rows(db, user_id, clone_id, &knowledge).await?;
 
     let seeds_json = research_seeds_for_clustering(db, clone_id).await?;
@@ -532,7 +544,7 @@ async fn run_knowledge_and_clustering(
         .filter(|cluster| cluster.relevance_score >= threshold)
         .take(expand_limit)
     {
-        expanded.extend(cluster_seed_queries(cluster));
+        expanded.extend(cluster_seed_queries(cluster, allowed_platforms));
     }
     Ok(dedupe_seed_queries(expanded))
 }
@@ -1276,42 +1288,40 @@ fn normalize_discovery_items(
     }
 }
 
-fn knowledge_seed_queries(knowledge: &KnowledgeExtractionResponse) -> Vec<SeedQuery> {
+fn knowledge_seed_queries(
+    knowledge: &KnowledgeExtractionResponse,
+    allowed_platforms: &[String],
+) -> Vec<SeedQuery> {
     knowledge
         .deeper_queries
         .iter()
         .chain(knowledge.queries.iter())
         .cloned()
-        .flat_map(|seed| {
-            accepted_seed_queries(vec![seed], &["tiktok".to_string(), "instagram".to_string()])
-        })
+        .flat_map(|seed| accepted_seed_queries(vec![seed], allowed_platforms))
         .collect()
 }
 
-fn cluster_seed_queries(cluster: &ClusterCandidate) -> Vec<SeedQuery> {
+fn cluster_seed_queries(
+    cluster: &ClusterCandidate,
+    allowed_platforms: &[String],
+) -> Vec<SeedQuery> {
     let mut seeds = cluster
         .deeper_queries
         .iter()
         .cloned()
-        .flat_map(|seed| {
-            accepted_seed_queries(vec![seed], &["tiktok".to_string(), "instagram".to_string()])
-        })
+        .flat_map(|seed| accepted_seed_queries(vec![seed], allowed_platforms))
         .collect::<Vec<_>>();
     if seeds.is_empty() {
         for term in string_array_from_value(&cluster.terms) {
             if filter_synthetic_terms(&term).is_ok() {
-                seeds.push(SeedQuery {
-                    query: term.clone(),
-                    platform: "tiktok".to_string(),
-                    source: "cluster_expansion".to_string(),
-                    raw_json: json!({ "cluster": cluster.label, "platform": "tiktok" }),
-                });
-                seeds.push(SeedQuery {
-                    query: term,
-                    platform: "instagram".to_string(),
-                    source: "cluster_expansion".to_string(),
-                    raw_json: json!({ "cluster": cluster.label, "platform": "instagram" }),
-                });
+                for platform in allowed_platforms {
+                    seeds.push(SeedQuery {
+                        query: term.clone(),
+                        platform: platform.clone(),
+                        source: "cluster_expansion".to_string(),
+                        raw_json: json!({ "cluster": cluster.label, "platform": platform }),
+                    });
+                }
             }
         }
     }
@@ -1594,6 +1604,24 @@ mod tests {
             serde_json::to_value(refresh).unwrap()["type"],
             json!("refresh_pool")
         );
+    }
+
+    #[test]
+    fn cluster_expansion_respects_requested_platform_allowlist() {
+        let cluster = ClusterCandidate {
+            label: "mirror fit".to_string(),
+            terms: json!(["mirror outfit"]),
+            intent: "creator outfit checks".to_string(),
+            visual_criteria: json!("single person mirror photo"),
+            relevance_score: 0.91,
+            deeper_queries: Vec::new(),
+        };
+        let allowed_platforms = vec!["instagram".to_string()];
+
+        let expanded = cluster_seed_queries(&cluster, &allowed_platforms);
+
+        assert!(!expanded.is_empty());
+        assert!(expanded.iter().all(|seed| seed.platform == "instagram"));
     }
 
     #[test]
