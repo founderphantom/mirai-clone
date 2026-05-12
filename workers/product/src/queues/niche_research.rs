@@ -100,26 +100,26 @@ async fn handle_seed_from_bubbles(
     moderation_level: u8,
     platforms: Vec<String>,
 ) -> WorkerResult<()> {
-    let ai = env.ai("AI")?;
     let Some(clone) = load_clone_for_research(db, &user_id, &clone_id).await? else {
         web_sys::console::log_1(
             &format!("ack niche research for missing clone user={user_id} clone={clone_id}").into(),
         );
         return Ok(());
     };
+    let ai = env.ai("AI")?;
     let bubbles = load_selected_bubbles(db, &user_id, &clone_id, &bubble_ids).await?;
     let selected_bubble_ids = bubbles
         .iter()
         .map(|bubble| bubble.id.as_str())
         .collect::<Vec<_>>();
-    if bubbles.len() < 5 {
+    if !valid_loaded_bubble_count(bubbles.len()) {
         set_clone_research_status(
             db,
             &user_id,
             &clone_id,
             "insufficient_bubbles",
             &format!(
-                "selected_bubbles={}, minimum=5, bubble_ids={}",
+                "selected_bubbles={}, required=5, bubble_ids={}",
                 bubbles.len(),
                 selected_bubble_ids.join(",")
             ),
@@ -1309,6 +1309,10 @@ fn bubble_search_queries(bubbles: &[BubbleRow]) -> Vec<String> {
     queries
 }
 
+fn valid_loaded_bubble_count(count: usize) -> bool {
+    count == 5
+}
+
 fn normalize_platforms(platforms: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     platforms
@@ -1817,6 +1821,13 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn loaded_bubble_count_must_be_exactly_five() {
+        assert!(!valid_loaded_bubble_count(4));
+        assert!(valid_loaded_bubble_count(5));
+        assert!(!valid_loaded_bubble_count(6));
     }
 
     #[test]

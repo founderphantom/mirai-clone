@@ -609,13 +609,16 @@ mod tests {
     fn save_bubbles_request_accepts_existing_bubble_ids_contract() {
         let request = serde_json::from_value::<SaveBubblesRequest>(json!({
             "cloneId": "clone_1",
-            "bubbleIds": ["bubble_1", "bubble_2"],
+            "bubbleIds": ["bubble_1", "bubble_2", "bubble_3", "bubble_4", "bubble_5"],
             "moderationLevel": 7
         }))
         .unwrap();
 
         assert_eq!(request.clone_id.as_deref(), Some("clone_1"));
-        assert_eq!(request.selected_bubble_ids, vec!["bubble_1", "bubble_2"]);
+        assert_eq!(
+            request.selected_bubble_ids,
+            vec!["bubble_1", "bubble_2", "bubble_3", "bubble_4", "bubble_5"]
+        );
         assert_eq!(request.moderation_level, Some(7));
     }
 
