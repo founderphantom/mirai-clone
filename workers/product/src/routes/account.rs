@@ -6,6 +6,7 @@ use crate::services::accounts::{
     account_usage_limits, upsert_account_from_identity, EntitlementSnapshot, UsageLimits,
     VerifiedIdentity,
 };
+use crate::services::generation_usage::{usage_snapshot, GenerationUsageSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use worker::{Request, Response, Result as WorkerResult, RouteContext};
@@ -57,10 +58,12 @@ pub async fn get_account(req: Request, ctx: RouteContext<()>) -> WorkerResult<Re
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AccountUsageResponse {
     clones: Vec<UsageBucket>,
     generations: Vec<UsageBucket>,
     media: Vec<UsageBucket>,
+    generation_usage: GenerationUsageSnapshot,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -117,11 +120,13 @@ pub async fn get_usage(req: Request, ctx: RouteContext<()>) -> WorkerResult<Resp
         vec![json!(user_id)],
     )
     .await?;
+    let generation_usage = usage_snapshot(&db, user_id, &auth.plan, 10, 50).await?;
 
     Response::from_json(&AccountUsageResponse {
         clones,
         generations,
         media,
+        generation_usage,
     })
 }
 
@@ -196,4 +201,35 @@ fn env_var(ctx: &RouteContext<()>, name: &str) -> Option<String> {
         .ok()
         .map(|value| value.to_string())
         .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AccountUsageResponse, UsageBucket};
+    use crate::services::generation_usage::GenerationUsageSnapshot;
+
+    #[test]
+    fn account_usage_response_includes_generation_usage_contract() {
+        let response = AccountUsageResponse {
+            clones: Vec::<UsageBucket>::new(),
+            generations: Vec::<UsageBucket>::new(),
+            media: Vec::<UsageBucket>::new(),
+            generation_usage: GenerationUsageSnapshot {
+                images_today: 3,
+                daily_limit: 10,
+                remaining: 7,
+                limit_resets_at: "2026-05-12T00:00:00.000Z".to_string(),
+            },
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+
+        assert_eq!(value["generationUsage"]["imagesToday"], 3);
+        assert_eq!(value["generationUsage"]["dailyLimit"], 10);
+        assert_eq!(value["generationUsage"]["remaining"], 7);
+        assert_eq!(
+            value["generationUsage"]["limitResetsAt"],
+            "2026-05-12T00:00:00.000Z"
+        );
+    }
 }

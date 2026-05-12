@@ -644,6 +644,22 @@ mod tests {
     }
 
     #[test]
+    fn bubble_selection_requires_five_unique_ids_for_research() {
+        let selected = unique_selected_bubble_ids(vec![
+            "bubble_1".to_string(),
+            "bubble_2".to_string(),
+            "bubble_2".to_string(),
+            "bubble_3".to_string(),
+            "bubble_4".to_string(),
+            "bubble_5".to_string(),
+        ]);
+
+        assert_eq!(selected.len(), 5);
+        assert!(valid_selected_bubble_count(selected.len()));
+        assert!(!valid_selected_bubble_count(selected.len() - 1));
+    }
+
+    #[test]
     fn all_requested_bubbles_must_match_available_bubbles() {
         assert!(all_requested_bubbles_matched(
             &["bubble_1".to_string(), "bubble_2".to_string()],

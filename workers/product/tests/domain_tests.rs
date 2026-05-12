@@ -741,6 +741,19 @@ fn daily_generation_limits_follow_plan() {
 }
 
 #[test]
+fn default_bubbles_provide_enough_unique_research_choices() {
+    let bubbles = default_bubbles();
+    let unique_slugs = bubbles
+        .iter()
+        .map(|bubble| bubble.slug.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert!(bubbles.len() >= 5);
+    assert_eq!(unique_slugs.len(), bubbles.len());
+    assert!(bubbles.iter().all(|bubble| !bubble.search_queries.is_empty()));
+}
+
+#[test]
 fn influence_accumulates_likes_and_dislikes_from_metadata() {
     let influence = accumulate_influence(&[
         SwipeMetadata {
