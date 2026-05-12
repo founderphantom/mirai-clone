@@ -68,4 +68,39 @@ mod tests {
         assert!(value.get("user_id").is_none());
         assert!(value.get("idempotency_key").is_none());
     }
+
+    #[test]
+    fn generation_messages_serialize_blitz_fields_as_camel_case() {
+        let message = GenerationMessage::GenerateBlitzBatch {
+            batch_id: "batch_1".to_string(),
+            clone_id: "clone_1".to_string(),
+            user_id: "user_1".to_string(),
+            idempotency_key: "blitz_gen:batch_1".to_string(),
+            visual_reference_ids: vec!["vref_1".to_string()],
+            provider_soul_id: "soul_1".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(message).unwrap(),
+            json!({
+                "type": "generate_blitz_batch",
+                "batchId": "batch_1",
+                "cloneId": "clone_1",
+                "userId": "user_1",
+                "idempotencyKey": "blitz_gen:batch_1",
+                "visualReferenceIds": ["vref_1"],
+                "providerSoulId": "soul_1"
+            })
+        );
+
+        let poll = GenerationMessage::PollGeneration {
+            job_id: "gen_1".to_string(),
+            batch_id: "batch_1".to_string(),
+            attempt: 1,
+            max_attempts: 30,
+        };
+        assert_eq!(
+            serde_json::to_value(poll).unwrap()["type"],
+            json!("poll_generation")
+        );
+    }
 }

@@ -5,7 +5,7 @@ pub mod domain;
 mod env;
 mod http;
 mod providers;
-pub mod queues;
+mod queues;
 pub mod routes;
 pub mod services;
 

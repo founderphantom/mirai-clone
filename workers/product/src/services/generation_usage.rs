@@ -56,6 +56,25 @@ pub async fn reserve_image(
     pro_daily_limit: u32,
 ) -> WorkerResult<bool> {
     let usage_date = current_utc_date();
+    reserve_image_for_date(
+        db,
+        user_id,
+        plan,
+        free_daily_limit,
+        pro_daily_limit,
+        &usage_date,
+    )
+    .await
+}
+
+pub async fn reserve_image_for_date(
+    db: &D1Database,
+    user_id: &str,
+    plan: &str,
+    free_daily_limit: u32,
+    pro_daily_limit: u32,
+    usage_date: &str,
+) -> WorkerResult<bool> {
     let daily_limit = daily_generation_limit(plan, free_daily_limit, pro_daily_limit);
     let now = now_iso_string();
 
@@ -108,6 +127,14 @@ pub async fn reserve_image(
 
 pub async fn refund_image(db: &D1Database, user_id: &str) -> WorkerResult<()> {
     let usage_date = current_utc_date();
+    refund_image_for_date(db, user_id, &usage_date).await
+}
+
+pub async fn refund_image_for_date(
+    db: &D1Database,
+    user_id: &str,
+    usage_date: &str,
+) -> WorkerResult<()> {
     let now = now_iso_string();
     db::exec(
         db,
