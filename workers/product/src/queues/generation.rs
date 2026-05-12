@@ -211,10 +211,7 @@ async fn generate_blitz_batch(
             .await?;
             continue;
         }
-        if let Err(error) = mark_generation_usage_reserved(db, &job_id, &usage_date).await {
-            refund_image_for_date(db, user_id, &usage_date).await?;
-            return Err(error);
-        }
+        persist_generation_usage_marker_or_refund(db, &job_id, user_id, &usage_date).await?;
 
         if let Err(error) = submit_generation_job(
             db,
@@ -351,7 +348,6 @@ async fn submit_generation_job(
     };
 
     if let Some(final_url) = final_image_url(&result.raw_json) {
-        record_provider_generation_response(db, job_id, &result.raw_json).await?;
         if let Err(error) =
             complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await
         {
@@ -421,7 +417,6 @@ async fn retry_provider_submission_from_poll(
     };
 
     if let Some(final_url) = final_image_url(&result.raw_json) {
-        record_provider_generation_response(db, job_id, &result.raw_json).await?;
         if let Err(error) =
             complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await
         {
@@ -553,10 +548,7 @@ async fn ensure_generation_usage_reserved(
         return Ok(false);
     }
 
-    if let Err(error) = mark_generation_usage_reserved(db, &job.id, &usage_date).await {
-        refund_image_for_date(db, &job.user_id, &usage_date).await?;
-        return Err(error);
-    }
+    persist_generation_usage_marker_or_refund(db, &job.id, &job.user_id, &usage_date).await?;
     Ok(true)
 }
 
@@ -718,7 +710,6 @@ async fn poll_generation(
     };
 
     if let Some(final_url) = final_image_url(&result.raw_json) {
-        record_provider_generation_response(db, job_id, &result.raw_json).await?;
         if let Err(error) =
             complete_generation_job(db, env, job_id, &final_url, &result.raw_json).await
         {
@@ -825,6 +816,8 @@ async fn complete_generation_job(
         }
         return Ok(());
     }
+
+    record_completion_response(db, job_id, raw_response).await?;
 
     let (bytes, content_type) = download_generated_image(provider_url).await?;
     let media_id = generation_media_id(job_id);
@@ -1312,20 +1305,50 @@ async fn mark_generation_job_submitting(db: &D1Database, job_id: &str) -> Worker
     .await
 }
 
+async fn persist_generation_usage_marker_or_refund(
+    db: &D1Database,
+    job_id: &str,
+    user_id: &str,
+    usage_date: &str,
+) -> WorkerResult<()> {
+    match mark_generation_usage_reserved(db, job_id, usage_date).await {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            refund_image_for_date(db, user_id, usage_date).await?;
+            let Some(job) = load_generation_job_by_id(db, job_id).await? else {
+                return Err(Error::RustError(
+                    "generation_usage_marker_missing_after_reservation".to_string(),
+                ));
+            };
+            if request_has_usage_reservation_marker(&job.request_json) {
+                Ok(())
+            } else {
+                Err(Error::RustError(
+                    "generation_usage_marker_missing_after_reservation".to_string(),
+                ))
+            }
+        }
+        Err(error) => {
+            refund_image_for_date(db, user_id, usage_date).await?;
+            Err(error)
+        }
+    }
+}
+
 async fn mark_generation_usage_reserved(
     db: &D1Database,
     job_id: &str,
     usage_date: &str,
-) -> WorkerResult<()> {
+) -> WorkerResult<bool> {
     let now = now_iso_string();
-    db::exec(
+    let result = db::run(
         db,
         r#"
         UPDATE generation_jobs
         SET request_json = json_set(
               CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,
               '$.usageReserved',
-              1,
+              json('true'),
               '$.usageReservedAt',
               ?,
               '$.usageReservedDate',
@@ -1333,10 +1356,22 @@ async fn mark_generation_usage_reserved(
             ),
             updated_at = ?
         WHERE id = ?
+          AND json_extract(
+            CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,
+            '$.usageReservedAt'
+          ) IS NULL
+          AND COALESCE(
+            json_extract(
+              CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,
+              '$.usageReserved'
+            ),
+            0
+          ) != 1
         "#,
         vec![json!(now), json!(usage_date), json!(now), json!(job_id)],
     )
-    .await
+    .await?;
+    Ok(changed_rows(&result)? > 0)
 }
 
 async fn claim_generation_completion(db: &D1Database, job_id: &str) -> WorkerResult<bool> {
@@ -1375,6 +1410,12 @@ async fn record_provider_generation_response(
     job_id: &str,
     raw_json: &Value,
 ) -> WorkerResult<()> {
+    if final_image_url(raw_json).is_some() {
+        return Err(Error::RustError(
+            "final_generation_response_must_complete".to_string(),
+        ));
+    }
+
     let provider_job_ids = provider_job_ids(raw_json);
     let now = now_iso_string();
     db::exec(
@@ -1385,7 +1426,7 @@ async fn record_provider_generation_response(
             response_json = ?,
             updated_at = ?
         WHERE id = ?
-          AND status IN ('queued', 'submitted', 'completing')
+          AND status IN ('queued', 'submitted')
         "#,
         vec![
             json!(provider_job_ids.to_string()),
@@ -1393,6 +1434,26 @@ async fn record_provider_generation_response(
             json!(now),
             json!(job_id),
         ],
+    )
+    .await
+}
+
+async fn record_completion_response(
+    db: &D1Database,
+    job_id: &str,
+    raw_json: &Value,
+) -> WorkerResult<()> {
+    let now = now_iso_string();
+    db::exec(
+        db,
+        r#"
+        UPDATE generation_jobs
+        SET response_json = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND status = 'completing'
+        "#,
+        vec![json!(raw_json.to_string()), json!(now), json!(job_id)],
     )
     .await
 }
@@ -1511,8 +1572,13 @@ async fn repair_failed_generation_refund(
     job_id: &str,
     job: &GenerationJobRow,
 ) -> WorkerResult<()> {
-    if response_has_usage_refund_marker(&job.response_json) {
-        return Ok(());
+    match failed_generation_refund_action(&job.request_json, &job.response_json) {
+        FailedGenerationRefundAction::AlreadyHandled => return Ok(()),
+        FailedGenerationRefundAction::MarkSkipped => {
+            mark_generation_refund_skipped(db, job_id, "usage_reservation_missing").await?;
+            return Ok(());
+        }
+        FailedGenerationRefundAction::Refund => {}
     }
 
     let usage_date =
@@ -1572,6 +1638,41 @@ async fn repair_failed_generation_refund(
     .await?;
 
     Ok(())
+}
+
+async fn mark_generation_refund_skipped(
+    db: &D1Database,
+    job_id: &str,
+    reason: &str,
+) -> WorkerResult<()> {
+    let now = now_iso_string();
+    db::exec(
+        db,
+        r#"
+        UPDATE generation_jobs
+        SET response_json = json_set(
+              CASE WHEN json_valid(response_json) THEN response_json ELSE '{}' END,
+              '$.usageRefundSkipped',
+              1,
+              '$.usageRefundSkippedAt',
+              ?,
+              '$.usageRefundSkippedReason',
+              ?
+            ),
+            updated_at = ?
+        WHERE id = ?
+          AND json_extract(
+            CASE WHEN json_valid(response_json) THEN response_json ELSE '{}' END,
+            '$.usageRefundSkippedAt'
+          ) IS NULL
+          AND json_extract(
+            CASE WHEN json_valid(response_json) THEN response_json ELSE '{}' END,
+            '$.usageRefundedAt'
+          ) IS NULL
+        "#,
+        vec![json!(now), json!(reason), json!(now), json!(job_id)],
+    )
+    .await
 }
 
 async fn load_generation_job(
@@ -1895,6 +1996,28 @@ fn response_has_usage_refund_marker(response_json: &str) -> bool {
         .is_some()
 }
 
+fn response_has_usage_refund_skip_marker(response_json: &str) -> bool {
+    serde_json::from_str::<Value>(response_json)
+        .ok()
+        .and_then(|value| json_string_at(&value, "/usageRefundSkippedAt"))
+        .is_some()
+}
+
+fn failed_generation_refund_action(
+    request_json: &str,
+    response_json: &str,
+) -> FailedGenerationRefundAction {
+    if response_has_usage_refund_marker(response_json)
+        || response_has_usage_refund_skip_marker(response_json)
+    {
+        FailedGenerationRefundAction::AlreadyHandled
+    } else if request_has_usage_reservation_marker(request_json) {
+        FailedGenerationRefundAction::Refund
+    } else {
+        FailedGenerationRefundAction::MarkSkipped
+    }
+}
+
 fn response_json_has_final_url(response_json: &str) -> bool {
     serde_json::from_str::<Value>(response_json)
         .ok()
@@ -1958,6 +2081,13 @@ enum CompletionClaimFailureAction {
     RepairFailed,
     RetryLater,
     Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedGenerationRefundAction {
+    AlreadyHandled,
+    Refund,
+    MarkSkipped,
 }
 
 fn poll_failure_action(attempt: u8, max_attempts: u8) -> PollFailureAction {
@@ -2067,13 +2197,14 @@ fn completion_updated_at_is_stale(updated_at: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_claim_failure_action, deterministic_generation_job_id, final_image_url,
-        generation_media_id, generation_output_id, poll_failure_action, provider_asset_id,
-        provider_ids_are_empty, provider_job_ids, provider_status,
-        request_has_usage_reservation_marker, response_has_usage_refund_marker,
-        retryable_completion_attempt, submission_arguments_from_request,
-        terminal_failure_allowed_for_job_state, usage_date_from_request_json,
-        CompletionClaimFailureAction, PollFailureAction,
+        completion_claim_failure_action, deterministic_generation_job_id,
+        failed_generation_refund_action, final_image_url, generation_media_id,
+        generation_output_id, poll_failure_action, provider_asset_id, provider_ids_are_empty,
+        provider_job_ids, provider_status, request_has_usage_reservation_marker,
+        response_has_usage_refund_marker, retryable_completion_attempt,
+        submission_arguments_from_request, terminal_failure_allowed_for_job_state,
+        usage_date_from_request_json, CompletionClaimFailureAction, FailedGenerationRefundAction,
+        PollFailureAction,
     };
     use serde_json::json;
 
@@ -2174,6 +2305,32 @@ mod tests {
         ));
         assert!(!request_has_usage_reservation_marker("{}"));
         assert!(!request_has_usage_reservation_marker("not json"));
+    }
+
+    #[test]
+    fn failed_generation_refund_action_requires_usage_reservation_marker() {
+        assert_eq!(
+            failed_generation_refund_action(r#"{"usageReserved":true}"#, r#"{}"#),
+            FailedGenerationRefundAction::Refund
+        );
+        assert_eq!(
+            failed_generation_refund_action(r#"{}"#, r#"{}"#),
+            FailedGenerationRefundAction::MarkSkipped
+        );
+        assert_eq!(
+            failed_generation_refund_action(
+                r#"{"usageReserved":true}"#,
+                r#"{"usageRefundedAt":"2026-05-11T01:02:03.000Z"}"#
+            ),
+            FailedGenerationRefundAction::AlreadyHandled
+        );
+        assert_eq!(
+            failed_generation_refund_action(
+                r#"{}"#,
+                r#"{"usageRefundSkippedAt":"2026-05-11T01:02:03.000Z"}"#
+            ),
+            FailedGenerationRefundAction::AlreadyHandled
+        );
     }
 
     #[test]
