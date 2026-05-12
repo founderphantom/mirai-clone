@@ -3,7 +3,7 @@ use crate::http::error::ApiError;
 use crate::services::blitz;
 use crate::services::generation_usage::usage_snapshot;
 use serde::Deserialize;
-use worker::{Request, Response, Result as WorkerResult, RouteContext, Url};
+use worker::{Error, Request, Response, Result as WorkerResult, RouteContext, Url};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,7 +27,10 @@ pub async fn current(req: Request, ctx: RouteContext<()>) -> WorkerResult<Respon
     };
     let db = ctx.env.d1("DB")?;
     let usage = usage_snapshot(&db, &auth.user_id, &auth.plan, 10, 50).await?;
-    let response = blitz::current_batch(&db, &auth.user_id, &clone_id, usage).await?;
+    let response = match blitz::current_batch(&db, &auth.user_id, &clone_id, usage).await {
+        Ok(response) => response,
+        Err(error) => return map_or_return_blitz_error(error),
+    };
     Response::from_json(&response)
 }
 
@@ -58,16 +61,7 @@ pub async fn swipe(mut req: Request, ctx: RouteContext<()>) -> WorkerResult<Resp
     .await
     {
         Ok(response) => Response::from_json(&response),
-        Err(error) if error.to_string().contains("duplicate_swipe") => {
-            ApiError::bad_request("duplicate_swipe", "This Blitz card was already swiped.")
-                .to_response()
-        }
-        Err(error) if error.to_string().contains("invalid_swipe_action") => ApiError::bad_request(
-            "invalid_swipe_action",
-            "Swipe action must be like or dislike.",
-        )
-        .to_response(),
-        Err(error) => Err(error),
+        Err(error) => map_or_return_blitz_error(error),
     }
 }
 
@@ -106,4 +100,66 @@ pub fn parse_history_limit(value: Option<&str>) -> u32 {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(10)
         .clamp(1, 50)
+}
+
+pub fn map_blitz_service_error(error: &Error) -> Option<ApiError> {
+    let Error::RustError(code) = error else {
+        return None;
+    };
+
+    match code.as_str() {
+        "clone_not_found" => Some(ApiError::not_found(
+            "clone_not_found",
+            "Clone profile was not found.",
+        )),
+        "blitz_batch_not_found" => Some(ApiError::not_found(
+            "blitz_batch_not_found",
+            "Blitz batch was not found.",
+        )),
+        "generation_output_not_found" => Some(ApiError::not_found(
+            "generation_output_not_found",
+            "Blitz output was not found.",
+        )),
+        "blitz_batch_not_swipeable" => Some(ApiError::bad_request(
+            "blitz_batch_not_swipeable",
+            "This Blitz batch is not ready for swipes.",
+        )),
+        "invalid_swipe_action" => Some(ApiError::bad_request(
+            "invalid_swipe_action",
+            "Swipe action must be like or dislike.",
+        )),
+        "duplicate_swipe" => Some(ApiError::conflict(
+            "duplicate_swipe",
+            "This Blitz card was already swiped.",
+        )),
+        "provider_soul_id_missing" => Some(ApiError::bad_request(
+            "provider_soul_id_missing",
+            "Soul is not ready for Blitz generation.",
+        )),
+        _ => None,
+    }
+}
+
+fn map_or_return_blitz_error(error: Error) -> WorkerResult<Response> {
+    if let Some(api_error) = map_blitz_service_error(&error) {
+        return api_error.to_response();
+    }
+
+    Err(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SwipeRequest;
+
+    #[test]
+    fn swipe_request_deserializes_camel_case_fields() {
+        let request: SwipeRequest =
+            serde_json::from_str(r#"{"batchId":"batch_1","outputId":"output_1","action":"like"}"#)
+                .expect("camelCase swipe request should deserialize");
+
+        assert_eq!(request.batch_id, "batch_1");
+        assert_eq!(request.output_id, "output_1");
+        assert_eq!(request.action, "like");
+    }
 }

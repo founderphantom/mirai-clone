@@ -14,7 +14,9 @@ use mirai_product_worker::domain::media_validation::{
     is_supported_reference_content_type, validate_reference_count, ReferenceCountError,
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
-use mirai_product_worker::routes::blitz::{parse_history_limit, read_required_query_param};
+use mirai_product_worker::routes::blitz::{
+    map_blitz_service_error, parse_history_limit, read_required_query_param,
+};
 use mirai_product_worker::routes::onboarding::default_bubbles;
 use mirai_product_worker::scrapecreators::{
     build_scrape_request, normalize_instagram_reels_search, normalize_tiktok_keyword_search,
@@ -57,6 +59,41 @@ fn blitz_history_limit_is_bounded() {
     assert_eq!(parse_history_limit(Some("2")), 2);
     assert_eq!(parse_history_limit(Some("500")), 50);
     assert_eq!(parse_history_limit(Some("bad")), 10);
+}
+
+#[test]
+fn blitz_route_maps_known_service_errors_to_api_errors() {
+    let cases = [
+        ("clone_not_found", 404, "clone_not_found"),
+        ("blitz_batch_not_found", 404, "blitz_batch_not_found"),
+        (
+            "generation_output_not_found",
+            404,
+            "generation_output_not_found",
+        ),
+        (
+            "blitz_batch_not_swipeable",
+            400,
+            "blitz_batch_not_swipeable",
+        ),
+        ("invalid_swipe_action", 400, "invalid_swipe_action"),
+        ("duplicate_swipe", 409, "duplicate_swipe"),
+        ("provider_soul_id_missing", 400, "provider_soul_id_missing"),
+    ];
+
+    for (sentinel, status, code) in cases {
+        let error = worker::Error::RustError(sentinel.to_string());
+        let mapped = map_blitz_service_error(&error).expect("known sentinel should map");
+        assert_eq!(mapped.status, status, "{sentinel} status");
+        assert_eq!(mapped.code, code, "{sentinel} code");
+    }
+}
+
+#[test]
+fn blitz_route_does_not_swallow_unknown_service_errors() {
+    let error = worker::Error::RustError("duplicate_swipe_extra_context".to_string());
+
+    assert!(map_blitz_service_error(&error).is_none());
 }
 
 #[test]
