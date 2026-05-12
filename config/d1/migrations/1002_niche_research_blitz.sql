@@ -277,6 +277,7 @@ INSERT INTO blitz_config (key, value, updated_at) VALUES
   ('recent_search_window', 'last-year', '2026-05-11T00:00:00.000Z'),
   ('cluster_relevance_threshold', '0.72', '2026-05-11T00:00:00.000Z'),
   ('expand_clusters_per_run', '4', '2026-05-11T00:00:00.000Z'),
+  ('max_seed_queries_per_platform', '8', '2026-05-11T00:00:00.000Z'),
   ('max_reference_generation_uses', '4', '2026-05-11T00:00:00.000Z'),
   ('scrape_delay_ms', '1000', '2026-05-11T00:00:00.000Z');
 

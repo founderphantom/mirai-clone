@@ -286,10 +286,10 @@ pub async fn save_bubbles(mut req: Request, ctx: RouteContext<()>) -> WorkerResu
     };
 
     let requested_bubble_ids = unique_selected_bubble_ids(input.selected_bubble_ids);
-    if requested_bubble_ids.is_empty() || requested_bubble_ids.len() > 5 {
+    if !valid_selected_bubble_count(requested_bubble_ids.len()) {
         return ApiError::bad_request(
             "invalid_bubble_selection",
-            "Choose between 1 and 5 inspiration bubbles.",
+            "Choose exactly 5 inspiration bubbles.",
         )
         .to_response();
     }
@@ -546,6 +546,10 @@ fn all_requested_bubbles_matched(matched_ids: &[String], requested_ids: &[String
     matched_ids.len() == requested_ids.len()
 }
 
+fn valid_selected_bubble_count(count: usize) -> bool {
+    count == 5
+}
+
 async fn count_inspiration_pool(db: &worker::D1Database, user_id: &str) -> WorkerResult<u32> {
     let row = db::first::<CountRow>(
         db,
@@ -596,8 +600,8 @@ fn now_iso_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_requested_bubbles_matched, unique_selected_bubble_ids, BubbleResponse, CloneSummary,
-        SaveBubblesRequest,
+        all_requested_bubbles_matched, unique_selected_bubble_ids, valid_selected_bubble_count,
+        BubbleResponse, CloneSummary, SaveBubblesRequest,
     };
     use serde_json::json;
 
@@ -626,6 +630,14 @@ mod tests {
             ]),
             vec!["bubble_1".to_string(), "bubble_2".to_string()]
         );
+    }
+
+    #[test]
+    fn selected_bubble_count_must_be_exactly_five_for_research() {
+        assert!(!valid_selected_bubble_count(0));
+        assert!(!valid_selected_bubble_count(4));
+        assert!(valid_selected_bubble_count(5));
+        assert!(!valid_selected_bubble_count(6));
     }
 
     #[test]

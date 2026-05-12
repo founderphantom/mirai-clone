@@ -102,7 +102,10 @@ async fn handle_seed_from_bubbles(
 ) -> WorkerResult<()> {
     let ai = env.ai("AI")?;
     let Some(clone) = load_clone_for_research(db, &user_id, &clone_id).await? else {
-        return Err(Error::RustError("clone_not_found".to_string()));
+        web_sys::console::log_1(
+            &format!("ack niche research for missing clone user={user_id} clone={clone_id}").into(),
+        );
+        return Ok(());
     };
     let bubbles = load_selected_bubbles(db, &user_id, &clone_id, &bubble_ids).await?;
     let selected_bubble_ids = bubbles
@@ -147,6 +150,9 @@ async fn handle_seed_from_bubbles(
     if seed_queries.is_empty() {
         seed_queries = fallback_bubble_seed_queries(&excluded_terms, &allowed_platforms);
     }
+    let max_seed_queries_per_platform =
+        config_u32(&config, "max_seed_queries_per_platform", 8) as usize;
+    seed_queries = cap_seed_queries_per_platform(seed_queries, max_seed_queries_per_platform);
     insert_seed_queries(db, &user_id, &clone_id, &seed_queries).await?;
 
     run_scrape_pass(db, env, &user_id, &clone_id, &seed_queries, &config).await?;
@@ -161,6 +167,8 @@ async fn handle_seed_from_bubbles(
     )
     .await?;
     if !deeper_queries.is_empty() {
+        let deeper_queries =
+            cap_seed_queries_per_platform(deeper_queries, max_seed_queries_per_platform);
         insert_seed_queries(db, &user_id, &clone_id, &deeper_queries).await?;
         run_scrape_pass(db, env, &user_id, &clone_id, &deeper_queries, &config).await?;
     }
@@ -355,9 +363,17 @@ async fn run_scrape_pass(
             "region": region,
         });
         let source_id = upsert_discovery_source(db, &request_url, &params, &now).await?;
-        let raw = fetch_scrapecreators_json(&request_url, &api_key)
-            .await
-            .map_err(|error| Error::RustError(error.to_string()))?;
+        let raw = match fetch_scrapecreators_json(&request_url, &api_key).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                mark_discovery_source_failed(db, &source_id, &params, &error.to_string(), &now)
+                    .await?;
+                if scrape_delay_ms > 0 {
+                    Delay::from(Duration::from_millis(scrape_delay_ms as u64)).await;
+                }
+                continue;
+            }
+        };
         let items = normalize_discovery_items(platform, &raw);
         insert_discovery_items(
             db,
@@ -369,6 +385,7 @@ async fn run_scrape_pass(
             allow_unknown_source_date,
         )
         .await?;
+        mark_discovery_source_fresh(db, &source_id, &params, &now).await?;
 
         if scrape_delay_ms > 0 {
             Delay::from(Duration::from_millis(scrape_delay_ms as u64)).await;
@@ -392,10 +409,16 @@ async fn upsert_discovery_source(
     db::exec(
         db,
         r#"
-        INSERT OR IGNORE INTO discovery_sources (
+        INSERT INTO discovery_sources (
           id, provider, source, params_json, refreshed_at, status
         )
-        VALUES (?, 'scrapecreators', ?, ?, ?, 'fresh')
+        VALUES (?, 'scrapecreators', ?, ?, ?, 'refreshing')
+        ON CONFLICT(id) DO UPDATE SET
+          provider = 'scrapecreators',
+          source = excluded.source,
+          params_json = excluded.params_json,
+          refreshed_at = excluded.refreshed_at,
+          status = 'refreshing'
         "#,
         vec![
             json!(source_id),
@@ -406,20 +429,52 @@ async fn upsert_discovery_source(
     )
     .await?;
 
-    let row = db::first::<IdRow>(
+    Ok(source_id)
+}
+
+async fn mark_discovery_source_fresh(
+    db: &D1Database,
+    source_id: &str,
+    params: &Value,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
         db,
         r#"
-        SELECT id
-        FROM discovery_sources
-        WHERE provider = 'scrapecreators'
-          AND source = ?
-          AND params_json = ?
-        LIMIT 1
+        UPDATE discovery_sources
+        SET status = 'fresh',
+            refreshed_at = ?,
+            params_json = ?
+        WHERE id = ?
         "#,
-        vec![json!(source), json!(params_json)],
+        vec![json!(now), json!(params.to_string()), json!(source_id)],
     )
-    .await?;
-    Ok(row.map(|row| row.id).unwrap_or(source_id))
+    .await
+}
+
+async fn mark_discovery_source_failed(
+    db: &D1Database,
+    source_id: &str,
+    params: &Value,
+    error: &str,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        r#"
+        UPDATE discovery_sources
+        SET status = 'failed',
+            refreshed_at = ?,
+            params_json = ?
+        WHERE id = ?
+        "#,
+        vec![
+            json!(now),
+            json!(failed_source_params_json(params, error, now)),
+            json!(source_id),
+        ],
+    )
+    .await
 }
 
 async fn insert_discovery_items(
@@ -452,7 +507,7 @@ async fn insert_discovery_items(
         db::exec(
             db,
             r#"
-            INSERT OR IGNORE INTO discovery_items (
+            INSERT INTO discovery_items (
               id,
               source_id,
               external_id,
@@ -470,6 +525,17 @@ async fn insert_discovery_items(
               created_at
             )
             VALUES (?, ?, ?, ?, 'short_video', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_id, platform, external_id) DO UPDATE SET
+              media_type = excluded.media_type,
+              title = excluded.title,
+              author_handle = excluded.author_handle,
+              thumbnail_url = excluded.thumbnail_url,
+              image_url = excluded.image_url,
+              source_url = excluded.source_url,
+              source_published_at = excluded.source_published_at,
+              metrics_json = excluded.metrics_json,
+              raw_json = excluded.raw_json,
+              discovered_at = excluded.discovered_at
             "#,
             vec![
                 json!(item_id),
@@ -792,7 +858,18 @@ async fn run_visual_reference_selection(
             .await?;
             continue;
         }
+        let visual_reference_id = visual_reference_id_for(clone_id, &candidate_id);
         if visual_reference_exists(db, clone_id, &candidate_id).await? {
+            insert_inspiration_pool_row(
+                db,
+                user_id,
+                clone_id,
+                &visual_reference_id,
+                &item.id,
+                1.0,
+                &now,
+            )
+            .await?;
             continue;
         }
 
@@ -987,7 +1064,7 @@ async fn insert_visual_reference(
     moderation_level: u8,
     now: &str,
 ) -> WorkerResult<String> {
-    let id = deterministic_id("visual_ref", &[clone_id, candidate_id]);
+    let id = visual_reference_id_for(clone_id, candidate_id);
     db::exec(
         db,
         r#"
@@ -1290,6 +1367,25 @@ fn fallback_bubble_seed_queries(
         .collect()
 }
 
+fn cap_seed_queries_per_platform(seeds: Vec<SeedQuery>, max_per_platform: usize) -> Vec<SeedQuery> {
+    if max_per_platform == 0 {
+        return Vec::new();
+    }
+
+    let mut counts = HashMap::<String, usize>::new();
+    seeds
+        .into_iter()
+        .filter(|seed| {
+            let count = counts.entry(seed.platform.clone()).or_insert(0);
+            if *count >= max_per_platform {
+                return false;
+            }
+            *count += 1;
+            true
+        })
+        .collect()
+}
+
 fn scrape_platform_for_seed(seed: &SeedQuery) -> Option<ScrapePlatform> {
     match seed.platform.as_str() {
         "tiktok" if seed.query.trim_start().starts_with('#') => Some(ScrapePlatform::TikTokHashtag),
@@ -1463,11 +1559,35 @@ fn freshness_status(freshness: &FreshnessDecision) -> String {
         .unwrap_or_else(|| "unknown_rejected".to_string())
 }
 
+fn failed_source_params_json(params: &Value, error: &str, now: &str) -> String {
+    let mut params = params.clone();
+    let compact_error = compact_error_text(error);
+    if let Some(object) = params.as_object_mut() {
+        object.insert("lastError".to_string(), json!(compact_error));
+        object.insert("lastErrorAt".to_string(), json!(now));
+    } else {
+        params = json!({
+            "lastError": compact_error,
+            "lastErrorAt": now,
+        });
+    }
+    params.to_string()
+}
+
+fn compact_error_text(error: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 280;
+    error.chars().take(MAX_ERROR_CHARS).collect()
+}
+
 fn env_var(env: &Env, key: &str, error_code: &str) -> WorkerResult<String> {
     match env.var(key) {
         Ok(value) if !value.to_string().trim().is_empty() => Ok(value.to_string()),
         _ => Err(Error::RustError(error_code.to_string())),
     }
+}
+
+fn visual_reference_id_for(clone_id: &str, candidate_id: &str) -> String {
+    deterministic_id("visual_ref", &[clone_id, candidate_id])
 }
 
 fn deterministic_id(prefix: &str, parts: &[&str]) -> String {
@@ -1662,6 +1782,41 @@ mod tests {
         assert!(sql.contains("di.platform IN (SELECT value FROM json_each(?))"));
         assert_eq!(filter_json, "[\"instagram\"]");
         assert!(!filter_json.contains("tiktok"));
+    }
+
+    #[test]
+    fn seed_queries_are_capped_per_platform() {
+        let seeds = (0..5)
+            .map(|index| SeedQuery {
+                query: format!("tiktok query {index}"),
+                platform: "tiktok".to_string(),
+                source: "seed_extraction".to_string(),
+                raw_json: json!({}),
+            })
+            .chain((0..3).map(|index| SeedQuery {
+                query: format!("instagram query {index}"),
+                platform: "instagram".to_string(),
+                source: "seed_extraction".to_string(),
+                raw_json: json!({}),
+            }))
+            .collect::<Vec<_>>();
+
+        let capped = cap_seed_queries_per_platform(seeds, 2);
+
+        assert_eq!(
+            capped
+                .iter()
+                .filter(|seed| seed.platform == "tiktok")
+                .count(),
+            2
+        );
+        assert_eq!(
+            capped
+                .iter()
+                .filter(|seed| seed.platform == "instagram")
+                .count(),
+            2
+        );
     }
 
     #[test]

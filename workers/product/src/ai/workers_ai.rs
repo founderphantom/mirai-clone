@@ -186,8 +186,58 @@ fn decode_choice_content<T: DeserializeOwned>(
 }
 
 fn decode_json_text<T: DeserializeOwned>(text: &str, label: &str) -> WorkerResult<T> {
-    serde_json::from_str(text)
-        .map_err(|error| Error::RustError(format!("failed to decode {label}: {error}")))
+    match serde_json::from_str(text) {
+        Ok(decoded) => Ok(decoded),
+        Err(first_error) => {
+            let Some(snippet) = extract_json_snippet(text) else {
+                return Err(Error::RustError(format!(
+                    "failed to decode {label}: {first_error}"
+                )));
+            };
+            serde_json::from_str(snippet)
+                .map_err(|error| Error::RustError(format!("failed to decode {label}: {error}")))
+        }
+    }
+}
+
+fn extract_json_snippet(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if let Some(unfenced) = strip_json_fence(trimmed) {
+        return Some(unfenced);
+    }
+
+    let object = json_span(trimmed, '{', '}');
+    let array = json_span(trimmed, '[', ']');
+    match (object, array) {
+        (Some(object), Some(array)) => {
+            if object.0 <= array.0 {
+                Some(&trimmed[object.0..=object.1])
+            } else {
+                Some(&trimmed[array.0..=array.1])
+            }
+        }
+        (Some(object), None) => Some(&trimmed[object.0..=object.1]),
+        (None, Some(array)) => Some(&trimmed[array.0..=array.1]),
+        (None, None) => None,
+    }
+}
+
+fn strip_json_fence(text: &str) -> Option<&str> {
+    let text = text.strip_prefix("```")?;
+    let text = text.trim_start();
+    let text = text
+        .strip_prefix("json")
+        .or_else(|| text.strip_prefix("JSON"))
+        .unwrap_or(text);
+    let text = text.trim_start();
+    let text = text.strip_suffix("```")?;
+    Some(text.trim())
+}
+
+fn json_span(text: &str, open: char, close: char) -> Option<(usize, usize)> {
+    let start = text.find(open)?;
+    let end = text.rfind(close)?;
+    (end >= start).then_some((start, end))
 }
 
 pub fn seed_extraction_prompt(niche: &str, excluded_terms: &[String]) -> String {
@@ -334,6 +384,20 @@ mod tests {
         let decoded: DecodeFixture = decode_structured_response(response).unwrap();
 
         assert_eq!(decoded, DecodeFixture { ok: true });
+    }
+
+    #[test]
+    fn decodes_fenced_or_prose_wrapped_json_content() {
+        let fenced: DecodeFixture =
+            decode_json_text("```json\n{\"ok\":true}\n```", "workers ai fenced fixture").unwrap();
+        assert_eq!(fenced, DecodeFixture { ok: true });
+
+        let prose: DecodeFixture = decode_json_text(
+            "Here is the structured result:\n{\"ok\":true}\nDone.",
+            "workers ai prose fixture",
+        )
+        .unwrap();
+        assert_eq!(prose, DecodeFixture { ok: true });
     }
 
     #[test]
