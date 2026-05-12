@@ -3,6 +3,7 @@ use crate::domain::blitz::{
     accumulate_influence, select_visual_references, SwipeMetadata, VisualReferenceForSelection,
 };
 use crate::queues::messages::GenerationMessage;
+use crate::queues::niche_research::NicheResearchMessage;
 use crate::services::generation_usage::GenerationUsageSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -180,6 +181,13 @@ pub fn trigger_influence_cutoff_batch_number(current_batch_number: u32) -> u32 {
     current_batch_number.saturating_sub(2)
 }
 
+pub fn stored_batch_size_for_selected_refs(
+    configured_batch_size: u32,
+    selected_reference_count: usize,
+) -> u32 {
+    u32::try_from(selected_reference_count).unwrap_or(configured_batch_size)
+}
+
 pub async fn create_next_batch(
     db: &D1Database,
     env: &Env,
@@ -235,17 +243,17 @@ pub async fn create_next_batch(
 
     if selected.is_empty() {
         env.queue("NICHE_RESEARCH_QUEUE")?
-            .send(json!({
-                "type": "refresh_pool",
-                "userId": user_id,
-                "cloneId": clone_id,
-                "reason": "pool_depleted",
-            }))
+            .send(NicheResearchMessage::RefreshPool {
+                user_id: user_id.to_string(),
+                clone_id: clone_id.to_string(),
+                reason: "pool_depleted".to_string(),
+            })
             .await?;
         return Ok(None);
     }
 
     let batch_id = prefixed_id("blitz_batch");
+    let stored_batch_size = stored_batch_size_for_selected_refs(batch_size, selected.len());
     let now = now_iso_string();
     db::exec(
         db,
@@ -267,7 +275,7 @@ pub async fn create_next_batch(
             json!(user_id),
             json!(clone_id),
             json!(next_batch_number),
-            json!(batch_size),
+            json!(stored_batch_size),
             json!(serde_json::to_string(&influence).unwrap_or_else(|_| "{}".to_string())),
             json!(now),
         ],

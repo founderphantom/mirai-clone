@@ -24,7 +24,8 @@ use mirai_product_worker::services::accounts::{
     account_usage_limits, VerifiedIdentity,
 };
 use mirai_product_worker::services::blitz::{
-    next_batch_should_trigger, swipe_action_to_db_value, trigger_influence_cutoff_batch_number,
+    next_batch_should_trigger, stored_batch_size_for_selected_refs, swipe_action_to_db_value,
+    trigger_influence_cutoff_batch_number,
 };
 use mirai_product_worker::services::clones::{handle_with_suffix, slugify_handle};
 use mirai_product_worker::services::media::{media_storage_key, normalize_extension, safe_segment};
@@ -88,6 +89,12 @@ fn influence_for_next_batch_skips_current_batch_feedback() {
     assert_eq!(trigger_influence_cutoff_batch_number(2), 0);
     assert_eq!(trigger_influence_cutoff_batch_number(3), 1);
     assert_eq!(trigger_influence_cutoff_batch_number(4), 2);
+}
+
+#[test]
+fn partial_blitz_batches_store_selected_reference_count() {
+    assert_eq!(stored_batch_size_for_selected_refs(5, 3), 3);
+    assert_eq!(stored_batch_size_for_selected_refs(5, 5), 5);
 }
 
 #[test]
