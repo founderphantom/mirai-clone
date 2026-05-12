@@ -18,7 +18,7 @@ import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { authClient } from "../lib/auth-client";
 import { track } from "../lib/analytics";
 import { api } from "../lib/api";
-import type { Account } from "../types";
+import type { Account, GenerationUsage } from "../types";
 
 type UsageBucket = {
   status?: string;
@@ -30,6 +30,7 @@ type AccountUsage = {
   clones: UsageBucket[];
   generations: UsageBucket[];
   media: UsageBucket[];
+  generationUsage?: GenerationUsage;
 };
 
 export function MeScreen({ account, onSignedOut }: { account: Account; onSignedOut: () => void }) {
@@ -147,7 +148,11 @@ export function MeScreen({ account, onSignedOut }: { account: Account; onSignedO
             <strong>Workspace activity</strong>
           </div>
           <AccountMeter label="Clone profiles" value={stats[0].value} max={5} />
-          <AccountMeter label="Generation jobs" value={stats[1].value} max={24} />
+          <AccountMeter
+            label="Daily generations"
+            value={usage?.generationUsage?.imagesToday || 0}
+            max={usage?.generationUsage?.dailyLimit || 10}
+          />
           <AccountMeter label="Saved assets" value={stats[2].value} max={48} />
         </section>
 

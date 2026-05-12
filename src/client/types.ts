@@ -83,6 +83,36 @@ export type InstagramHarvestJob = {
   clone_id: string | null;
 };
 
+export type BlitzImage = {
+  outputId: string;
+  mediaUrl: string;
+  visualReferenceId: string | null;
+  swipeIndex: number;
+  swiped: boolean;
+};
+
+export type BlitzBatch = {
+  id: string;
+  batchNumber: number;
+  status: string;
+  images: BlitzImage[];
+};
+
+export type GenerationUsage = {
+  imagesToday: number;
+  dailyLimit: number;
+  remaining: number;
+  limitResetsAt: string;
+};
+
+export type BlitzCurrent = {
+  batch: BlitzBatch | null;
+  status?: string | null;
+  progress?: { phase: string; detail: string } | null;
+  usage: GenerationUsage;
+  nextBatchStatus?: string | null;
+};
+
 export type OnboardingState = {
   clones: Clone[];
   activeClone: Clone | null;

@@ -172,7 +172,7 @@ export function AppRouter() {
       onSignedOut={() => setData(null)}
     >
       {effectiveRoute === "onboarding" && <OnboardingScreen onCreated={loadAll} />}
-      {effectiveRoute === "blitz" && <BlitzScreen jobs={data.jobs} />}
+      {effectiveRoute === "blitz" && <BlitzScreen clones={data.clones} selectedCloneId={selectedCloneId} />}
       {effectiveRoute === "create" && (
         <CreateScreen clones={data.clones} selectedCloneId={selectedCloneId} onSubmitted={loadAll} />
       )}

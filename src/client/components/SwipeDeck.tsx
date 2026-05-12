@@ -1,5 +1,5 @@
 import { Heart, RotateCcw, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { track } from "../lib/analytics";
 
 export type SwipeCard = {
@@ -16,13 +16,18 @@ export function SwipeDeck({
 }: {
   cards: SwipeCard[];
   emptyLabel?: string;
-  onSwipe?: (card: SwipeCard, verdict: "like" | "pass") => void;
+  onSwipe?: (card: SwipeCard, verdict: "like" | "dislike") => void;
 }) {
   const [index, setIndex] = useState(0);
+  const cardIds = useMemo(() => cards.map((card) => card.id).join("|"), [cards]);
   const current = cards[index];
   const remaining = useMemo(() => Math.max(0, cards.length - index), [cards.length, index]);
 
-  function swipe(verdict: "like" | "pass") {
+  useEffect(() => {
+    setIndex(0);
+  }, [cardIds]);
+
+  function swipe(verdict: "like" | "dislike") {
     if (!current) return;
     track("blitz_swipe_preview", { cardId: current.id, verdict });
     onSwipe?.(current, verdict);
@@ -51,7 +56,7 @@ export function SwipeDeck({
         </footer>
       </article>
       <div className="swipe-actions">
-        <button className="pass" title="Pass" onClick={() => swipe("pass")}>
+        <button className="pass" title="Dislike" aria-label="Dislike" onClick={() => swipe("dislike")}>
           <X size={24} />
         </button>
         <button className="like" title="Save" onClick={() => swipe("like")}>
