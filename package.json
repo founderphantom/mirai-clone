@@ -21,7 +21,7 @@
     "product:test": "bash scripts/test_product_worker.sh",
     "product:build": "bash scripts/build_product_worker.sh",
     "auth:dev": "wrangler dev -c workers/auth/wrangler.auth.jsonc",
-    "product:dev": "npm run build:client && npm run product:build && wrangler dev -c workers/product/wrangler.product.jsonc",
+    "product:dev": "npm run build:client && npm run product:build && wrangler dev -c workers/product/wrangler.product.jsonc --port 8780",
     "db:migrate:local": "wrangler d1 migrations apply mirai-db --local -c workers/product/wrangler.product.jsonc",
     "db:migrate:remote": "wrangler d1 migrations apply mirai-db --remote -c workers/product/wrangler.product.jsonc",
     "cf-typegen": "wrangler types -c workers/product/wrangler.product.jsonc"

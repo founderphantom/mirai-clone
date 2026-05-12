@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use worker::{D1Database, Env, Error, MessageBatch, MessageExt, Result as WorkerResult};
 
-const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FUFU";
+const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER";
 const HIGGSFIELD_TRAINING_TOOL_VAR: &str = "HIGGSFIELD_MCP_CLONE_TRAINING_TOOL";
 const ACTIVE_LEASE_MINUTES: f64 = 30.0;
 const SUBMITTED_LEASE_MINUTES: f64 = 360.0;

@@ -9,7 +9,7 @@ POLAR_ACCESS_TOKEN=
 POLAR_WEBHOOK_SECRET=
 POLAR_PRO_PRODUCT_ID=
 POLAR_STUDIO_PRODUCT_ID=
-HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FUFU=
+HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER=
 OPENROUTER_API_KEY=
 OPENCODE_GO_API_KEY=
 ```
@@ -28,7 +28,7 @@ python3 scripts/higgsfield_device_auth.py
 The script prints an authorization URL and then, after approval, prints:
 
 ```bash
-wrangler secret put HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FUFU -c workers/product/wrangler.product.jsonc
+wrangler secret put HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER -c workers/product/wrangler.product.jsonc
 ```
 
 Use `--print-token` only when you are ready to pipe the token directly into
