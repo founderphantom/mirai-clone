@@ -23,6 +23,9 @@ use mirai_product_worker::services::accounts::{
     account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
     account_usage_limits, VerifiedIdentity,
 };
+use mirai_product_worker::services::blitz::{
+    next_batch_should_trigger, swipe_action_to_db_value, trigger_influence_cutoff_batch_number,
+};
 use mirai_product_worker::services::clones::{handle_with_suffix, slugify_handle};
 use mirai_product_worker::services::media::{media_storage_key, normalize_extension, safe_segment};
 use mirai_product_worker::services::provider_accounts::{
@@ -60,6 +63,31 @@ fn text_only_models_are_not_chosen_for_vision_tasks() {
     assert_eq!(selected.provider, "workers_ai");
     assert_eq!(selected.model, "@cf/moonshotai/kimi-k2.6");
     assert!(selected.supports_vision);
+}
+
+#[test]
+fn blitz_swipe_actions_accept_like_and_dislike_only() {
+    assert_eq!(swipe_action_to_db_value("like").unwrap(), "like");
+    assert_eq!(swipe_action_to_db_value("dislike").unwrap(), "dislike");
+    assert_eq!(
+        swipe_action_to_db_value("pass").unwrap_err(),
+        "invalid_swipe_action"
+    );
+}
+
+#[test]
+fn first_swipe_triggers_prefetch_once() {
+    assert!(next_batch_should_trigger(0));
+    assert!(!next_batch_should_trigger(1));
+    assert!(!next_batch_should_trigger(4));
+}
+
+#[test]
+fn influence_for_next_batch_skips_current_batch_feedback() {
+    assert_eq!(trigger_influence_cutoff_batch_number(1), 0);
+    assert_eq!(trigger_influence_cutoff_batch_number(2), 0);
+    assert_eq!(trigger_influence_cutoff_batch_number(3), 1);
+    assert_eq!(trigger_influence_cutoff_batch_number(4), 2);
 }
 
 #[test]
