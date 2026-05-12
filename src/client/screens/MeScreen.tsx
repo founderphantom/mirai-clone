@@ -73,6 +73,8 @@ export function MeScreen({ account, onSignedOut }: { account: Account; onSignedO
     }
   }
 
+  const dailyGenerationMeter = dailyGenerationMeterValue(usage?.generationUsage, stats[1].value);
+
   return (
     <div className="me-screen account-screen">
       <section className="account-hero">
@@ -150,8 +152,8 @@ export function MeScreen({ account, onSignedOut }: { account: Account; onSignedO
           <AccountMeter label="Clone profiles" value={stats[0].value} max={5} />
           <AccountMeter
             label="Daily generations"
-            value={usage?.generationUsage?.imagesToday || 0}
-            max={usage?.generationUsage?.dailyLimit || 10}
+            value={dailyGenerationMeter.value}
+            max={dailyGenerationMeter.max}
           />
           <AccountMeter label="Saved assets" value={stats[2].value} max={48} />
         </section>
@@ -247,4 +249,11 @@ function AccountAction({
 function sumBuckets(buckets: UsageBucket[] | undefined) {
   if (!buckets) return 0;
   return buckets.reduce((total, bucket) => total + Number(bucket.count || 0), 0);
+}
+
+export function dailyGenerationMeterValue(generationUsage: GenerationUsage | undefined, generationBucketTotal: number) {
+  return {
+    value: generationUsage?.imagesToday ?? generationBucketTotal,
+    max: generationUsage?.dailyLimit ?? 24
+  };
 }

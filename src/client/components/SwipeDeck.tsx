@@ -16,9 +16,10 @@ export function SwipeDeck({
 }: {
   cards: SwipeCard[];
   emptyLabel?: string;
-  onSwipe?: (card: SwipeCard, verdict: "like" | "dislike") => void;
+  onSwipe?: (card: SwipeCard, verdict: "like" | "dislike") => void | Promise<void>;
 }) {
   const [index, setIndex] = useState(0);
+  const [pending, setPending] = useState(false);
   const cardIds = useMemo(() => cards.map((card) => card.id).join("|"), [cards]);
   const current = cards[index];
   const remaining = useMemo(() => Math.max(0, cards.length - index), [cards.length, index]);
@@ -27,11 +28,18 @@ export function SwipeDeck({
     setIndex(0);
   }, [cardIds]);
 
-  function swipe(verdict: "like" | "dislike") {
-    if (!current) return;
+  async function swipe(verdict: "like" | "dislike") {
+    if (!current || pending) return;
+    setPending(true);
     track("blitz_swipe_preview", { cardId: current.id, verdict });
-    onSwipe?.(current, verdict);
-    setIndex((value) => value + 1);
+    try {
+      await onSwipe?.(current, verdict);
+      setIndex((value) => value + 1);
+    } catch {
+      return;
+    } finally {
+      setPending(false);
+    }
   }
 
   if (!current) {
@@ -56,10 +64,10 @@ export function SwipeDeck({
         </footer>
       </article>
       <div className="swipe-actions">
-        <button className="pass" title="Dislike" aria-label="Dislike" onClick={() => swipe("dislike")}>
+        <button className="pass" title="Dislike" aria-label="Dislike" disabled={pending} onClick={() => void swipe("dislike")}>
           <X size={24} />
         </button>
-        <button className="like" title="Save" onClick={() => swipe("like")}>
+        <button className="like" title="Save" aria-label="Save" disabled={pending} onClick={() => void swipe("like")}>
           <Heart size={24} />
         </button>
       </div>
