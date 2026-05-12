@@ -165,7 +165,16 @@ async fn handle_seed_from_bubbles(
         run_scrape_pass(db, env, &user_id, &clone_id, &deeper_queries, &config).await?;
     }
 
-    run_visual_reference_selection(db, &ai, &user_id, &clone_id, moderation_level, &config).await?;
+    run_visual_reference_selection(
+        db,
+        &ai,
+        &user_id,
+        &clone_id,
+        moderation_level,
+        &allowed_platforms,
+        &config,
+    )
+    .await?;
     finalize_research_pool(db, env, &clone, &clone_id, &config).await
 }
 
@@ -493,7 +502,7 @@ async fn run_knowledge_and_clustering(
     allowed_platforms: &[String],
     config: &HashMap<String, String>,
 ) -> WorkerResult<Vec<SeedQuery>> {
-    let items = load_clone_discovery_items(db, clone_id, 120).await?;
+    let items = load_clone_discovery_items(db, clone_id, allowed_platforms, 120).await?;
     let now = now_iso_string();
     let freshness_years = config_u32(config, "freshness_window_years", 5) as i64;
     let allow_unknown_source_date = config_bool(config, "allow_unknown_source_date", true);
@@ -552,11 +561,28 @@ async fn run_knowledge_and_clustering(
 async fn load_clone_discovery_items(
     db: &D1Database,
     clone_id: &str,
+    allowed_platforms: &[String],
     limit: u32,
 ) -> WorkerResult<Vec<DiscoveryItemRow>> {
+    if allowed_platforms.is_empty() {
+        return Ok(Vec::new());
+    }
+
     db::all(
         db,
-        r#"
+        clone_discovery_items_sql(),
+        vec![
+            json!(clone_id),
+            json!(clone_id),
+            json!(discovery_platform_filter_json(allowed_platforms)),
+            json!(limit),
+        ],
+    )
+    .await
+}
+
+fn clone_discovery_items_sql() -> &'static str {
+    r#"
         SELECT
           di.id,
           di.platform,
@@ -579,12 +605,15 @@ async fn load_clone_discovery_items(
         INNER JOIN discovery_sources ds
           ON ds.id = di.source_id
         WHERE json_extract(ds.params_json, '$.cloneId') = ?
+          AND di.platform IN (SELECT value FROM json_each(?))
         ORDER BY COALESCE(di.source_published_at, di.discovered_at) DESC
         LIMIT ?
-        "#,
-        vec![json!(clone_id), json!(clone_id), json!(limit)],
-    )
-    .await
+        "#
+}
+
+fn discovery_platform_filter_json(allowed_platforms: &[String]) -> String {
+    serde_json::to_string(&normalize_platforms(allowed_platforms))
+        .unwrap_or_else(|_| "[]".to_string())
 }
 
 async fn insert_knowledge_rows(
@@ -719,9 +748,10 @@ async fn run_visual_reference_selection(
     user_id: &str,
     clone_id: &str,
     moderation_level: u8,
+    allowed_platforms: &[String],
     config: &HashMap<String, String>,
 ) -> WorkerResult<()> {
-    let items = load_clone_discovery_items(db, clone_id, 200).await?;
+    let items = load_clone_discovery_items(db, clone_id, allowed_platforms, 200).await?;
     let now = now_iso_string();
     let freshness_years = config_u32(config, "freshness_window_years", 5) as i64;
     let allow_unknown_source_date = config_bool(config, "allow_unknown_source_date", false);
@@ -1622,6 +1652,16 @@ mod tests {
 
         assert!(!expanded.is_empty());
         assert!(expanded.iter().all(|seed| seed.platform == "instagram"));
+    }
+
+    #[test]
+    fn clone_discovery_item_load_sql_filters_requested_platforms_with_json_each() {
+        let sql = clone_discovery_items_sql();
+        let filter_json = discovery_platform_filter_json(&["instagram".to_string()]);
+
+        assert!(sql.contains("di.platform IN (SELECT value FROM json_each(?))"));
+        assert_eq!(filter_json, "[\"instagram\"]");
+        assert!(!filter_json.contains("tiktok"));
     }
 
     #[test]
