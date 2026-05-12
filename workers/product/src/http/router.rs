@@ -75,6 +75,9 @@ pub async fn run(req: Request, env: Env) -> WorkerResult<Response> {
         )
         .post_async("/api/media/upload", crate::routes::media::upload_media)
         .get_async("/api/media/:id", crate::routes::media::get_media)
+        .get_async("/api/blitz/current", crate::routes::blitz::current)
+        .post_async("/api/blitz/swipe", crate::routes::blitz::swipe)
+        .get_async("/api/blitz/history", crate::routes::blitz::history)
         .get_async("/api/health", |_req, ctx| async move { health(ctx).await })
         .run(req, env)
         .await

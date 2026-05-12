@@ -14,6 +14,7 @@ use mirai_product_worker::domain::media_validation::{
     is_supported_reference_content_type, validate_reference_count, ReferenceCountError,
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
+use mirai_product_worker::routes::blitz::{parse_history_limit, read_required_query_param};
 use mirai_product_worker::routes::onboarding::default_bubbles;
 use mirai_product_worker::scrapecreators::{
     build_scrape_request, normalize_instagram_reels_search, normalize_tiktok_keyword_search,
@@ -34,6 +35,29 @@ use mirai_product_worker::services::provider_accounts::{
     choose_provider_account, ProviderAccountCandidate,
 };
 use serde_json::json;
+
+#[test]
+fn blitz_route_query_helpers_validate_required_values() {
+    let url = worker::Url::parse("https://mirai.test/api/blitz/current?clone_id=clone_1").unwrap();
+    assert_eq!(
+        read_required_query_param(&url, "clone_id").unwrap(),
+        "clone_1".to_string()
+    );
+
+    let missing = worker::Url::parse("https://mirai.test/api/blitz/current").unwrap();
+    assert_eq!(
+        read_required_query_param(&missing, "clone_id").unwrap_err(),
+        "missing_clone_id"
+    );
+}
+
+#[test]
+fn blitz_history_limit_is_bounded() {
+    assert_eq!(parse_history_limit(None), 10);
+    assert_eq!(parse_history_limit(Some("2")), 2);
+    assert_eq!(parse_history_limit(Some("500")), 50);
+    assert_eq!(parse_history_limit(Some("bad")), 10);
+}
 
 #[test]
 fn text_only_models_are_not_chosen_for_vision_tasks() {
