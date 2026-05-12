@@ -80,6 +80,9 @@ struct ConfigRow {
 #[derive(Debug, Deserialize)]
 struct ExistingBatchRow {
     id: String,
+    status: String,
+    batch_number: u32,
+    batch_size: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +164,24 @@ struct CountRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct BatchGenerationCountsRow {
+    job_count: u32,
+    output_count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistingSwipeRow {
+    action: String,
+    visual_reference_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LatestBatchStateRow {
+    status: String,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct StatusRow {
     status: String,
 }
@@ -188,6 +209,18 @@ pub fn stored_batch_size_for_selected_refs(
     u32::try_from(selected_reference_count).unwrap_or(configured_batch_size)
 }
 
+pub fn first_swipe_prefetch_should_run(swipes_after_attempt: u32) -> bool {
+    swipes_after_attempt == 1
+}
+
+pub fn batch_complete_for_swipe_count(swipe_count: u32, output_count: u32) -> bool {
+    output_count > 0 && swipe_count >= output_count
+}
+
+pub fn swipeable_batch_status(status: &str) -> bool {
+    matches!(status, "active" | "ready")
+}
+
 pub async fn create_next_batch(
     db: &D1Database,
     env: &Env,
@@ -203,6 +236,9 @@ pub async fn create_next_batch(
         db,
         r#"
         SELECT id
+             , status
+             , batch_number
+             , batch_size
         FROM blitz_batches
         WHERE user_id = ?
           AND clone_id = ?
@@ -214,6 +250,8 @@ pub async fn create_next_batch(
     )
     .await?
     {
+        ensure_batch_generation_enqueued(db, env, user_id, clone_id, provider_soul_id, &existing)
+            .await?;
         return Ok(Some(existing.id));
     }
 
@@ -231,34 +269,27 @@ pub async fn create_next_batch(
     .map(|row| row.next_batch_number)
     .unwrap_or(1);
 
-    let influence = load_influence(db, clone_id, next_batch_number).await?;
-    let references = load_visual_references_for_selection(db, clone_id).await?;
-    let selected = select_visual_references(
-        &references,
-        &influence,
+    let (influence, selected) = select_references_for_batch(
+        db,
+        clone_id,
+        next_batch_number,
         batch_size as usize,
         max_reference_generation_uses,
-        &now_iso_string(),
-    );
+    )
+    .await?;
 
     if selected.is_empty() {
-        env.queue("NICHE_RESEARCH_QUEUE")?
-            .send(NicheResearchMessage::RefreshPool {
-                user_id: user_id.to_string(),
-                clone_id: clone_id.to_string(),
-                reason: "pool_depleted".to_string(),
-            })
-            .await?;
+        enqueue_refresh_pool(env, user_id, clone_id, "pool_depleted").await?;
         return Ok(None);
     }
 
     let batch_id = prefixed_id("blitz_batch");
     let stored_batch_size = stored_batch_size_for_selected_refs(batch_size, selected.len());
     let now = now_iso_string();
-    db::exec(
+    let insert_result = db::run(
         db,
         r#"
-        INSERT INTO blitz_batches (
+        INSERT OR IGNORE INTO blitz_batches (
           id,
           user_id,
           clone_id,
@@ -281,21 +312,29 @@ pub async fn create_next_batch(
         ],
     )
     .await?;
+    if changed_rows(&insert_result)? == 0 {
+        let Some(existing) = load_batch_by_number(db, user_id, clone_id, next_batch_number).await?
+        else {
+            return Err(Error::RustError("blitz_batch_insert_conflict".to_string()));
+        };
+        ensure_batch_generation_enqueued(db, env, user_id, clone_id, provider_soul_id, &existing)
+            .await?;
+        return Ok(Some(existing.id));
+    }
 
     let selected_ids = selected
         .into_iter()
         .map(|reference| reference.id)
         .collect::<Vec<_>>();
-    env.queue("GENERATION_QUEUE")?
-        .send(GenerationMessage::GenerateBlitzBatch {
-            batch_id: batch_id.clone(),
-            clone_id: clone_id.to_string(),
-            user_id: user_id.to_string(),
-            idempotency_key: format!("blitz_gen:{batch_id}"),
-            visual_reference_ids: selected_ids,
-            provider_soul_id: provider_soul_id.to_string(),
-        })
-        .await?;
+    enqueue_generation_batch(
+        env,
+        user_id,
+        clone_id,
+        &batch_id,
+        provider_soul_id,
+        selected_ids,
+    )
+    .await?;
 
     Ok(Some(batch_id))
 }
@@ -335,15 +374,24 @@ pub async fn current_batch(
     .await?;
 
     let Some(batch) = batch else {
+        if let Some(latest) = load_latest_unavailable_batch(db, user_id, clone_id).await? {
+            return Ok(BlitzCurrentResponse {
+                batch: None,
+                status: Some(latest.status.clone()),
+                progress: Some(progress_for_unavailable_batch(&latest)),
+                usage,
+                next_batch_status: Some(latest.status),
+            });
+        }
+
+        let status = provider_niche_research_status(&clone.provider_config_json)
+            .unwrap_or_else(|| "generating".to_string());
         return Ok(BlitzCurrentResponse {
             batch: None,
-            status: Some("generating".to_string()),
-            progress: Some(BlitzProgressResponse {
-                phase: "niche_research".to_string(),
-                detail: "Scraping visual references...".to_string(),
-            }),
+            status: Some(status.clone()),
+            progress: Some(progress_for_provider_status(&status)),
             usage,
-            next_batch_status: provider_niche_research_status(&clone.provider_config_json),
+            next_batch_status: Some(status),
         });
     };
 
@@ -354,6 +402,9 @@ pub async fn current_batch(
         batch.status.clone()
     };
     let images = load_batch_images(db, user_id, clone_id, &batch.id).await?;
+    if !images.is_empty() {
+        sync_batch_size_to_output_count(db, &batch.id, images.len() as u32).await?;
+    }
     let next_batch_status =
         load_next_batch_status(db, user_id, clone_id, batch.batch_number).await?;
 
@@ -384,11 +435,13 @@ pub async fn record_swipe(
     let Some(batch) = load_batch_for_swipe(db, user_id, batch_id).await? else {
         return Err(Error::RustError("blitz_batch_not_found".to_string()));
     };
+    if !swipeable_batch_status(&batch.status) {
+        return Err(Error::RustError("blitz_batch_not_swipeable".to_string()));
+    }
     let Some(output) = load_output_for_swipe(db, user_id, batch_id, output_id).await? else {
         return Err(Error::RustError("generation_output_not_found".to_string()));
     };
     let swipe_index = load_swipe_index(db, batch_id, output_id).await?;
-    let existing_swipes = count_swipes(db, batch_id).await?;
     let now = now_iso_string();
     let metadata = json!({
         "aestheticTags": parse_string_array(output.aesthetic_tags_json.as_deref().unwrap_or("[]")),
@@ -431,23 +484,14 @@ pub async fn record_swipe(
         ],
     )
     .await?;
-    if changed_rows(&insert_result)? == 0 {
-        return Err(Error::RustError("duplicate_swipe".to_string()));
-    }
+    let inserted_new_swipe = changed_rows(&insert_result)? > 0;
 
-    increment_batch_action_count(db, batch_id, action).await?;
-    if action == "like" {
-        if let Some(visual_reference_id) = metadata
-            .get("visualReferenceId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        {
-            mark_visual_reference_liked(db, visual_reference_id, &now).await?;
-        }
-    }
+    repair_batch_swipe_counts(db, batch_id).await?;
+    repair_liked_reference_for_output(db, batch_id, output_id, &now).await?;
 
     let mut next_batch_triggered = false;
-    if next_batch_should_trigger(existing_swipes) {
+    let swipe_count = count_swipes(db, batch_id).await?;
+    if first_swipe_prefetch_should_run(swipe_count) {
         let provider_soul_id = batch
             .provider_soul_id
             .as_deref()
@@ -460,15 +504,27 @@ pub async fn record_swipe(
                 .is_some();
     }
 
-    let swipe_count = count_swipes(db, batch_id).await?;
-    let batch_complete = swipe_count >= batch.batch_size;
+    let output_count = count_swipeable_outputs(db, batch_id).await?;
+    if output_count > 0 {
+        sync_batch_size_to_output_count(db, batch_id, output_count).await?;
+    }
+    let progress_total = if output_count > 0 {
+        output_count
+    } else {
+        batch.batch_size
+    };
+    let batch_complete = batch_complete_for_swipe_count(swipe_count, output_count);
     if batch_complete {
         mark_batch_completed(db, batch_id, &now).await?;
     }
 
+    if !inserted_new_swipe {
+        return Err(Error::RustError("duplicate_swipe".to_string()));
+    }
+
     Ok(SwipeResponse {
         swipe_index,
-        batch_progress: format!("{swipe_count}/{}", batch.batch_size),
+        batch_progress: format!("{swipe_count}/{progress_total}"),
         batch_complete,
         next_batch_triggered,
     })
@@ -522,6 +578,175 @@ async fn load_blitz_selection_config(db: &D1Database) -> WorkerResult<(u32, u32)
     }
 
     Ok((batch_size, max_reference_generation_uses))
+}
+
+async fn ensure_batch_generation_enqueued(
+    db: &D1Database,
+    env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    provider_soul_id: &str,
+    batch: &ExistingBatchRow,
+) -> WorkerResult<()> {
+    let counts = load_batch_generation_counts(db, &batch.id).await?;
+    if counts.job_count > 0 || counts.output_count > 0 {
+        return Ok(());
+    }
+    if !matches!(batch.status.as_str(), "pending" | "generating" | "ready") {
+        return Ok(());
+    }
+
+    let (_, max_reference_generation_uses) = load_blitz_selection_config(db).await?;
+    let (influence, selected) = select_references_for_batch(
+        db,
+        clone_id,
+        batch.batch_number,
+        batch.batch_size as usize,
+        max_reference_generation_uses,
+    )
+    .await?;
+
+    if selected.is_empty() {
+        enqueue_refresh_pool(env, user_id, clone_id, "pool_depleted").await?;
+        return Ok(());
+    }
+
+    let selected_ids = selected
+        .iter()
+        .map(|reference| reference.id.clone())
+        .collect::<Vec<_>>();
+    let stored_batch_size =
+        stored_batch_size_for_selected_refs(batch.batch_size, selected_ids.len());
+    db::exec(
+        db,
+        r#"
+        UPDATE blitz_batches
+        SET status = 'generating',
+            batch_size = ?,
+            influence_json = ?
+        WHERE id = ?
+          AND status IN ('pending', 'generating', 'ready')
+        "#,
+        vec![
+            json!(stored_batch_size),
+            json!(serde_json::to_string(&influence).unwrap_or_else(|_| "{}".to_string())),
+            json!(&batch.id),
+        ],
+    )
+    .await?;
+
+    enqueue_generation_batch(
+        env,
+        user_id,
+        clone_id,
+        &batch.id,
+        provider_soul_id,
+        selected_ids,
+    )
+    .await
+}
+
+async fn select_references_for_batch(
+    db: &D1Database,
+    clone_id: &str,
+    batch_number: u32,
+    batch_size: usize,
+    max_reference_generation_uses: u32,
+) -> WorkerResult<(
+    crate::domain::blitz::Influence,
+    Vec<VisualReferenceForSelection>,
+)> {
+    let influence = load_influence(db, clone_id, batch_number).await?;
+    let references = load_visual_references_for_selection(db, clone_id).await?;
+    let selected = select_visual_references(
+        &references,
+        &influence,
+        batch_size,
+        max_reference_generation_uses,
+        &now_iso_string(),
+    );
+
+    Ok((influence, selected))
+}
+
+async fn enqueue_generation_batch(
+    env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    batch_id: &str,
+    provider_soul_id: &str,
+    visual_reference_ids: Vec<String>,
+) -> WorkerResult<()> {
+    env.queue("GENERATION_QUEUE")?
+        .send(GenerationMessage::GenerateBlitzBatch {
+            batch_id: batch_id.to_string(),
+            clone_id: clone_id.to_string(),
+            user_id: user_id.to_string(),
+            idempotency_key: format!("blitz_gen:{batch_id}"),
+            visual_reference_ids,
+            provider_soul_id: provider_soul_id.to_string(),
+        })
+        .await
+}
+
+async fn enqueue_refresh_pool(
+    env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    reason: &str,
+) -> WorkerResult<()> {
+    env.queue("NICHE_RESEARCH_QUEUE")?
+        .send(NicheResearchMessage::RefreshPool {
+            user_id: user_id.to_string(),
+            clone_id: clone_id.to_string(),
+            reason: reason.to_string(),
+        })
+        .await
+}
+
+async fn load_batch_by_number(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    batch_number: u32,
+) -> WorkerResult<Option<ExistingBatchRow>> {
+    db::first::<ExistingBatchRow>(
+        db,
+        r#"
+        SELECT id, status, batch_number, batch_size
+        FROM blitz_batches
+        WHERE user_id = ?
+          AND clone_id = ?
+          AND batch_number = ?
+        "#,
+        vec![json!(user_id), json!(clone_id), json!(batch_number)],
+    )
+    .await
+}
+
+async fn load_batch_generation_counts(
+    db: &D1Database,
+    batch_id: &str,
+) -> WorkerResult<BatchGenerationCountsRow> {
+    let row = db::first::<BatchGenerationCountsRow>(
+        db,
+        r#"
+        SELECT
+          COUNT(DISTINCT gj.id) AS job_count,
+          COUNT(DISTINCT go.id) AS output_count
+        FROM generation_jobs gj
+        LEFT JOIN generation_outputs go
+          ON go.job_id = gj.id
+        WHERE gj.blitz_batch_id = ?
+        "#,
+        vec![json!(batch_id)],
+    )
+    .await?;
+
+    Ok(row.unwrap_or(BatchGenerationCountsRow {
+        job_count: 0,
+        output_count: 0,
+    }))
 }
 
 async fn load_influence(
@@ -634,6 +859,61 @@ async fn load_user_clone(
     .await
 }
 
+async fn load_latest_unavailable_batch(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+) -> WorkerResult<Option<LatestBatchStateRow>> {
+    db::first::<LatestBatchStateRow>(
+        db,
+        r#"
+        SELECT status, error_message
+        FROM blitz_batches
+        WHERE user_id = ?
+          AND clone_id = ?
+          AND status IN ('pending', 'generating', 'failed')
+        ORDER BY batch_number DESC, created_at DESC
+        LIMIT 1
+        "#,
+        vec![json!(user_id), json!(clone_id)],
+    )
+    .await
+}
+
+fn progress_for_unavailable_batch(batch: &LatestBatchStateRow) -> BlitzProgressResponse {
+    match batch.status.as_str() {
+        "failed" => BlitzProgressResponse {
+            phase: "generation_failed".to_string(),
+            detail: batch
+                .error_message
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "Image generation failed.".to_string()),
+        },
+        "pending" => BlitzProgressResponse {
+            phase: "generation".to_string(),
+            detail: "Preparing image generation...".to_string(),
+        },
+        _ => BlitzProgressResponse {
+            phase: "generation".to_string(),
+            detail: "Generating images...".to_string(),
+        },
+    }
+}
+
+fn progress_for_provider_status(status: &str) -> BlitzProgressResponse {
+    let detail = match status {
+        "refresh_requested" => "Refreshing visual references...",
+        "failed" => "Visual reference refresh failed.",
+        _ => "Scraping visual references...",
+    };
+
+    BlitzProgressResponse {
+        phase: "niche_research".to_string(),
+        detail: detail.to_string(),
+    }
+}
+
 async fn mark_batch_active(db: &D1Database, batch_id: &str) -> WorkerResult<()> {
     let now = now_iso_string();
     db::exec(
@@ -737,6 +1017,7 @@ async fn load_batch_for_swipe(
           ON cp.id = bb.clone_id
         WHERE bb.id = ?
           AND bb.user_id = ?
+          AND bb.status IN ('ready', 'active')
           AND cp.deleted_at IS NULL
         "#,
         vec![json!(batch_id), json!(user_id)],
@@ -810,30 +1091,96 @@ async fn count_swipes(db: &D1Database, batch_id: &str) -> WorkerResult<u32> {
     Ok(row.map(|row| row.count).unwrap_or(0))
 }
 
-async fn increment_batch_action_count(
-    db: &D1Database,
-    batch_id: &str,
-    action: &str,
-) -> WorkerResult<()> {
-    let column = if action == "like" {
-        "like_count"
-    } else {
-        "dislike_count"
-    };
-    db::exec(
+async fn count_swipeable_outputs(db: &D1Database, batch_id: &str) -> WorkerResult<u32> {
+    let row = db::first::<CountRow>(
         db,
-        &format!(
-            r#"
-            UPDATE blitz_batches
-            SET {column} = {column} + 1
-            WHERE id = ?
-              AND completed_at IS NULL
-              AND status != 'completed'
-            "#
-        ),
+        r#"
+        SELECT COUNT(*) AS count
+        FROM generation_outputs go
+        INNER JOIN generation_jobs gj
+          ON gj.id = go.job_id
+        WHERE gj.blitz_batch_id = ?
+        "#,
         vec![json!(batch_id)],
     )
     .await?;
+    Ok(row.map(|row| row.count).unwrap_or(0))
+}
+
+async fn sync_batch_size_to_output_count(
+    db: &D1Database,
+    batch_id: &str,
+    output_count: u32,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        r#"
+        UPDATE blitz_batches
+        SET batch_size = ?
+        WHERE id = ?
+          AND batch_size != ?
+        "#,
+        vec![json!(output_count), json!(batch_id), json!(output_count)],
+    )
+    .await
+}
+
+async fn repair_batch_swipe_counts(db: &D1Database, batch_id: &str) -> WorkerResult<()> {
+    db::exec(
+        db,
+        r#"
+        UPDATE blitz_batches
+        SET like_count = (
+              SELECT COUNT(*)
+              FROM blitz_swipes
+              WHERE batch_id = ?
+                AND action = 'like'
+            ),
+            dislike_count = (
+              SELECT COUNT(*)
+              FROM blitz_swipes
+              WHERE batch_id = ?
+                AND action = 'dislike'
+            )
+        WHERE id = ?
+        "#,
+        vec![json!(batch_id), json!(batch_id), json!(batch_id)],
+    )
+    .await
+}
+
+async fn repair_liked_reference_for_output(
+    db: &D1Database,
+    batch_id: &str,
+    output_id: &str,
+    now: &str,
+) -> WorkerResult<()> {
+    let Some(swipe) = db::first::<ExistingSwipeRow>(
+        db,
+        r#"
+        SELECT action, visual_reference_id
+        FROM blitz_swipes
+        WHERE batch_id = ?
+          AND generation_output_id = ?
+        LIMIT 1
+        "#,
+        vec![json!(batch_id), json!(output_id)],
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    if swipe.action == "like" {
+        if let Some(visual_reference_id) = swipe
+            .visual_reference_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            mark_visual_reference_liked(db, visual_reference_id, now).await?;
+        }
+    }
 
     Ok(())
 }

@@ -24,7 +24,8 @@ use mirai_product_worker::services::accounts::{
     account_usage_limits, VerifiedIdentity,
 };
 use mirai_product_worker::services::blitz::{
-    next_batch_should_trigger, stored_batch_size_for_selected_refs, swipe_action_to_db_value,
+    batch_complete_for_swipe_count, first_swipe_prefetch_should_run, next_batch_should_trigger,
+    stored_batch_size_for_selected_refs, swipe_action_to_db_value, swipeable_batch_status,
     trigger_influence_cutoff_batch_number,
 };
 use mirai_product_worker::services::clones::{handle_with_suffix, slugify_handle};
@@ -95,6 +96,30 @@ fn influence_for_next_batch_skips_current_batch_feedback() {
 fn partial_blitz_batches_store_selected_reference_count() {
     assert_eq!(stored_batch_size_for_selected_refs(5, 3), 3);
     assert_eq!(stored_batch_size_for_selected_refs(5, 5), 5);
+}
+
+#[test]
+fn blitz_prefetch_repair_runs_when_only_one_swipe_exists() {
+    assert!(first_swipe_prefetch_should_run(1));
+    assert!(!first_swipe_prefetch_should_run(0));
+    assert!(!first_swipe_prefetch_should_run(2));
+}
+
+#[test]
+fn blitz_completion_uses_actual_swipeable_output_count() {
+    assert!(batch_complete_for_swipe_count(3, 3));
+    assert!(batch_complete_for_swipe_count(5, 3));
+    assert!(!batch_complete_for_swipe_count(3, 5));
+    assert!(!batch_complete_for_swipe_count(0, 0));
+}
+
+#[test]
+fn blitz_swipes_are_limited_to_ready_or_active_batches() {
+    assert!(swipeable_batch_status("ready"));
+    assert!(swipeable_batch_status("active"));
+    assert!(!swipeable_batch_status("generating"));
+    assert!(!swipeable_batch_status("failed"));
+    assert!(!swipeable_batch_status("completed"));
 }
 
 #[test]
