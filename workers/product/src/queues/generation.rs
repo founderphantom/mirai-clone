@@ -2,7 +2,9 @@ use crate::db;
 use crate::providers::higgsfield_auth::{refresh_access_token, validate_access_token};
 use crate::providers::higgsfield_mcp::{call_tool, HiggsfieldMcpError};
 use crate::queues::messages::GenerationMessage;
-use crate::services::generation_usage::{current_utc_date, reserve_image_for_date};
+use crate::services::generation_usage::{
+    current_utc_date, refund_image_for_date, reserve_image_for_date,
+};
 use crate::services::media::media_storage_key;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -43,6 +45,7 @@ struct GenerationJobRow {
     provider_job_ids_json: String,
     request_json: String,
     response_json: String,
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +211,10 @@ async fn generate_blitz_batch(
             .await?;
             continue;
         }
+        if let Err(error) = mark_generation_usage_reserved(db, &job_id, &usage_date).await {
+            refund_image_for_date(db, user_id, &usage_date).await?;
+            return Err(error);
+        }
 
         if let Err(error) = submit_generation_job(
             db,
@@ -258,6 +265,13 @@ async fn submit_generation_job(
     provider_soul_id: &str,
     materialized_reference_url: &str,
 ) -> WorkerResult<()> {
+    let Some(job) = load_generation_job_by_id(db, job_id).await? else {
+        return Ok(());
+    };
+    if !ensure_generation_usage_reserved(db, &job).await? {
+        return Ok(());
+    }
+
     let tool_name = generation_tool_name(env)?;
     let token = match refresh_access_token(env, HIGGSFIELD_REFRESH_SECRET_NAME).await {
         Ok(token) => token,
@@ -304,27 +318,7 @@ async fn submit_generation_job(
 
     mark_generation_job_submitting(db, job_id).await?;
 
-    let request = db::first::<GenerationJobRow>(
-        db,
-        r#"
-        SELECT
-          id,
-          user_id,
-          clone_id,
-          blitz_batch_id,
-          input_visual_reference_id,
-          status,
-          provider_job_ids_json,
-          request_json,
-          response_json
-        FROM generation_jobs
-        WHERE id = ?
-        "#,
-        vec![json!(job_id)],
-    )
-    .await?
-    .and_then(|job| serde_json::from_str::<Value>(&job.request_json).ok())
-    .unwrap_or_else(|| {
+    let request = serde_json::from_str::<Value>(&job.request_json).unwrap_or_else(|_| {
         json!({
             "jobId": job_id,
             "batchId": batch_id,
@@ -511,6 +505,61 @@ async fn resume_existing_generation_job(
     Ok(())
 }
 
+async fn ensure_generation_usage_reserved(
+    db: &D1Database,
+    job: &GenerationJobRow,
+) -> WorkerResult<bool> {
+    if request_has_usage_reservation_marker(&job.request_json) {
+        return Ok(true);
+    }
+
+    let Some(clone) = load_ready_clone_plan(db, &job.clone_id, &job.user_id).await? else {
+        fail_generation_job_without_refund(
+            db,
+            &job.id,
+            "generation_clone_unavailable",
+            "Clone was unavailable before generation usage could be reserved.",
+        )
+        .await?;
+        if let Some(batch_id) = job.blitz_batch_id.as_deref() {
+            mark_batch_ready_if_complete(db, batch_id).await?;
+        }
+        return Ok(false);
+    };
+
+    let (free_daily_limit, pro_daily_limit) = load_generation_limits(db).await?;
+    let usage_date =
+        usage_date_from_request_json(&job.request_json).unwrap_or_else(current_utc_date);
+    if !reserve_image_for_date(
+        db,
+        &job.user_id,
+        &clone.plan,
+        free_daily_limit,
+        pro_daily_limit,
+        &usage_date,
+    )
+    .await?
+    {
+        fail_generation_job_without_refund(
+            db,
+            &job.id,
+            "daily_generation_limit_reached",
+            "Daily generation limit was reached before provider submission.",
+        )
+        .await?;
+        if let Some(batch_id) = job.blitz_batch_id.as_deref() {
+            mark_batch_ready_if_complete(db, batch_id).await?;
+        }
+        return Ok(false);
+    }
+
+    if let Err(error) = mark_generation_usage_reserved(db, &job.id, &usage_date).await {
+        refund_image_for_date(db, &job.user_id, &usage_date).await?;
+        return Err(error);
+    }
+    Ok(true)
+}
+
 async fn poll_generation(
     db: &D1Database,
     env: &Env,
@@ -538,6 +587,10 @@ async fn poll_generation(
         serde_json::from_str::<Value>(&job.request_json).unwrap_or_else(|_| json!({}));
     let stored_response =
         serde_json::from_str::<Value>(&job.response_json).unwrap_or_else(|_| json!({}));
+    if !ensure_generation_usage_reserved(db, &job).await? {
+        return Ok(());
+    }
+
     if let Some(final_url) = final_image_url(&stored_response) {
         if let Err(error) =
             complete_generation_job(db, env, job_id, &final_url, &stored_response).await
@@ -881,6 +934,27 @@ async fn fail_generation_job(
             mark_batch_ready_if_complete(db, batch_id).await?;
         }
         return Ok(());
+    }
+    if job.status == "completing" {
+        let output_exists = generation_output_count(db, job_id).await? > 0;
+        let has_final_url = response_json_has_final_url(&job.response_json);
+        if output_exists {
+            let raw_response =
+                serde_json::from_str::<Value>(&job.response_json).unwrap_or_else(|_| json!({}));
+            repair_completed_generation_job(db, job_id, &job, &raw_response).await?;
+            return Ok(());
+        }
+        let is_stale = completion_updated_at_is_stale(job.updated_at.as_deref());
+        if !terminal_failure_allowed_for_job_state(
+            &job.status,
+            has_final_url,
+            output_exists,
+            is_stale,
+        ) {
+            return Err(Error::RustError(
+                "generation_completion_in_progress".to_string(),
+            ));
+        }
     }
 
     let now = now_iso_string();
@@ -1238,6 +1312,33 @@ async fn mark_generation_job_submitting(db: &D1Database, job_id: &str) -> Worker
     .await
 }
 
+async fn mark_generation_usage_reserved(
+    db: &D1Database,
+    job_id: &str,
+    usage_date: &str,
+) -> WorkerResult<()> {
+    let now = now_iso_string();
+    db::exec(
+        db,
+        r#"
+        UPDATE generation_jobs
+        SET request_json = json_set(
+              CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,
+              '$.usageReserved',
+              1,
+              '$.usageReservedAt',
+              ?,
+              '$.usageReservedDate',
+              ?
+            ),
+            updated_at = ?
+        WHERE id = ?
+        "#,
+        vec![json!(now), json!(usage_date), json!(now), json!(job_id)],
+    )
+    .await
+}
+
 async fn claim_generation_completion(db: &D1Database, job_id: &str) -> WorkerResult<bool> {
     let now = now_iso_string();
     let reclaim_cutoff = completion_reclaim_cutoff_iso();
@@ -1310,7 +1411,7 @@ async fn record_poll_attempt(
         SET response_json = ?,
             updated_at = ?
         WHERE id = ?
-          AND status IN ('queued', 'submitted', 'completing')
+          AND status IN ('queued', 'submitted')
         "#,
         vec![
             json!(json!({
@@ -1490,7 +1591,8 @@ async fn load_generation_job(
           status,
           provider_job_ids_json,
           request_json,
-          response_json
+          response_json,
+          updated_at
         FROM generation_jobs
         WHERE id = ?
           AND blitz_batch_id = ?
@@ -1516,7 +1618,8 @@ async fn load_generation_job_by_id(
           status,
           provider_job_ids_json,
           request_json,
-          response_json
+          response_json,
+          updated_at
         FROM generation_jobs
         WHERE id = ?
         "#,
@@ -1542,7 +1645,8 @@ async fn load_generation_job_by_batch_reference(
           status,
           provider_job_ids_json,
           request_json,
-          response_json
+          response_json,
+          updated_at
         FROM generation_jobs
         WHERE blitz_batch_id = ?
           AND input_visual_reference_id = ?
@@ -1743,6 +1847,18 @@ fn usage_date_from_request_json(request_json: &str) -> Option<String> {
         .and_then(|value| json_string_at(&value, "/usageDate"))
 }
 
+fn request_has_usage_reservation_marker(request_json: &str) -> bool {
+    serde_json::from_str::<Value>(request_json)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("usageReserved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || json_string_at(&value, "/usageReservedAt").is_some()
+        })
+}
+
 fn submission_arguments_from_request(job_id: &str, request_json: &Value) -> WorkerResult<Value> {
     Ok(json!({
         "jobId": json_string_at(request_json, "/jobId").unwrap_or_else(|| job_id.to_string()),
@@ -1776,6 +1892,13 @@ fn response_has_usage_refund_marker(response_json: &str) -> bool {
     serde_json::from_str::<Value>(response_json)
         .ok()
         .and_then(|value| json_string_at(&value, "/usageRefundedAt"))
+        .is_some()
+}
+
+fn response_json_has_final_url(response_json: &str) -> bool {
+    serde_json::from_str::<Value>(response_json)
+        .ok()
+        .and_then(|value| final_image_url(&value))
         .is_some()
 }
 
@@ -1868,6 +1991,15 @@ fn completion_claim_failure_action(
     }
 }
 
+fn terminal_failure_allowed_for_job_state(
+    status: &str,
+    has_final_url: bool,
+    output_exists: bool,
+    is_stale: bool,
+) -> bool {
+    status != "completing" || (is_stale && !has_final_url && !output_exists)
+}
+
 fn is_permanent_submission_error(error: &Error) -> bool {
     let message = error.to_string();
     message.contains("higgsfield_generation_tool_missing")
@@ -1924,14 +2056,23 @@ fn completion_reclaim_cutoff_iso() -> String {
         .into()
 }
 
+fn completion_updated_at_is_stale(updated_at: Option<&str>) -> bool {
+    let Some(updated_at) = updated_at else {
+        return false;
+    };
+    let updated_ms = js_sys::Date::parse(updated_at);
+    updated_ms.is_finite() && js_sys::Date::now() - updated_ms >= 120_000.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         completion_claim_failure_action, deterministic_generation_job_id, final_image_url,
         generation_media_id, generation_output_id, poll_failure_action, provider_asset_id,
         provider_ids_are_empty, provider_job_ids, provider_status,
-        response_has_usage_refund_marker, retryable_completion_attempt,
-        submission_arguments_from_request, usage_date_from_request_json,
+        request_has_usage_reservation_marker, response_has_usage_refund_marker,
+        retryable_completion_attempt, submission_arguments_from_request,
+        terminal_failure_allowed_for_job_state, usage_date_from_request_json,
         CompletionClaimFailureAction, PollFailureAction,
     };
     use serde_json::json;
@@ -2018,6 +2159,55 @@ mod tests {
             Some("2026-05-11".to_string())
         );
         assert_eq!(usage_date_from_request_json("{}"), None);
+    }
+
+    #[test]
+    fn usage_reservation_marker_accepts_boolean_or_timestamp() {
+        assert!(request_has_usage_reservation_marker(
+            r#"{"usageReserved":true}"#
+        ));
+        assert!(request_has_usage_reservation_marker(
+            r#"{"usageReservedAt":"2026-05-11T01:02:03.000Z"}"#
+        ));
+        assert!(!request_has_usage_reservation_marker(
+            r#"{"usageReserved":false}"#
+        ));
+        assert!(!request_has_usage_reservation_marker("{}"));
+        assert!(!request_has_usage_reservation_marker("not json"));
+    }
+
+    #[test]
+    fn terminal_failure_decision_protects_active_completing_jobs() {
+        assert!(!terminal_failure_allowed_for_job_state(
+            "completing",
+            true,
+            false,
+            true
+        ));
+        assert!(!terminal_failure_allowed_for_job_state(
+            "completing",
+            false,
+            true,
+            true
+        ));
+        assert!(!terminal_failure_allowed_for_job_state(
+            "completing",
+            false,
+            false,
+            false
+        ));
+        assert!(terminal_failure_allowed_for_job_state(
+            "completing",
+            false,
+            false,
+            true
+        ));
+        assert!(terminal_failure_allowed_for_job_state(
+            "submitted",
+            false,
+            false,
+            false
+        ));
     }
 
     #[test]
