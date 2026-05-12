@@ -8,7 +8,7 @@ use crate::services::generation_usage::GenerationUsageSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
-use worker::{D1Database, Env, Error, Result as WorkerResult};
+use worker::{console_error, console_log, D1Database, Env, Error, Result as WorkerResult};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -425,7 +425,9 @@ pub async fn start_waiting_ready_pools(env: &Env) -> WorkerResult<u32> {
 
 pub async fn reconcile_stale_batches(env: &Env) -> WorkerResult<()> {
     let db = env.d1("DB")?;
-    start_waiting_ready_pools(env).await?;
+    if let Err(error) = start_waiting_ready_pools(env).await {
+        console_error!("scheduled waiting ready pool startup failed: {}", error);
+    }
 
     let stale_minutes = parse_stale_minutes_config(
         env.var("BLITZ_BATCH_STALE_MINUTES")
@@ -435,32 +437,68 @@ pub async fn reconcile_stale_batches(env: &Env) -> WorkerResult<()> {
     let now = now_iso_string();
     let cutoff = stale_cutoff_iso(stale_minutes);
 
-    db::exec(
+    let ready_result = db::run(
         &db,
         r#"
         UPDATE blitz_batches
-        SET status = CASE
-              WHEN generation_count > 0 THEN 'ready'
-              ELSE 'failed'
-            END,
-            ready_at = CASE
-              WHEN generation_count > 0 THEN COALESCE(ready_at, ?)
-              ELSE ready_at
-            END,
-            error_code = CASE
-              WHEN generation_count > 0 THEN error_code
-              ELSE 'stale_generation_batch'
-            END,
-            error_message = CASE
-              WHEN generation_count > 0 THEN error_message
-              ELSE 'Batch was generating beyond the configured timeout.'
-            END
+        SET status = 'ready',
+            generation_count = (
+              SELECT COUNT(*)
+              FROM generation_outputs go
+              INNER JOIN generation_jobs gj
+                ON gj.id = go.job_id
+              WHERE gj.blitz_batch_id = blitz_batches.id
+            ),
+            ready_at = COALESCE(ready_at, ?),
+            error_code = NULL,
+            error_message = NULL
         WHERE status = 'generating'
           AND created_at < ?
+          AND EXISTS (
+            SELECT 1
+            FROM generation_outputs go
+            INNER JOIN generation_jobs gj
+              ON gj.id = go.job_id
+            WHERE gj.blitz_batch_id = blitz_batches.id
+          )
         "#,
-        vec![json!(now), json!(cutoff)],
+        vec![json!(&now), json!(&cutoff)],
     )
-    .await
+    .await?;
+
+    let failed_result = db::run(
+        &db,
+        r#"
+        UPDATE blitz_batches
+        SET status = 'failed',
+            generation_count = 0,
+            error_code = 'stale_generation_batch',
+            error_message = 'Batch was generating beyond the configured timeout.'
+        WHERE status = 'generating'
+          AND created_at < ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM generation_outputs go
+            INNER JOIN generation_jobs gj
+              ON gj.id = go.job_id
+            WHERE gj.blitz_batch_id = blitz_batches.id
+          )
+        "#,
+        vec![json!(&cutoff)],
+    )
+    .await?;
+
+    let ready_count = changed_rows(&ready_result)?;
+    let failed_count = changed_rows(&failed_result)?;
+    if ready_count > 0 || failed_count > 0 {
+        console_log!(
+            "stale blitz reconciliation marked ready={} failed={}",
+            ready_count,
+            failed_count
+        );
+    }
+
+    Ok(())
 }
 
 pub async fn current_batch(
@@ -1373,7 +1411,8 @@ fn now_iso_string() -> String {
 
 fn parse_stale_minutes_config(value: Option<String>) -> i64 {
     value
-        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
         .unwrap_or(45)
 }
 
@@ -1391,6 +1430,7 @@ mod tests {
     #[test]
     fn parse_stale_minutes_config_uses_positive_override() {
         assert_eq!(parse_stale_minutes_config(Some("30".to_string())), 30);
+        assert_eq!(parse_stale_minutes_config(Some(" 30 ".to_string())), 30);
     }
 
     #[test]
@@ -1400,5 +1440,7 @@ mod tests {
             parse_stale_minutes_config(Some("not-a-number".to_string())),
             45
         );
+        assert_eq!(parse_stale_minutes_config(Some("0".to_string())), 45);
+        assert_eq!(parse_stale_minutes_config(Some("-1".to_string())), 45);
     }
 }
