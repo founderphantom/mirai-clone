@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { canAdvanceSwipeDeckAfterAwait } from "../../src/client/components/SwipeDeck";
 import { isLoadedBlitzStateForClone } from "../../src/client/screens/BlitzScreen";
 import { dailyGenerationMeterValue } from "../../src/client/screens/MeScreen";
 import type { BlitzCurrent } from "../../src/client/types";
@@ -18,6 +19,13 @@ describe("Blitz client state guards", () => {
     expect(isLoadedBlitzStateForClone({ cloneId: "clone-a", data: blitzCurrent }, "clone-a")).toBe(true);
     expect(isLoadedBlitzStateForClone({ cloneId: "clone-a", data: blitzCurrent }, "clone-b")).toBe(false);
     expect(isLoadedBlitzStateForClone(null, "clone-a")).toBe(false);
+  });
+});
+
+describe("SwipeDeck async advancement guard", () => {
+  it("only advances when the swipe resolves for the same deck key", () => {
+    expect(canAdvanceSwipeDeckAfterAwait("card-a|card-b", "card-a|card-b")).toBe(true);
+    expect(canAdvanceSwipeDeckAfterAwait("card-a|card-b", "card-c|card-d")).toBe(false);
   });
 });
 

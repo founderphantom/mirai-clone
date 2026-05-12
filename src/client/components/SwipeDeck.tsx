@@ -1,5 +1,5 @@
 import { Heart, RotateCcw, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { track } from "../lib/analytics";
 
 export type SwipeCard = {
@@ -8,6 +8,10 @@ export type SwipeCard = {
   subtitle?: string;
   imageUrl?: string | null;
 };
+
+export function canAdvanceSwipeDeckAfterAwait(capturedDeckKey: string, currentDeckKey: string) {
+  return capturedDeckKey === currentDeckKey;
+}
 
 export function SwipeDeck({
   cards,
@@ -21,20 +25,25 @@ export function SwipeDeck({
   const [index, setIndex] = useState(0);
   const [pending, setPending] = useState(false);
   const cardIds = useMemo(() => cards.map((card) => card.id).join("|"), [cards]);
+  const cardIdsRef = useRef(cardIds);
   const current = cards[index];
   const remaining = useMemo(() => Math.max(0, cards.length - index), [cards.length, index]);
 
   useEffect(() => {
+    cardIdsRef.current = cardIds;
     setIndex(0);
   }, [cardIds]);
 
   async function swipe(verdict: "like" | "dislike") {
     if (!current || pending) return;
+    const swipeDeckKey = cardIds;
     setPending(true);
     track("blitz_swipe_preview", { cardId: current.id, verdict });
     try {
       await onSwipe?.(current, verdict);
-      setIndex((value) => value + 1);
+      if (canAdvanceSwipeDeckAfterAwait(swipeDeckKey, cardIdsRef.current)) {
+        setIndex((value) => value + 1);
+      }
     } catch {
       return;
     } finally {
