@@ -127,6 +127,13 @@ struct CloneRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct WaitingReadyPoolRow {
+    user_id: String,
+    clone_id: String,
+    provider_soul_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct BatchRow {
     id: String,
     clone_id: String,
@@ -337,6 +344,71 @@ pub async fn create_next_batch(
     .await?;
 
     Ok(Some(batch_id))
+}
+
+pub async fn start_waiting_ready_pools(env: &Env) -> WorkerResult<u32> {
+    let db = env.d1("DB")?;
+    let rows = db::all::<WaitingReadyPoolRow>(
+        &db,
+        r#"
+        SELECT user_id,
+               id AS clone_id,
+               provider_soul_id
+        FROM clone_profiles
+        WHERE soul_status = 'ready'
+          AND provider_soul_id IS NOT NULL
+          AND deleted_at IS NULL
+          AND json_extract(provider_config_json, '$.nicheResearchStatus') = 'pool_ready_awaiting_soul'
+        ORDER BY updated_at ASC
+        LIMIT 20
+        "#,
+        vec![],
+    )
+    .await?;
+
+    let mut started = 0;
+    for row in rows {
+        if create_next_batch(
+            &db,
+            env,
+            &row.user_id,
+            &row.clone_id,
+            &row.provider_soul_id,
+        )
+        .await?
+        .is_some()
+        {
+            let now = now_iso_string();
+            db::exec(
+                &db,
+                r#"
+                UPDATE clone_profiles
+                SET provider_config_json = json_set(
+                      CASE
+                        WHEN json_valid(provider_config_json) THEN provider_config_json
+                        ELSE '{}'
+                      END,
+                      '$.nicheResearchStatus',
+                      'batch_generation_started',
+                      '$.nicheResearchDetail',
+                      'First Blitz batch queued after Soul readiness.'
+                    ),
+                    updated_at = ?
+                WHERE user_id = ?
+                  AND id = ?
+                  AND soul_status = 'ready'
+                  AND provider_soul_id IS NOT NULL
+                  AND deleted_at IS NULL
+                  AND json_extract(provider_config_json, '$.nicheResearchStatus') = 'pool_ready_awaiting_soul'
+                "#,
+                vec![json!(now), json!(row.user_id), json!(row.clone_id)],
+            )
+            .await?;
+            started += 1;
+        }
+    }
+
+    Ok(started)
 }
 
 pub async fn current_batch(
