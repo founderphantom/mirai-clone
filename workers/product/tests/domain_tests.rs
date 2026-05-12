@@ -628,6 +628,15 @@ fn source_freshness_uses_rolling_five_year_cutoff() {
         FreshnessDecision::TooOld
     );
     assert_eq!(
+        classify_freshness(
+            Some("2026-05-12T00:00:00.000Z"),
+            true,
+            "2026-05-11T00:00:00.000Z",
+            5
+        ),
+        FreshnessDecision::TooOld
+    );
+    assert_eq!(
         classify_freshness(None, true, "2026-05-11T00:00:00.000Z", 5),
         FreshnessDecision::UnknownAllowed
     );
@@ -694,6 +703,41 @@ fn human_presence_accepts_single_organic_recent_images_only() {
         can_accept_human_presence(&render_like).unwrap_err(),
         "too_professional"
     );
+
+    let mut mannequin = accepted.clone();
+    mannequin.human_type = "mannequin".to_string();
+    assert_eq!(
+        can_accept_human_presence(&mannequin).unwrap_err(),
+        "unsupported_human_type"
+    );
+
+    let mut hands_only = accepted.clone();
+    hands_only.human_type = "hands_only".to_string();
+    assert_eq!(
+        can_accept_human_presence(&hands_only).unwrap_err(),
+        "unsupported_human_type"
+    );
+
+    let mut invalid_confidence = accepted.clone();
+    invalid_confidence.confidence = f64::NAN;
+    assert_eq!(
+        can_accept_human_presence(&invalid_confidence).unwrap_err(),
+        "invalid_score"
+    );
+
+    let mut infinite_organic = accepted.clone();
+    infinite_organic.organic_photo_score = f64::INFINITY;
+    assert_eq!(
+        can_accept_human_presence(&infinite_organic).unwrap_err(),
+        "invalid_score"
+    );
+
+    let mut out_of_range_freshness = accepted.clone();
+    out_of_range_freshness.freshness_visual_score = 1.01;
+    assert_eq!(
+        can_accept_human_presence(&out_of_range_freshness).unwrap_err(),
+        "invalid_score"
+    );
 }
 
 #[test]
@@ -701,6 +745,7 @@ fn daily_generation_limits_follow_plan() {
     assert_eq!(daily_generation_limit("free", 10, 50), 10);
     assert_eq!(daily_generation_limit("paid", 10, 50), 50);
     assert_eq!(daily_generation_limit("pro", 10, 50), 50);
+    assert_eq!(daily_generation_limit("pro ", 10, 50), 50);
     assert_eq!(daily_generation_limit("studio", 10, 50), 50);
     assert_eq!(daily_generation_limit("unknown", 10, 50), 10);
 }
@@ -730,6 +775,53 @@ fn influence_accumulates_likes_and_dislikes_from_metadata() {
     assert_eq!(influence.disliked_clusters["formal-wear"], 1);
     assert_eq!(influence.liked_platforms["tiktok"], 1);
     assert_eq!(influence.liked_visual_reference_ids["vref_1"], 1);
+}
+
+#[test]
+fn influence_normalizes_text_keys_but_preserves_reference_id_case() {
+    let influence = accumulate_influence(&[SwipeMetadata {
+        action: "like".to_string(),
+        aesthetic_tags: vec![" Minimalist ".to_string()],
+        niche_cluster: Some(" Outfit-Inspo ".to_string()),
+        source_platform: "TikTok".to_string(),
+        visual_reference_id: Some(" VRef_A ".to_string()),
+    }]);
+
+    assert_eq!(influence.liked_tags["minimalist"], 1);
+    assert_eq!(influence.liked_clusters["outfit-inspo"], 1);
+    assert_eq!(influence.liked_platforms["tiktok"], 1);
+    assert_eq!(influence.liked_visual_reference_ids["VRef_A"], 1);
+
+    let refs = vec![
+        VisualReferenceForSelection {
+            id: "aaa_unmatched".to_string(),
+            source_platform: "instagram".to_string(),
+            source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some("other".to_string()),
+            aesthetic_tags: vec!["other".to_string()],
+            human_presence_score: 0.8,
+            organic_photo_score: 0.8,
+            freshness_visual_score: 0.8,
+            generation_use_count: 0,
+            last_liked_at: None,
+        },
+        VisualReferenceForSelection {
+            id: "zzz_matched".to_string(),
+            source_platform: "tiktok".to_string(),
+            source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some("outfit-inspo".to_string()),
+            aesthetic_tags: vec!["minimalist".to_string()],
+            human_presence_score: 0.8,
+            organic_photo_score: 0.8,
+            freshness_visual_score: 0.8,
+            generation_use_count: 0,
+            last_liked_at: None,
+        },
+    ];
+
+    let selected = select_visual_references(&refs, &influence, 1, 4, "2026-05-11T00:00:00.000Z");
+
+    assert_eq!(selected[0].id, "zzz_matched");
 }
 
 #[test]
@@ -799,6 +891,59 @@ fn selection_respects_influence_variety_and_reuse_cap() {
     );
     assert!(!ids.contains(&"unliked_used".to_string()));
     assert!(!ids.contains(&"capped".to_string()));
+}
+
+#[test]
+fn selection_filters_invalid_scores_and_future_sources() {
+    let refs = vec![
+        VisualReferenceForSelection {
+            id: "valid".to_string(),
+            source_platform: "instagram".to_string(),
+            source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some("valid".to_string()),
+            aesthetic_tags: vec!["street".to_string()],
+            human_presence_score: 0.7,
+            organic_photo_score: 0.8,
+            freshness_visual_score: 0.8,
+            generation_use_count: 0,
+            last_liked_at: None,
+        },
+        VisualReferenceForSelection {
+            id: "nan_score".to_string(),
+            source_platform: "tiktok".to_string(),
+            source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            niche_cluster: Some("invalid".to_string()),
+            aesthetic_tags: vec!["street".to_string()],
+            human_presence_score: f64::NAN,
+            organic_photo_score: 1.0,
+            freshness_visual_score: 1.0,
+            generation_use_count: 0,
+            last_liked_at: None,
+        },
+        VisualReferenceForSelection {
+            id: "future".to_string(),
+            source_platform: "tiktok".to_string(),
+            source_published_at: Some("2026-05-12T00:00:00.000Z".to_string()),
+            niche_cluster: Some("future".to_string()),
+            aesthetic_tags: vec!["street".to_string()],
+            human_presence_score: 0.95,
+            organic_photo_score: 0.95,
+            freshness_visual_score: 0.95,
+            generation_use_count: 0,
+            last_liked_at: None,
+        },
+    ];
+
+    let selected = select_visual_references(
+        &refs,
+        &Influence::default(),
+        3,
+        4,
+        "2026-05-11T00:00:00.000Z",
+    );
+    let ids = selected.into_iter().map(|item| item.id).collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["valid".to_string()]);
 }
 
 #[test]
@@ -887,3 +1032,11 @@ fn instagram_reels_normalizer_converts_numeric_taken_at_values() {
     );
 }
 
+
+#[test]
+fn freshness_decision_serializes_as_snake_case() {
+    assert_eq!(
+        serde_json::to_value(FreshnessDecision::UnknownAllowed).unwrap(),
+        json!("unknown_allowed")
+    );
+}

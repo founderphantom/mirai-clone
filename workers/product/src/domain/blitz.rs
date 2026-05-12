@@ -4,6 +4,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FreshnessDecision {
     Recent,
     TooOld,
@@ -117,6 +118,10 @@ pub fn classify_freshness(
         return FreshnessDecision::TooOld;
     };
 
+    if published_at > now {
+        return FreshnessDecision::TooOld;
+    }
+
     if published_at >= now - Duration::days(365 * years) {
         FreshnessDecision::Recent
     } else {
@@ -130,6 +135,15 @@ pub fn can_accept_human_presence(review: &HumanPresenceReview) -> Result<(), &'s
     }
     if review.human_count > 1 {
         return Err("multiple_humans");
+    }
+    if !is_supported_human_type(&review.human_type) {
+        return Err("unsupported_human_type");
+    }
+    if !is_unit_score(review.confidence)
+        || !is_unit_score(review.organic_photo_score)
+        || !is_unit_score(review.freshness_visual_score)
+    {
+        return Err("invalid_score");
     }
     if review.confidence < 0.7 {
         return Err("low_confidence");
@@ -154,7 +168,7 @@ pub fn can_accept_human_presence(review: &HumanPresenceReview) -> Result<(), &'s
 }
 
 pub fn daily_generation_limit(plan: &str, free_limit: u32, paid_limit: u32) -> u32 {
-    match plan.to_ascii_lowercase().as_str() {
+    match plan.trim().to_ascii_lowercase().as_str() {
         "paid" | "studio" | "pro" => paid_limit,
         _ => free_limit,
     }
@@ -172,7 +186,7 @@ pub fn accumulate_influence(swipes: &[SwipeMetadata]) -> Influence {
                     swipe.niche_cluster.as_deref(),
                 );
                 increment(&mut influence.liked_platforms, &swipe.source_platform);
-                increment_option(
+                increment_reference_option(
                     &mut influence.liked_visual_reference_ids,
                     swipe.visual_reference_id.as_deref(),
                 );
@@ -184,7 +198,7 @@ pub fn accumulate_influence(swipes: &[SwipeMetadata]) -> Influence {
                     swipe.niche_cluster.as_deref(),
                 );
                 increment(&mut influence.disliked_platforms, &swipe.source_platform);
-                increment_option(
+                increment_reference_option(
                     &mut influence.disliked_visual_reference_ids,
                     swipe.visual_reference_id.as_deref(),
                 );
@@ -205,13 +219,12 @@ pub fn select_visual_references(
 ) -> Vec<VisualReferenceForSelection> {
     let mut scored = references
         .iter()
+        .filter(|reference| is_selectable_reference(reference, now))
         .filter(|reference| reference.generation_use_count < reuse_cap)
         .filter(|reference| {
             reference.generation_use_count == 0
                 || reference.last_liked_at.is_some()
-                || influence
-                    .liked_visual_reference_ids
-                    .contains_key(&reference.id)
+                || contains_reference_id(&influence.liked_visual_reference_ids, &reference.id)
         })
         .map(|reference| {
             (
@@ -233,25 +246,27 @@ pub fn select_visual_references(
             break;
         }
 
+        let platform_key = normalize_key(&reference.source_platform);
         let platform_count = platform_counts
-            .get(&reference.source_platform)
+            .get(platform_key.as_deref().unwrap_or(""))
             .copied()
             .unwrap_or(0);
         if platform_count >= 3 {
             continue;
         }
 
-        if let Some(cluster) = reference.niche_cluster.as_deref() {
+        let cluster_key = reference.niche_cluster.as_deref().and_then(normalize_key);
+        if let Some(cluster) = cluster_key.as_deref() {
             if cluster_counts.get(cluster).copied().unwrap_or(0) >= 2 {
                 continue;
             }
         }
 
-        *platform_counts
-            .entry(reference.source_platform.clone())
-            .or_insert(0) += 1;
-        if let Some(cluster) = reference.niche_cluster.as_deref() {
-            *cluster_counts.entry(cluster.to_string()).or_insert(0) += 1;
+        if let Some(platform) = platform_key {
+            *platform_counts.entry(platform).or_insert(0) += 1;
+        }
+        if let Some(cluster) = cluster_key {
+            *cluster_counts.entry(cluster).or_insert(0) += 1;
         }
         selected.push(reference.clone());
     }
@@ -270,41 +285,40 @@ fn score_visual_reference(
         + source_recency_score(reference.source_published_at.as_deref(), now);
 
     for tag in &reference.aesthetic_tags {
-        score += *influence.liked_tags.get(tag).unwrap_or(&0) as f64 * 0.4;
-        score -= *influence.disliked_tags.get(tag).unwrap_or(&0) as f64 * 0.6;
+        score += normalized_count(&influence.liked_tags, tag) as f64 * 0.4;
+        score -= normalized_count(&influence.disliked_tags, tag) as f64 * 0.6;
     }
 
     if let Some(cluster) = reference.niche_cluster.as_deref() {
-        score += *influence.liked_clusters.get(cluster).unwrap_or(&0) as f64 * 0.6;
-        score -= *influence.disliked_clusters.get(cluster).unwrap_or(&0) as f64 * 0.8;
+        score += normalized_count(&influence.liked_clusters, cluster) as f64 * 0.6;
+        score -= normalized_count(&influence.disliked_clusters, cluster) as f64 * 0.8;
     }
 
-    score += *influence
-        .liked_platforms
-        .get(&reference.source_platform)
-        .unwrap_or(&0) as f64
-        * 0.25;
-    score -= *influence
-        .disliked_platforms
-        .get(&reference.source_platform)
-        .unwrap_or(&0) as f64
-        * 0.35;
-    score += *influence
-        .liked_visual_reference_ids
-        .get(&reference.id)
-        .unwrap_or(&0) as f64
-        * 2.0;
-    score -= *influence
-        .disliked_visual_reference_ids
-        .get(&reference.id)
-        .unwrap_or(&0) as f64
-        * 2.0;
+    score += normalized_count(&influence.liked_platforms, &reference.source_platform) as f64 * 0.25;
+    score -=
+        normalized_count(&influence.disliked_platforms, &reference.source_platform) as f64 * 0.35;
+    score += reference_id_count(&influence.liked_visual_reference_ids, &reference.id) as f64 * 2.0;
+    score -=
+        reference_id_count(&influence.disliked_visual_reference_ids, &reference.id) as f64 * 2.0;
 
     if reference.generation_use_count > 0 {
         score -= reference.generation_use_count as f64 * 0.25;
     }
 
     score
+}
+
+fn is_selectable_reference(reference: &VisualReferenceForSelection, now: &str) -> bool {
+    is_unit_score(reference.human_presence_score)
+        && is_unit_score(reference.organic_photo_score)
+        && is_unit_score(reference.freshness_visual_score)
+        && reference
+            .source_published_at
+            .as_deref()
+            .map(|published_at| {
+                classify_freshness(Some(published_at), true, now, 5) != FreshnessDecision::TooOld
+            })
+            .unwrap_or(true)
 }
 
 fn source_recency_score(published_at: Option<&str>, now: &str) -> f64 {
@@ -340,9 +354,64 @@ fn increment_option(counts: &mut HashMap<String, u32>, value: Option<&str>) {
 }
 
 fn increment(counts: &mut HashMap<String, u32>, value: &str) {
-    if !value.is_empty() {
-        *counts.entry(value.to_string()).or_insert(0) += 1;
+    if let Some(value) = normalize_key(value) {
+        let count = counts.entry(value).or_insert(0);
+        *count = count.saturating_add(1);
     }
+}
+
+fn increment_reference_option(counts: &mut HashMap<String, u32>, value: Option<&str>) {
+    if let Some(value) = value {
+        if let Some(value) = normalize_reference_id(value) {
+            let count = counts.entry(value).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+}
+
+fn normalized_count(counts: &HashMap<String, u32>, value: &str) -> u32 {
+    normalize_key(value)
+        .and_then(|value| counts.get(&value).copied())
+        .unwrap_or(0)
+}
+
+fn reference_id_count(counts: &HashMap<String, u32>, value: &str) -> u32 {
+    normalize_reference_id(value)
+        .and_then(|value| counts.get(&value).copied())
+        .unwrap_or(0)
+}
+
+fn contains_reference_id(counts: &HashMap<String, u32>, value: &str) -> bool {
+    reference_id_count(counts, value) > 0
+}
+
+fn normalize_key(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn normalize_reference_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn is_unit_score(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+fn is_supported_human_type(value: &str) -> bool {
+    matches!(
+        normalize_key(value).as_deref(),
+        Some("full_body" | "upper_body" | "portrait" | "person" | "human")
+    )
 }
 
 fn normalize_words(value: &str) -> String {
