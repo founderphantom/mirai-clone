@@ -347,6 +347,22 @@ async fn handle_clone_training_message(
                 .await?;
                 return Ok(());
             }
+            if let Some((error_code, error_message, raw_json)) =
+                mcp_invalid_response_failure(&error, "media_upload")
+            {
+                fail_clone_training_job(
+                    db,
+                    job_id,
+                    clone_id,
+                    user_id,
+                    idempotency_key,
+                    error_code,
+                    &error_message,
+                    &raw_json,
+                )
+                .await?;
+                return Ok(());
+            }
             return Err(map_mcp_error(error));
         }
         Err(error) => {
@@ -1465,17 +1481,6 @@ fn higgsfield_auth_provider_action_error(
         } if matches!(*status, 401 | 422) => {
             Some(CloneTrainingProviderError::HiggsfieldRefreshTokenInvalid)
         }
-        HiggsfieldAuthError::HttpStatus {
-            phase: HiggsfieldAuthPhase::Validate,
-            status,
-        }
-        | HiggsfieldAuthError::CredentialsObjectStatus {
-            phase: HiggsfieldAuthPhase::Validate,
-            status,
-            ..
-        } if matches!(*status, 401 | 422) => {
-            Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
-        }
         _ => None,
     }
 }
@@ -1500,6 +1505,23 @@ fn mcp_error_detail(error: &HiggsfieldMcpError, phase: &str) -> String {
             "Higgsfield provider MCP auth failed: phase={phase} detail={}",
             sanitize_error_detail(&other.to_string())
         ),
+    }
+}
+
+fn mcp_invalid_response_failure(
+    error: &HiggsfieldMcpError,
+    phase: &str,
+) -> Option<(&'static str, String, Value)> {
+    match error {
+        HiggsfieldMcpError::InvalidResponse { message, raw_json } => Some((
+            "higgsfield_mcp_invalid_response",
+            format!(
+                "Higgsfield MCP {phase} response was invalid: {}",
+                sanitize_error_detail(message)
+            ),
+            raw_json.clone(),
+        )),
+        _ => None,
     }
 }
 
@@ -1538,7 +1560,7 @@ mod tests {
         clone_training_status_arguments, clone_training_submission_arguments,
         has_provider_submission, higgsfield_auth_provider_action_error,
         higgsfield_mcp_provider_action_error, lease_is_expired, mcp_error_detail,
-        CloneTrainingProviderError, TrainingJobRow,
+        mcp_invalid_response_failure, CloneTrainingProviderError, TrainingJobRow,
     };
     use crate::providers::higgsfield_auth::{HiggsfieldAuthError, HiggsfieldAuthPhase};
     use crate::providers::higgsfield_mcp::HiggsfieldMcpError;
@@ -1643,13 +1665,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejection_uses_provider_auth_error_code() {
+    fn validate_rejection_is_diagnostic_not_clone_provider_action() {
         assert_eq!(
             higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus {
                 phase: HiggsfieldAuthPhase::Validate,
                 status: 401
             }),
-            Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
+            None
         );
         assert_eq!(
             higgsfield_auth_provider_action_error(&HiggsfieldAuthError::CredentialsObjectStatus {
@@ -1665,7 +1687,7 @@ mod tests {
                 status: 422,
                 message: "Higgsfield provider auth failed: phase=validate status=422".to_string()
             }),
-            Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
+            None
         );
     }
 
@@ -1684,5 +1706,25 @@ mod tests {
             mcp_error_detail(&error, "clone_submit"),
             "Higgsfield provider MCP auth failed: phase=clone_submit status=401"
         );
+    }
+
+    #[test]
+    fn mcp_invalid_upload_response_becomes_terminal_failure_details() {
+        let raw_json = json!({"result": {"content": [{"type": "text", "text": "no slots"}]}});
+        let error = HiggsfieldMcpError::InvalidResponse {
+            message: "media_upload response did not include upload slots".to_string(),
+            raw_json: raw_json.clone(),
+        };
+
+        let (error_code, error_message, failure_json) =
+            mcp_invalid_response_failure(&error, "media_upload").expect("failure detail");
+
+        assert_eq!(error_code, "higgsfield_mcp_invalid_response");
+        assert_eq!(
+            error_message,
+            "Higgsfield MCP media_upload response was invalid: media_upload response did not include upload slots"
+        );
+        assert_eq!(failure_json, raw_json);
+        assert_eq!(higgsfield_mcp_provider_action_error(&error), None);
     }
 }

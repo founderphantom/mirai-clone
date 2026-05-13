@@ -1,6 +1,7 @@
 # Higgsfield MCP Process
 
 Validated on 2026-05-12 against `https://mcp.higgsfield.ai/mcp`.
+Auth endpoint behavior rechecked on 2026-05-13.
 
 This document records the working MCP flow for the two Higgsfield operations
 Mirai needs:
@@ -87,7 +88,12 @@ POST https://fnf-device-auth.higgsfield.ai/validate
 }
 ```
 
-The response contains `user_id` when the access token is valid.
+On 2026-05-13, `/validate` rejected refreshed device-flow access tokens with
+`{"detail":"Invalid or missing API key"}` even though the same bearer token
+successfully called MCP `tools/list`. Treat `/validate` as a warning-only
+diagnostic endpoint, not as a required gate for clone training or generation.
+The production auth flow should use `/refresh` plus direct MCP calls as the
+source of truth.
 
 Use the access token for MCP:
 
@@ -310,6 +316,20 @@ Wrangler env values should use MCP tool names:
   "HIGGSFIELD_MCP_CLONE_TRAINING_TOOL": "show_characters",
   "HIGGSFIELD_MCP_GENERATION_TOOL": "generate_image"
 }
+```
+
+Production refresh-token setup should use the smoke check that exercises MCP
+directly:
+
+```sh
+python3 scripts/higgsfield_device_auth.py --smoke --print-token
+```
+
+Store the latest printed refresh token from that run, because `/refresh`
+rotates refresh tokens:
+
+```sh
+wrangler secret put HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER -c workers/product/wrangler.product.jsonc
 ```
 
 Clone training should not pass app-shaped fields directly to MCP. It should:

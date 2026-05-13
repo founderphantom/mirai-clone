@@ -56,7 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--smoke",
         action="store_true",
-        help="refresh, validate, and list required MCP tools before printing storage instructions",
+        help="refresh and verify required MCP tools before printing storage instructions",
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="diagnostically call /validate after refresh; failures are warnings only",
     )
     parser.add_argument(
         "--client-name",
@@ -345,8 +350,8 @@ def main() -> int:
     refresh_token = str(refresh_token)
 
     print("Refresh token received.")
-    should_smoke = args.smoke or args.list_tools
-    if should_smoke:
+    should_refresh = args.smoke or args.list_tools or args.validate
+    if should_refresh:
         refresh_response = refresh_access_token(refresh_url, refresh_token)
         access_token = str(first_present(refresh_response, "accessToken", "access_token"))
         rotated_refresh_token = first_present(
@@ -357,15 +362,25 @@ def main() -> int:
         if rotated_refresh_token:
             refresh_token = str(rotated_refresh_token)
             print("Rotated refresh token received from /refresh.")
-        validation = validate_access_token(validate_url, access_token)
-        print(
-            f"Validated access token for Higgsfield user {first_present(validation, 'userId', 'user_id')}."
-        )
-        tools = list_mcp_tools(args.mcp_url, access_token)
-        print_mcp_tools(tools)
-        if args.smoke:
-            assert_required_tools_present(tools)
-            print("Smoke check passed.")
+        if args.validate:
+            try:
+                validation = validate_access_token(validate_url, access_token)
+            except Exception as error:
+                print(
+                    f"warning: /validate rejected the refreshed access token: {error}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "Diagnostic /validate accepted access token for Higgsfield user "
+                    f"{first_present(validation, 'userId', 'user_id')}."
+                )
+        if args.smoke or args.list_tools:
+            tools = list_mcp_tools(args.mcp_url, access_token)
+            print_mcp_tools(tools)
+            if args.smoke:
+                assert_required_tools_present(tools)
+                print("Smoke check passed: required MCP tools are available.")
     print(f"wrangler secret put {SECRET_NAME} -c {WRANGLER_CONFIG}")
     if args.print_token:
         print(refresh_token)

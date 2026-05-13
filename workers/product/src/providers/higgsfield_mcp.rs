@@ -315,6 +315,12 @@ fn extract_media_upload_slots(
 }
 
 fn collect_media_upload_slots(payload: &Value, slots: &mut Vec<MediaUploadSlot>) {
+    if let Some(items) = payload.as_array() {
+        for item in items {
+            push_media_upload_slot(item, slots);
+        }
+    }
+
     for path in [
         "/result/files",
         "/result/uploads",
@@ -332,18 +338,15 @@ fn collect_media_upload_slots(payload: &Value, slots: &mut Vec<MediaUploadSlot>)
             continue;
         };
         for item in items {
-            if let Some(slot) = media_upload_slot_from_value(item) {
-                if !slots
-                    .iter()
-                    .any(|existing| existing.media_id == slot.media_id)
-                {
-                    slots.push(slot);
-                }
-            }
+            push_media_upload_slot(item, slots);
         }
     }
 
-    if let Some(slot) = media_upload_slot_from_value(payload) {
+    push_media_upload_slot(payload, slots);
+}
+
+fn push_media_upload_slot(value: &Value, slots: &mut Vec<MediaUploadSlot>) {
+    if let Some(slot) = media_upload_slot_from_value(value) {
         if !slots
             .iter()
             .any(|existing| existing.media_id == slot.media_id)
@@ -442,7 +445,10 @@ fn json_string_at(value: &Value, path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_provider_job_id, extract_provider_soul_id, parse_mcp_response_text};
+    use super::{
+        extract_media_upload_slots, extract_provider_job_id, extract_provider_soul_id,
+        parse_mcp_response_text,
+    };
     use serde_json::json;
 
     #[test]
@@ -480,5 +486,69 @@ data: {"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"id\":\"hf_
             extract_provider_soul_id(&wrapped),
             Some("soul_1".to_string())
         );
+    }
+
+    #[test]
+    fn extracts_media_upload_slots_from_mcp_content_text_array() {
+        let wrapped = json!({
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "[{\"id\":\"media_1\",\"upload_url\":\"https://upload.example/1\",\"url\":\"https://cdn.example/1.jpg\",\"content_type\":\"image/jpeg\"}]"
+                }]
+            }
+        });
+
+        let slots = extract_media_upload_slots(&wrapped).expect("upload slots");
+
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].media_id, "media_1");
+        assert_eq!(slots[0].upload_url, "https://upload.example/1");
+        assert_eq!(slots[0].url, "https://cdn.example/1.jpg");
+        assert_eq!(slots[0].content_type.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn extracts_media_upload_slots_from_raw_top_level_array() {
+        let raw = json!([
+            {
+                "id": "media_1",
+                "upload_url": "https://upload.example/1",
+                "cdn_url": "https://cdn.example/1.jpg"
+            },
+            {
+                "media_id": "media_2",
+                "uploadUrl": "https://upload.example/2",
+                "publicUrl": "https://cdn.example/2.jpg"
+            }
+        ]);
+
+        let slots = extract_media_upload_slots(&raw).expect("upload slots");
+
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].media_id, "media_1");
+        assert_eq!(slots[0].url, "https://cdn.example/1.jpg");
+        assert_eq!(slots[1].media_id, "media_2");
+        assert_eq!(slots[1].upload_url, "https://upload.example/2");
+    }
+
+    #[test]
+    fn extracts_media_upload_slots_from_existing_nested_shapes() {
+        let raw = json!({
+            "result": {
+                "files": [{
+                    "mediaId": "media_1",
+                    "presignedUrl": "https://upload.example/1",
+                    "publicUrl": "https://cdn.example/1.jpg"
+                }]
+            }
+        });
+
+        let slots = extract_media_upload_slots(&raw).expect("upload slots");
+
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].media_id, "media_1");
+        assert_eq!(slots[0].upload_url, "https://upload.example/1");
+        assert_eq!(slots[0].url, "https://cdn.example/1.jpg");
     }
 }

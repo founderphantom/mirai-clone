@@ -221,9 +221,7 @@ impl HiggsfieldCredentials {
         if let Some(stored_refresh_token) =
             optional_stored_refresh_token(&storage, &storage_key).await?
         {
-            match refresh_validate_rotate_and_store(&storage, &storage_key, &stored_refresh_token)
-                .await
-            {
+            match refresh_rotate_and_store(&storage, &storage_key, &stored_refresh_token).await {
                 Ok(access_token) => return Ok(access_token),
                 Err(error) if should_retry_from_secret(&error) => {
                     if let Some(latest_refresh_token) =
@@ -233,7 +231,7 @@ impl HiggsfieldCredentials {
                             Some(&latest_refresh_token),
                             &stored_refresh_token,
                         ) {
-                            match refresh_validate_rotate_and_store(
+                            match refresh_rotate_and_store(
                                 &storage,
                                 &storage_key,
                                 &latest_refresh_token,
@@ -272,7 +270,7 @@ impl HiggsfieldCredentials {
                 secret_name: refresh_secret_name.to_string(),
             })?
             .to_string();
-        refresh_validate_rotate_and_store(&storage, &storage_key, &fallback_refresh_token).await
+        refresh_rotate_and_store(&storage, &storage_key, &fallback_refresh_token).await
     }
 }
 
@@ -378,28 +376,33 @@ where
     Ok(response.json::<TResponse>().await?)
 }
 
-async fn refresh_validate_and_rotate(
+async fn refresh_and_rotate(
     refresh_token: &str,
 ) -> Result<(HiggsfieldAccessToken, Option<String>), HiggsfieldAuthError> {
     let token_response = refresh_access_token_value(refresh_token).await?;
-    let validate_response = validate_access_token(&token_response.access_token).await?;
+    Ok(access_token_from_refresh_response(token_response))
+}
+
+fn access_token_from_refresh_response(
+    token_response: HiggsfieldTokenResponse,
+) -> (HiggsfieldAccessToken, Option<String>) {
     let rotated_refresh_token = rotated_refresh_token_from_response(&token_response);
     let access_token = HiggsfieldAccessToken {
         access_token: token_response.access_token,
         token_type: token_response.token_type,
         expires_in: token_response.expires_in,
-        validated_user_id: Some(validate_response.user_id),
+        validated_user_id: None,
     };
 
-    Ok((access_token, rotated_refresh_token))
+    (access_token, rotated_refresh_token)
 }
 
-async fn refresh_validate_rotate_and_store(
+async fn refresh_rotate_and_store(
     storage: &worker::Storage,
     storage_key: &str,
     refresh_token: &str,
 ) -> Result<HiggsfieldAccessToken, HiggsfieldAuthError> {
-    let (access_token, rotated_refresh_token) = refresh_validate_and_rotate(refresh_token).await?;
+    let (access_token, rotated_refresh_token) = refresh_and_rotate(refresh_token).await?;
     if let Some(rotated_refresh_token) = rotated_refresh_token {
         storage.put(storage_key, rotated_refresh_token).await?;
     }
@@ -581,10 +584,10 @@ fn sanitize_error_detail(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        credentials_error_from_response, credentials_storage_key,
-        rotated_refresh_token_from_response, sanitize_error_detail, should_retry_from_secret,
-        stored_refresh_token_was_replaced, HiggsfieldAuthError, HiggsfieldAuthPhase,
-        RefreshRequest, ValidateRequest,
+        access_token_from_refresh_response, credentials_error_from_response,
+        credentials_storage_key, rotated_refresh_token_from_response, sanitize_error_detail,
+        should_retry_from_secret, stored_refresh_token_was_replaced, HiggsfieldAuthError,
+        HiggsfieldAuthPhase, RefreshRequest, ValidateRequest,
     };
     use serde_json::json;
 
@@ -653,6 +656,25 @@ mod tests {
 
         assert_eq!(response.access_token, "access_token");
         assert_eq!(response.validated_user_id.as_deref(), Some("user_1"));
+    }
+
+    #[test]
+    fn refresh_response_builds_unvalidated_mcp_bearer_token() {
+        let response: super::HiggsfieldTokenResponse = serde_json::from_value(json!({
+            "access_token": "access_token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": " hfr_next "
+        }))
+        .unwrap();
+
+        let (access_token, rotated_refresh_token) = access_token_from_refresh_response(response);
+
+        assert_eq!(access_token.access_token, "access_token");
+        assert_eq!(access_token.token_type.as_deref(), Some("Bearer"));
+        assert_eq!(access_token.expires_in, Some(3600));
+        assert_eq!(access_token.validated_user_id, None);
+        assert_eq!(rotated_refresh_token.as_deref(), Some("hfr_next"));
     }
 
     #[test]
