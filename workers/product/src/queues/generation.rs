@@ -1929,8 +1929,8 @@ async fn submit_generation_to_provider(
     let mut provider_request = request_json.clone();
     if let Some(object) = provider_request.as_object_mut() {
         object.insert(
-            "uploadedReferenceUrl".to_string(),
-            json!(uploaded_reference.url.clone()),
+            "uploadedReferenceValue".to_string(),
+            json!(uploaded_reference.reference_value.clone()),
         );
     }
     let arguments = submission_arguments_from_request(job_id, &provider_request)?;
@@ -2037,14 +2037,17 @@ fn final_image_url(raw_json: &Value) -> Option<String> {
 fn provider_job_ids(raw_json: &Value) -> Value {
     let mut ids = Vec::new();
     for payload in provider_payloads(raw_json) {
-        for path in [
-            "/result/id",
-            "/result/job_id",
-            "/result/jobId",
-            "/id",
-            "/job_id",
-            "/jobId",
-        ] {
+        for path in ["/result/id", "/result/job_id", "/result/jobId"] {
+            if let Some(id) = json_string_at(&payload, path) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        if is_jsonrpc_envelope(&payload) {
+            continue;
+        }
+        for path in ["/id", "/job_id", "/jobId"] {
             if let Some(id) = json_string_at(&payload, path) {
                 if !ids.contains(&id) {
                     ids.push(id);
@@ -2133,6 +2136,11 @@ fn collect_mcp_content_payloads(value: &Value, payloads: &mut Vec<Value>, depth:
     }
 }
 
+fn is_jsonrpc_envelope(payload: &Value) -> bool {
+    payload.get("jsonrpc").and_then(Value::as_str).is_some()
+        && (payload.get("result").is_some() || payload.get("error").is_some())
+}
+
 fn usage_date_from_request_json(request_json: &str) -> Option<String> {
     serde_json::from_str::<Value>(request_json)
         .ok()
@@ -2152,13 +2160,19 @@ fn request_has_usage_reservation_marker(request_json: &str) -> bool {
 }
 
 fn submission_arguments_from_request(_job_id: &str, request_json: &Value) -> WorkerResult<Value> {
+    let uploaded_reference_value = json_string_at(request_json, "/uploadedReferenceValue")
+        .or_else(|| json_string_at(request_json, "/uploadedReferenceUrl"))
+        .ok_or_else(|| {
+            Error::RustError("missing_generation_request_field:/uploadedReferenceValue".to_string())
+        })?;
+
     Ok(json!({
         "params": {
             "model": "soul_2",
             "prompt": "",
             "soul_id": required_json_string(request_json, "/providerSoulId")?,
             "medias": [{
-                "value": required_json_string(request_json, "/uploadedReferenceUrl")?,
+                "value": uploaded_reference_value,
                 "role": "image",
             }],
             "count": 1,
@@ -2603,6 +2617,27 @@ mod tests {
     }
 
     #[test]
+    fn provider_job_ids_ignore_jsonrpc_request_id_on_tool_error() {
+        let wrapped = json!({
+            "id": "generation_request_id",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "Provider submission failed"
+                }],
+                "isError": true,
+                "structuredContent": {
+                    "error": "Provider submission failed"
+                }
+            }
+        });
+
+        assert_eq!(provider_job_ids(&wrapped), json!([]));
+        assert!(provider_ids_are_empty(&provider_job_ids(&wrapped)));
+    }
+
+    #[test]
     fn usage_date_is_read_from_generation_request_json() {
         assert_eq!(
             usage_date_from_request_json(r#"{"usageDate":"2026-05-11"}"#),
@@ -2707,7 +2742,7 @@ mod tests {
             "visualReferenceId": "vref_1",
             "usageDate": "2026-05-11",
             "prompt": "",
-            "uploadedReferenceUrl": "https://higgsfield.example/uploaded.jpg"
+            "uploadedReferenceValue": "7ea59a7b-244e-41b1-b683-a60e1ff2df70"
         });
 
         assert_eq!(
@@ -2718,7 +2753,7 @@ mod tests {
                     "prompt": "",
                     "soul_id": "soul_1",
                     "medias": [{
-                        "value": "https://higgsfield.example/uploaded.jpg",
+                        "value": "7ea59a7b-244e-41b1-b683-a60e1ff2df70",
                         "role": "image"
                     }],
                     "count": 1

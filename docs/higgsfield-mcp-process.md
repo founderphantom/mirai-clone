@@ -147,14 +147,19 @@ For each returned upload:
 
 Observed behavior:
 
+- As of 2026-05-13, `media_upload` can return plain MCP text content with
+  generated `curl -X PUT` commands instead of structured JSON upload slots.
+  Parse the media ID, signed upload URL, and `Content-Type` from those lines.
+  Use the signed URL for the PUT, then use the confirmed media ID as the
+  provider reference value after `media_confirm`. Do not derive a public URL by
+  stripping the signed URL query string; that CloudFront/S3 URL may still return
+  `403`.
+- Structured JSON upload responses may include a public HTTPS `url`. When they
+  do, wait for that URL to become fetchable and use it as the provider reference
+  value.
 - `media_confirm` returned status `"uploaded"`.
-- Passing confirmed `media_id` values into `show_characters` failed with:
-  `"Expected a media_id UUID, completed image generation job ID, or https:// URL"`.
-- Passing the returned public HTTPS `url` values into `show_characters`
-  succeeded after the URLs were readable.
-
-Use the public HTTPS `url` values for Soul training unless Higgsfield fixes the
-media-ID path.
+- `show_characters` validates image references as media ID UUIDs, completed
+  image generation job IDs, or HTTPS URLs.
 
 ## Soul Creation
 

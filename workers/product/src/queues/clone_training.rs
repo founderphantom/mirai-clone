@@ -3,8 +3,8 @@ use crate::providers::higgsfield_auth::{
     provider_account_access_token, HiggsfieldAuthError, HiggsfieldAuthPhase,
 };
 use crate::providers::higgsfield_mcp::{
-    call_tool, extract_provider_soul_id, extract_provider_status, upload_media_files,
-    HiggsfieldMcpError, HiggsfieldMcpMediaFile,
+    call_tool, extract_provider_soul_id, extract_provider_status, extract_provider_tool_error,
+    upload_media_files, HiggsfieldMcpError, HiggsfieldMcpMediaFile, HiggsfieldUploadedMedia,
 };
 use crate::queues::messages::CloneTrainingMessage;
 use crate::services::provider_accounts::{choose_provider_account, ProviderAccountCandidate};
@@ -348,6 +348,22 @@ async fn handle_clone_training_message(
                 return Ok(());
             }
             if let Some((error_code, error_message, raw_json)) =
+                mcp_media_url_not_ready_failure(&error)
+            {
+                fail_clone_training_job(
+                    db,
+                    job_id,
+                    clone_id,
+                    user_id,
+                    idempotency_key,
+                    error_code,
+                    &error_message,
+                    &raw_json,
+                )
+                .await?;
+                return Ok(());
+            }
+            if let Some((error_code, error_message, raw_json)) =
                 mcp_invalid_response_failure(&error, "media_upload")
             {
                 fail_clone_training_job(
@@ -398,6 +414,25 @@ async fn handle_clone_training_message(
             return Err(map_mcp_error(error));
         }
     };
+
+    if let Some(error_message) = extract_provider_tool_error(&result.raw_json) {
+        release_provider_lease(db, job_id).await?;
+        fail_clone_training_job(
+            db,
+            job_id,
+            clone_id,
+            user_id,
+            idempotency_key,
+            "higgsfield_clone_submit_failed",
+            &format!(
+                "Higgsfield MCP clone training submission failed: {}",
+                sanitize_error_detail(&error_message)
+            ),
+            &result.raw_json,
+        )
+        .await?;
+        return Ok(());
+    }
 
     let provider_soul_id = match extract_provider_soul_id(&result.raw_json) {
         Some(provider_soul_id) => provider_soul_id,
@@ -1025,7 +1060,7 @@ async fn load_and_upload_training_references(
     }
 
     let uploaded = upload_media_files(access_token, &files).await?;
-    Ok(uploaded.into_iter().map(|media| media.url).collect())
+    Ok(uploaded_media_reference_values(uploaded))
 }
 
 async fn load_training_references(
@@ -1338,6 +1373,13 @@ fn clone_training_submission_arguments(name: &str, images: Vec<String>) -> Value
     })
 }
 
+fn uploaded_media_reference_values(uploaded: Vec<HiggsfieldUploadedMedia>) -> Vec<String> {
+    uploaded
+        .into_iter()
+        .map(|media| media.reference_value)
+        .collect()
+}
+
 fn clone_training_status_arguments(provider_soul_id: &str) -> Value {
     json!({
         "action": "status",
@@ -1525,6 +1567,25 @@ fn mcp_invalid_response_failure(
     }
 }
 
+fn mcp_media_url_not_ready_failure(
+    error: &HiggsfieldMcpError,
+) -> Option<(&'static str, String, Value)> {
+    match error {
+        HiggsfieldMcpError::MediaUrlNotReady { url } => Some((
+            "higgsfield_media_url_not_ready",
+            format!(
+                "Higgsfield MCP uploaded media URL was not fetchable after confirmation: {}",
+                sanitize_error_detail(url)
+            ),
+            json!({
+                "errorCode": "higgsfield_media_url_not_ready",
+                "url": url,
+            }),
+        )),
+        _ => None,
+    }
+}
+
 fn sanitize_error_detail(message: &str) -> String {
     let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let truncated = compact.chars().take(240).collect::<String>();
@@ -1560,10 +1621,11 @@ mod tests {
         clone_training_status_arguments, clone_training_submission_arguments,
         has_provider_submission, higgsfield_auth_provider_action_error,
         higgsfield_mcp_provider_action_error, lease_is_expired, mcp_error_detail,
-        mcp_invalid_response_failure, CloneTrainingProviderError, TrainingJobRow,
+        mcp_invalid_response_failure, mcp_media_url_not_ready_failure,
+        uploaded_media_reference_values, CloneTrainingProviderError, TrainingJobRow,
     };
     use crate::providers::higgsfield_auth::{HiggsfieldAuthError, HiggsfieldAuthPhase};
-    use crate::providers::higgsfield_mcp::HiggsfieldMcpError;
+    use crate::providers::higgsfield_mcp::{HiggsfieldMcpError, HiggsfieldUploadedMedia};
     use serde_json::json;
 
     fn job(provider_job_id: Option<&str>, response_json: &str) -> TrainingJobRow {
@@ -1614,7 +1676,7 @@ mod tests {
                 "Maya",
                 vec![
                     "https://higgsfield.example/maya-01.png".to_string(),
-                    "https://higgsfield.example/maya-02.png".to_string(),
+                    "7ea59a7b-244e-41b1-b683-a60e1ff2df70".to_string(),
                 ],
             ),
             json!({
@@ -1622,9 +1684,33 @@ mod tests {
                 "name": "Maya",
                 "images": [
                     "https://higgsfield.example/maya-01.png",
-                    "https://higgsfield.example/maya-02.png"
+                    "7ea59a7b-244e-41b1-b683-a60e1ff2df70"
                 ]
             })
+        );
+    }
+
+    #[test]
+    fn uploaded_media_reference_values_use_url_or_media_id_reference() {
+        assert_eq!(
+            uploaded_media_reference_values(vec![
+                HiggsfieldUploadedMedia {
+                    media_id: "media_1".to_string(),
+                    url: Some("https://higgsfield.example/maya-01.png".to_string()),
+                    reference_value: "https://higgsfield.example/maya-01.png".to_string(),
+                    content_type: "image/png".to_string(),
+                },
+                HiggsfieldUploadedMedia {
+                    media_id: "7ea59a7b-244e-41b1-b683-a60e1ff2df70".to_string(),
+                    url: None,
+                    reference_value: "7ea59a7b-244e-41b1-b683-a60e1ff2df70".to_string(),
+                    content_type: "image/jpeg".to_string(),
+                },
+            ]),
+            vec![
+                "https://higgsfield.example/maya-01.png".to_string(),
+                "7ea59a7b-244e-41b1-b683-a60e1ff2df70".to_string(),
+            ]
         );
     }
 
@@ -1725,6 +1811,30 @@ mod tests {
             "Higgsfield MCP media_upload response was invalid: media_upload response did not include upload slots"
         );
         assert_eq!(failure_json, raw_json);
+        assert_eq!(higgsfield_mcp_provider_action_error(&error), None);
+    }
+
+    #[test]
+    fn media_url_not_ready_becomes_terminal_clone_training_failure_details() {
+        let error = HiggsfieldMcpError::MediaUrlNotReady {
+            url: "https://cdn.example/private/maya-01.png".to_string(),
+        };
+
+        let (error_code, error_message, failure_json) =
+            mcp_media_url_not_ready_failure(&error).expect("failure detail");
+
+        assert_eq!(error_code, "higgsfield_media_url_not_ready");
+        assert_eq!(
+            error_message,
+            "Higgsfield MCP uploaded media URL was not fetchable after confirmation: https://cdn.example/private/maya-01.png"
+        );
+        assert_eq!(
+            failure_json,
+            json!({
+                "errorCode": "higgsfield_media_url_not_ready",
+                "url": "https://cdn.example/private/maya-01.png"
+            })
+        );
         assert_eq!(higgsfield_mcp_provider_action_error(&error), None);
     }
 }

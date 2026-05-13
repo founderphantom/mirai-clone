@@ -28,7 +28,8 @@ pub struct HiggsfieldMcpMediaFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HiggsfieldUploadedMedia {
     pub media_id: String,
-    pub url: String,
+    pub url: Option<String>,
+    pub reference_value: String,
     pub content_type: String,
 }
 
@@ -36,7 +37,7 @@ pub struct HiggsfieldUploadedMedia {
 struct MediaUploadSlot {
     media_id: String,
     upload_url: String,
-    url: String,
+    url: Option<String>,
     content_type: Option<String>,
 }
 
@@ -143,31 +144,14 @@ pub async fn upload_media_files(
         put_media_bytes(&slot.upload_url, upload_content_type, &file.bytes).await?;
     }
 
-    let media_ids = slots
-        .iter()
-        .map(|slot| slot.media_id.clone())
-        .collect::<Vec<_>>();
-    call_tool(
-        access_token,
-        json!("media-confirm"),
-        MEDIA_CONFIRM_TOOL,
-        json!({
-            "type": "image",
-            "media_ids": media_ids,
-        }),
-    )
-    .await?;
+    confirm_uploaded_media(access_token, &slots).await?;
 
     let mut uploaded = Vec::with_capacity(slots.len());
     for (file, slot) in files.iter().zip(slots.into_iter()) {
-        wait_until_media_url_fetchable(&slot.url).await?;
-        uploaded.push(HiggsfieldUploadedMedia {
-            media_id: slot.media_id,
-            url: slot.url,
-            content_type: slot
-                .content_type
-                .unwrap_or_else(|| file.content_type.clone()),
-        });
+        if let Some(url) = slot.url.as_deref() {
+            wait_until_media_url_fetchable(url).await?;
+        }
+        uploaded.push(uploaded_media_from_slot(&file.content_type, slot));
     }
 
     Ok(uploaded)
@@ -175,32 +159,42 @@ pub async fn upload_media_files(
 
 pub fn extract_provider_job_id(raw_json: &Value) -> Option<String> {
     provider_payloads(raw_json).iter().find_map(|payload| {
-        [
-            "/result/id",
-            "/result/job_id",
-            "/result/jobId",
-            "/id",
-            "/job_id",
-            "/jobId",
-        ]
-        .into_iter()
-        .find_map(|path| json_string_at(payload, path))
+        let nested_id = ["/result/id", "/result/job_id", "/result/jobId"]
+            .into_iter()
+            .find_map(|path| json_string_at(payload, path));
+        nested_id.or_else(|| {
+            if is_jsonrpc_envelope(payload) {
+                None
+            } else {
+                ["/id", "/job_id", "/jobId"]
+                    .into_iter()
+                    .find_map(|path| json_string_at(payload, path))
+            }
+        })
     })
 }
 
 pub fn extract_provider_soul_id(raw_json: &Value) -> Option<String> {
     provider_payloads(raw_json).iter().find_map(|payload| {
-        [
-            "/result/soul_id",
-            "/result/soulId",
-            "/result/id",
-            "/soul_id",
-            "/soulId",
-            "/id",
-        ]
-        .into_iter()
-        .find_map(|path| json_string_at(payload, path))
+        let nested_id = ["/result/soul_id", "/result/soulId", "/result/id"]
+            .into_iter()
+            .find_map(|path| json_string_at(payload, path));
+        nested_id.or_else(|| {
+            if is_jsonrpc_envelope(payload) {
+                None
+            } else {
+                ["/soul_id", "/soulId", "/id"]
+                    .into_iter()
+                    .find_map(|path| json_string_at(payload, path))
+            }
+        })
     })
+}
+
+pub fn extract_provider_tool_error(raw_json: &Value) -> Option<String> {
+    provider_payloads(raw_json)
+        .iter()
+        .find_map(provider_tool_error)
 }
 
 pub fn extract_provider_status(raw_json: &Value) -> Option<String> {
@@ -296,12 +290,72 @@ async fn wait_until_media_url_fetchable(url: &str) -> Result<(), HiggsfieldMcpEr
     })
 }
 
+async fn confirm_uploaded_media(
+    access_token: &str,
+    slots: &[MediaUploadSlot],
+) -> Result<(), HiggsfieldMcpError> {
+    for slot in slots {
+        let response = call_tool(
+            access_token,
+            json!(format!("media-confirm:{}", slot.media_id)),
+            MEDIA_CONFIRM_TOOL,
+            json!({
+                "type": "image",
+                "media_id": slot.media_id,
+            }),
+        )
+        .await?;
+        if extract_provider_tool_error(&response.raw_json).is_none() {
+            continue;
+        }
+
+        let fallback_response = call_tool(
+            access_token,
+            json!(format!("media-confirm-array:{}", slot.media_id)),
+            MEDIA_CONFIRM_TOOL,
+            json!({
+                "type": "image",
+                "media_ids": [slot.media_id.clone()],
+            }),
+        )
+        .await?;
+        if let Some(message) = extract_provider_tool_error(&fallback_response.raw_json) {
+            return Err(HiggsfieldMcpError::InvalidResponse {
+                message: format!("media_confirm returned error: {message}"),
+                raw_json: fallback_response.raw_json,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn uploaded_media_from_slot(
+    file_content_type: &str,
+    slot: MediaUploadSlot,
+) -> HiggsfieldUploadedMedia {
+    let MediaUploadSlot {
+        media_id,
+        url,
+        content_type,
+        ..
+    } = slot;
+    let reference_value = url.clone().unwrap_or_else(|| media_id.clone());
+    HiggsfieldUploadedMedia {
+        media_id,
+        url,
+        reference_value,
+        content_type: content_type.unwrap_or_else(|| file_content_type.to_string()),
+    }
+}
+
 fn extract_media_upload_slots(
     raw_json: &Value,
 ) -> Result<Vec<MediaUploadSlot>, HiggsfieldMcpError> {
     let mut slots = Vec::new();
     for payload in provider_payloads(raw_json) {
         collect_media_upload_slots(&payload, &mut slots);
+        collect_media_upload_slots_from_text_payload(&payload, &mut slots);
     }
 
     if slots.is_empty() {
@@ -347,12 +401,111 @@ fn collect_media_upload_slots(payload: &Value, slots: &mut Vec<MediaUploadSlot>)
 
 fn push_media_upload_slot(value: &Value, slots: &mut Vec<MediaUploadSlot>) {
     if let Some(slot) = media_upload_slot_from_value(value) {
-        if !slots
-            .iter()
-            .any(|existing| existing.media_id == slot.media_id)
-        {
-            slots.push(slot);
+        push_unique_media_upload_slot(slot, slots);
+    }
+}
+
+fn push_unique_media_upload_slot(slot: MediaUploadSlot, slots: &mut Vec<MediaUploadSlot>) {
+    if !slots
+        .iter()
+        .any(|existing| existing.media_id == slot.media_id)
+    {
+        slots.push(slot);
+    }
+}
+
+fn collect_media_upload_slots_from_text_payload(payload: &Value, slots: &mut Vec<MediaUploadSlot>) {
+    for path in ["/result/content", "/content"] {
+        let Some(content) = payload.pointer(path).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in content {
+            if let Some(text) = item
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                collect_media_upload_slots_from_text(text, slots);
+            }
         }
+    }
+
+    if let Some(raw_text) = payload
+        .get("rawText")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        collect_media_upload_slots_from_text(raw_text, slots);
+    }
+}
+
+fn collect_media_upload_slots_from_text(text: &str, slots: &mut Vec<MediaUploadSlot>) {
+    for line in text.lines() {
+        if let Some(slot) = media_upload_slot_from_text_line(line) {
+            push_unique_media_upload_slot(slot, slots);
+        }
+    }
+}
+
+fn media_upload_slot_from_text_line(line: &str) -> Option<MediaUploadSlot> {
+    let line = line.trim();
+    let instruction = line.strip_prefix("- ")?;
+    let (media_id, details) = instruction.split_once(':')?;
+    let media_id = media_id.trim();
+    if !looks_like_uuid(media_id) {
+        return None;
+    }
+    let upload_url = first_https_url(details)?;
+    let content_type = content_type_from_upload_instruction(details);
+
+    Some(MediaUploadSlot {
+        media_id: media_id.to_string(),
+        upload_url,
+        url: None,
+        content_type,
+    })
+}
+
+fn looks_like_uuid(value: &str) -> bool {
+    let mut hyphen_count = 0;
+    for ch in value.chars() {
+        if ch == '-' {
+            hyphen_count += 1;
+        } else if !ch.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    value.len() == 36 && hyphen_count == 4
+}
+
+fn first_https_url(text: &str) -> Option<String> {
+    let start = text.find("https://")?;
+    let tail = &text[start..];
+    let end = tail
+        .find(|ch: char| matches!(ch, '\'' | '"' | ' ' | '\t' | '\r' | '\n'))
+        .unwrap_or(tail.len());
+    let url = tail[..end].trim();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
+fn content_type_from_upload_instruction(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("content-type:")? + "content-type:".len();
+    let value = text[start..].trim_start();
+    let content_type = value
+        .chars()
+        .take_while(|ch| !matches!(ch, '"' | '\'' | ' ' | '\t' | '\r' | '\n'))
+        .collect::<String>();
+    if content_type.is_empty() {
+        None
+    } else {
+        Some(content_type)
     }
 }
 
@@ -396,7 +549,7 @@ fn media_upload_slot_from_value(value: &Value) -> Option<MediaUploadSlot> {
     Some(MediaUploadSlot {
         media_id,
         upload_url,
-        url,
+        url: Some(url),
         content_type,
     })
 }
@@ -405,6 +558,33 @@ fn provider_payloads(raw_json: &Value) -> Vec<Value> {
     let mut payloads = vec![raw_json.clone()];
     collect_mcp_content_payloads(raw_json, &mut payloads, 0);
     payloads
+}
+
+fn provider_tool_error(payload: &Value) -> Option<String> {
+    let is_error = json_bool_at(payload, "/result/isError").unwrap_or(false)
+        || json_bool_at(payload, "/isError").unwrap_or(false);
+    if !is_error {
+        return None;
+    }
+
+    [
+        "/result/structuredContent/error",
+        "/structuredContent/error",
+        "/result/error/message",
+        "/error/message",
+        "/result/error",
+        "/error",
+        "/result/content/0/text",
+        "/content/0/text",
+    ]
+    .into_iter()
+    .find_map(|path| json_string_at(payload, path))
+    .or_else(|| Some("Higgsfield MCP tool returned an error.".to_string()))
+}
+
+fn is_jsonrpc_envelope(payload: &Value) -> bool {
+    payload.get("jsonrpc").and_then(Value::as_str).is_some()
+        && (payload.get("result").is_some() || payload.get("error").is_some())
 }
 
 fn collect_mcp_content_payloads(value: &Value, payloads: &mut Vec<Value>, depth: u8) {
@@ -443,11 +623,16 @@ fn json_string_at(value: &Value, path: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn json_bool_at(value: &Value, path: &str) -> Option<bool> {
+    value.pointer(path).and_then(Value::as_bool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         extract_media_upload_slots, extract_provider_job_id, extract_provider_soul_id,
-        parse_mcp_response_text,
+        extract_provider_tool_error, parse_mcp_response_text, uploaded_media_from_slot,
+        MediaUploadSlot,
     };
     use serde_json::json;
 
@@ -489,6 +674,34 @@ data: {"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"id\":\"hf_
     }
 
     #[test]
+    fn mcp_tool_error_does_not_treat_jsonrpc_request_id_as_provider_id() {
+        let wrapped = json!({
+            "id": "train_request_id",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "Expected a media_id UUID, completed image generation job ID, or https:// URL"
+                }],
+                "isError": true,
+                "structuredContent": {
+                    "error": "Expected a media_id UUID, completed image generation job ID, or https:// URL"
+                }
+            }
+        });
+
+        assert_eq!(extract_provider_job_id(&wrapped), None);
+        assert_eq!(extract_provider_soul_id(&wrapped), None);
+        assert_eq!(
+            extract_provider_tool_error(&wrapped),
+            Some(
+                "Expected a media_id UUID, completed image generation job ID, or https:// URL"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn extracts_media_upload_slots_from_mcp_content_text_array() {
         let wrapped = json!({
             "result": {
@@ -504,8 +717,61 @@ data: {"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"id\":\"hf_
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].media_id, "media_1");
         assert_eq!(slots[0].upload_url, "https://upload.example/1");
-        assert_eq!(slots[0].url, "https://cdn.example/1.jpg");
+        assert_eq!(slots[0].url.as_deref(), Some("https://cdn.example/1.jpg"));
         assert_eq!(slots[0].content_type.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn structured_media_upload_slot_uses_public_url_as_reference_value() {
+        let uploaded = uploaded_media_from_slot(
+            "image/jpeg",
+            MediaUploadSlot {
+                media_id: "media_1".to_string(),
+                upload_url: "https://upload.example/1".to_string(),
+                url: Some("https://cdn.example/1.jpg".to_string()),
+                content_type: Some("image/png".to_string()),
+            },
+        );
+
+        assert_eq!(uploaded.media_id, "media_1");
+        assert_eq!(uploaded.url.as_deref(), Some("https://cdn.example/1.jpg"));
+        assert_eq!(uploaded.reference_value, "https://cdn.example/1.jpg");
+        assert_eq!(uploaded.content_type, "image/png");
+    }
+
+    #[test]
+    fn extracts_media_upload_slots_from_higgsfield_curl_instructions() {
+        let wrapped = json!({
+            "id": "media-upload",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "Generated 2 upload URLs. Run the curl commands, then call media_confirm with the media_ids.\n- 7ea59a7b-244e-41b1-b683-a60e1ff2df70: Upload the file using: curl -X PUT -H \"Content-Type: image/jpeg\" --data-binary @media_1.jpg 'https://cdn.example/user_1/7ea59a7b-244e-41b1-b683-a60e1ff2df70.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=sig1'. After upload, call the media_confirm tool with type \"image\" and media_id \"7ea59a7b-244e-41b1-b683-a60e1ff2df70\".\n- ba94ed0b-20fb-47bf-a359-b3b3e429110d: Upload the file using: curl -X PUT -H \"Content-Type: image/png\" --data-binary @media_2.png 'https://cdn.example/user_1/ba94ed0b-20fb-47bf-a359-b3b3e429110d.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=sig2'. After upload, call the media_confirm tool with type \"image\" and media_id \"ba94ed0b-20fb-47bf-a359-b3b3e429110d\"."
+                }]
+            }
+        });
+
+        let slots = extract_media_upload_slots(&wrapped).expect("upload slots");
+
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].media_id, "7ea59a7b-244e-41b1-b683-a60e1ff2df70");
+        assert_eq!(
+            slots[0].upload_url,
+            "https://cdn.example/user_1/7ea59a7b-244e-41b1-b683-a60e1ff2df70.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=sig1"
+        );
+        assert_eq!(slots[0].url, None);
+        assert_eq!(slots[0].content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(slots[1].media_id, "ba94ed0b-20fb-47bf-a359-b3b3e429110d");
+        assert_eq!(slots[1].url, None);
+        assert_eq!(slots[1].content_type.as_deref(), Some("image/png"));
+
+        let uploaded = uploaded_media_from_slot("image/jpeg", slots[0].clone());
+        assert_eq!(
+            uploaded.reference_value,
+            "7ea59a7b-244e-41b1-b683-a60e1ff2df70"
+        );
+        assert_eq!(uploaded.url, None);
     }
 
     #[test]
@@ -527,7 +793,7 @@ data: {"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"id\":\"hf_
 
         assert_eq!(slots.len(), 2);
         assert_eq!(slots[0].media_id, "media_1");
-        assert_eq!(slots[0].url, "https://cdn.example/1.jpg");
+        assert_eq!(slots[0].url.as_deref(), Some("https://cdn.example/1.jpg"));
         assert_eq!(slots[1].media_id, "media_2");
         assert_eq!(slots[1].upload_url, "https://upload.example/2");
     }
@@ -549,6 +815,25 @@ data: {"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"id\":\"hf_
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].media_id, "media_1");
         assert_eq!(slots[0].upload_url, "https://upload.example/1");
-        assert_eq!(slots[0].url, "https://cdn.example/1.jpg");
+        assert_eq!(slots[0].url.as_deref(), Some("https://cdn.example/1.jpg"));
+    }
+
+    #[test]
+    fn rejects_unparseable_media_upload_text() {
+        let wrapped = json!({
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "Generated upload URLs, but no curl commands are present."
+                }]
+            }
+        });
+
+        let error = extract_media_upload_slots(&wrapped).expect_err("invalid response");
+
+        assert!(matches!(
+            error,
+            super::HiggsfieldMcpError::InvalidResponse { .. }
+        ));
     }
 }
