@@ -238,7 +238,7 @@ def poll_for_token(
 
 
 def refresh_access_token(refresh_url: str, refresh_token: str) -> str:
-    response = post_json(refresh_url, {"refreshToken": refresh_token})
+    response = post_json(refresh_url, {"refresh_token": refresh_token})
     access_token = first_present(response, "accessToken", "access_token")
     if not access_token:
         raise RuntimeError(f"refresh response missing access token: {response}")

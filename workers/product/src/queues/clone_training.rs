@@ -1,6 +1,6 @@
 use crate::db;
 use crate::providers::higgsfield_auth::{
-    refresh_access_token, validate_access_token, HiggsfieldAuthError,
+    refresh_provider_account_access_token, validate_access_token, HiggsfieldAuthError,
 };
 use crate::providers::higgsfield_mcp::{
     call_tool, extract_provider_soul_id, extract_provider_status, upload_media_files,
@@ -25,6 +25,7 @@ const MAX_CLONE_TRAINING_POLL_ATTEMPTS: u8 = 90;
 #[derive(Debug, Deserialize)]
 struct TrainingJobRow {
     status: String,
+    provider_account_id: Option<String>,
     provider_job_id: Option<String>,
     response_json: String,
     clone_display_name: String,
@@ -61,8 +62,6 @@ enum CloneTrainingProviderError {
     HiggsfieldMcpToolMissing,
     #[error("No healthy Higgsfield provider account is available.")]
     HiggsfieldProviderAccountUnavailable,
-    #[error("Higgsfield provider access token is invalid.")]
-    HiggsfieldTokenInvalid,
 }
 
 impl CloneTrainingProviderError {
@@ -72,7 +71,6 @@ impl CloneTrainingProviderError {
             Self::HiggsfieldRefreshTokenInvalid => "higgsfield_refresh_token_invalid",
             Self::HiggsfieldMcpToolMissing => "higgsfield_mcp_tool_missing",
             Self::HiggsfieldProviderAccountUnavailable => "higgsfield_provider_account_unavailable",
-            Self::HiggsfieldTokenInvalid => "higgsfield_token_invalid",
         }
     }
 }
@@ -162,6 +160,7 @@ async fn handle_clone_training_message(
         r#"
         SELECT
           stj.status,
+          stj.provider_account_id,
           stj.provider_job_id,
           stj.response_json,
           cp.display_name AS clone_display_name
@@ -220,19 +219,6 @@ async fn handle_clone_training_message(
     }
     ensure_clone_training_status(db, clone_id, user_id).await?;
 
-    if env.secret(HIGGSFIELD_REFRESH_SECRET_NAME).is_err() {
-        mark_provider_action_required(
-            db,
-            job_id,
-            clone_id,
-            user_id,
-            idempotency_key,
-            &CloneTrainingProviderError::HiggsfieldSecretMissing,
-        )
-        .await?;
-        return Ok(());
-    }
-
     let tool_name = match env.var(HIGGSFIELD_TRAINING_TOOL_VAR) {
         Ok(tool_name) if !tool_name.to_string().trim().is_empty() => tool_name.to_string(),
         _ => {
@@ -264,7 +250,14 @@ async fn handle_clone_training_message(
         return Ok(());
     };
 
-    let token = match refresh_access_token(env, HIGGSFIELD_REFRESH_SECRET_NAME).await {
+    let token = match refresh_provider_account_access_token(
+        db,
+        env,
+        &provider_account.id,
+        HIGGSFIELD_REFRESH_SECRET_NAME,
+    )
+    .await
+    {
         Ok(token) => token,
         Err(error) => {
             let Some(provider_error) = higgsfield_auth_provider_action_error(&error) else {
@@ -283,21 +276,9 @@ async fn handle_clone_training_message(
         }
     };
 
-    let validation = validate_access_token(&token.access_token)
+    validate_access_token(&token.access_token)
         .await
         .map_err(|error| Error::RustError(error.to_string()))?;
-    if !validation.valid {
-        mark_provider_action_required(
-            db,
-            job_id,
-            clone_id,
-            user_id,
-            idempotency_key,
-            &CloneTrainingProviderError::HiggsfieldTokenInvalid,
-        )
-        .await?;
-        return Ok(());
-    }
 
     match reserve_provider_lease(db, &provider_account.id, job_id).await? {
         ProviderLeaseReservation::Acquired => {}
@@ -452,7 +433,35 @@ async fn poll_clone_training_message(
         }
     };
 
-    let token = match refresh_access_token(env, HIGGSFIELD_REFRESH_SECRET_NAME).await {
+    let Some(provider_account_id) = job
+        .provider_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return retry_clone_training_poll_after_error(
+            db,
+            env,
+            job_id,
+            clone_id,
+            user_id,
+            idempotency_key,
+            provider_soul_id,
+            attempt,
+            max_attempts,
+            "clone_training_poll_provider_account_missing",
+            "Clone training poll is missing provider account state.",
+        )
+        .await;
+    };
+    let token = match refresh_provider_account_access_token(
+        db,
+        env,
+        provider_account_id,
+        HIGGSFIELD_REFRESH_SECRET_NAME,
+    )
+    .await
+    {
         Ok(token) => token,
         Err(error) => {
             return retry_clone_training_poll_after_error(
@@ -471,26 +480,7 @@ async fn poll_clone_training_message(
             .await;
         }
     };
-    let validation = match validate_access_token(&token.access_token).await {
-        Ok(validation) => validation,
-        Err(error) => {
-            return retry_clone_training_poll_after_error(
-                db,
-                env,
-                job_id,
-                clone_id,
-                user_id,
-                idempotency_key,
-                provider_soul_id,
-                attempt,
-                max_attempts,
-                "clone_training_poll_auth_failed",
-                &error.to_string(),
-            )
-            .await;
-        }
-    };
-    if !validation.valid {
+    if let Err(error) = validate_access_token(&token.access_token).await {
         return retry_clone_training_poll_after_error(
             db,
             env,
@@ -501,8 +491,8 @@ async fn poll_clone_training_message(
             provider_soul_id,
             attempt,
             max_attempts,
-            "clone_training_poll_token_invalid",
-            "Higgsfield provider access token is invalid.",
+            "clone_training_poll_auth_failed",
+            &error.to_string(),
         )
         .await;
     }
@@ -897,6 +887,7 @@ async fn load_training_job_for_poll(
         r#"
         SELECT
           stj.status,
+          stj.provider_account_id,
           stj.provider_job_id,
           stj.response_json,
           cp.display_name AS clone_display_name
@@ -1400,7 +1391,7 @@ fn higgsfield_auth_provider_action_error(
         HiggsfieldAuthError::MissingSecret { .. } => {
             Some(CloneTrainingProviderError::HiggsfieldSecretMissing)
         }
-        HiggsfieldAuthError::HttpStatus { status } if *status == 422 => {
+        HiggsfieldAuthError::HttpStatus { status } if matches!(*status, 401 | 422) => {
             Some(CloneTrainingProviderError::HiggsfieldRefreshTokenInvalid)
         }
         _ => None,
@@ -1437,6 +1428,7 @@ mod tests {
     fn job(provider_job_id: Option<&str>, response_json: &str) -> TrainingJobRow {
         TrainingJobRow {
             status: "training".to_string(),
+            provider_account_id: Some("pa_higgsfield_founder".to_string()),
             provider_job_id: provider_job_id.map(ToString::to_string),
             response_json: response_json.to_string(),
             clone_display_name: "Maya".to_string(),
@@ -1508,6 +1500,10 @@ mod tests {
 
     #[test]
     fn refresh_token_rejection_requires_provider_action_instead_of_queue_retry() {
+        assert_eq!(
+            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus { status: 401 }),
+            Some(CloneTrainingProviderError::HiggsfieldRefreshTokenInvalid)
+        );
         assert_eq!(
             higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus { status: 422 }),
             Some(CloneTrainingProviderError::HiggsfieldRefreshTokenInvalid)

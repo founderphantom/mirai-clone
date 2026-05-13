@@ -1,5 +1,7 @@
 use crate::db;
-use crate::providers::higgsfield_auth::{refresh_access_token, validate_access_token};
+use crate::providers::higgsfield_auth::{
+    refresh_provider_account_access_token, validate_access_token,
+};
 use crate::providers::higgsfield_mcp::{
     call_tool, upload_media_files, HiggsfieldMcpError, HiggsfieldMcpMediaFile,
 };
@@ -17,6 +19,7 @@ use worker::{
 };
 
 const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER";
+const HIGGSFIELD_PROVIDER_ACCOUNT_ID: &str = "pa_higgsfield_founder";
 const HIGGSFIELD_GENERATION_TOOL_VAR: &str = "HIGGSFIELD_MCP_GENERATION_TOOL";
 const HIGGSFIELD_JOB_STATUS_TOOL: &str = "job_status";
 const GENERATION_POLL_DELAY_SECONDS: u32 = 10;
@@ -43,6 +46,7 @@ struct GenerationJobRow {
     blitz_batch_id: Option<String>,
     input_visual_reference_id: Option<String>,
     status: String,
+    provider_account_id: Option<String>,
     provider_job_ids_json: String,
     request_json: String,
     response_json: String,
@@ -279,7 +283,14 @@ async fn submit_generation_job(
     }
 
     let tool_name = generation_tool_name(env)?;
-    let token = match refresh_access_token(env, HIGGSFIELD_REFRESH_SECRET_NAME).await {
+    let token = match refresh_provider_account_access_token(
+        db,
+        env,
+        HIGGSFIELD_PROVIDER_ACCOUNT_ID,
+        HIGGSFIELD_REFRESH_SECRET_NAME,
+    )
+    .await
+    {
         Ok(token) => token,
         Err(error) => {
             schedule_submission_retry(
@@ -294,35 +305,20 @@ async fn submit_generation_job(
             return Ok(());
         }
     };
-    let validation = match validate_access_token(&token.access_token).await {
-        Ok(validation) => validation,
-        Err(error) => {
-            schedule_submission_retry(
-                db,
-                env,
-                job_id,
-                batch_id,
-                "provider_submission_validation_retry",
-                &error.to_string(),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    if !validation.valid {
+    if let Err(error) = validate_access_token(&token.access_token).await {
         schedule_submission_retry(
             db,
             env,
             job_id,
             batch_id,
-            "provider_submission_token_invalid",
-            "Higgsfield provider access token is invalid.",
+            "provider_submission_validation_retry",
+            &error.to_string(),
         )
         .await?;
         return Ok(());
     }
 
-    if !mark_generation_job_submitting(db, job_id).await? {
+    if !mark_generation_job_submitting(db, job_id, HIGGSFIELD_PROVIDER_ACCOUNT_ID).await? {
         return Ok(());
     }
 
@@ -620,7 +616,20 @@ async fn poll_generation(
             return Ok(());
         }
     };
-    let token = match refresh_access_token(env, HIGGSFIELD_REFRESH_SECRET_NAME).await {
+    let provider_account_id = job
+        .provider_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(HIGGSFIELD_PROVIDER_ACCOUNT_ID);
+    let token = match refresh_provider_account_access_token(
+        db,
+        env,
+        provider_account_id,
+        HIGGSFIELD_REFRESH_SECRET_NAME,
+    )
+    .await
+    {
         Ok(token) => token,
         Err(error) => {
             return handle_poll_failure(
@@ -636,23 +645,7 @@ async fn poll_generation(
             .await;
         }
     };
-    let validation = match validate_access_token(&token.access_token).await {
-        Ok(validation) => validation,
-        Err(error) => {
-            return handle_poll_failure(
-                db,
-                env,
-                job_id,
-                batch_id,
-                attempt,
-                max_attempts,
-                "provider_poll_auth_failed",
-                &error.to_string(),
-            )
-            .await
-        }
-    };
-    if !validation.valid {
+    if let Err(error) = validate_access_token(&token.access_token).await {
         return handle_poll_failure(
             db,
             env,
@@ -660,8 +653,8 @@ async fn poll_generation(
             batch_id,
             attempt,
             max_attempts,
-            "provider_poll_token_invalid",
-            "Higgsfield provider access token is invalid.",
+            "provider_poll_auth_failed",
+            &error.to_string(),
         )
         .await;
     }
@@ -1302,19 +1295,29 @@ async fn insert_generation_job(
     Ok(changed_rows(&result)? > 0)
 }
 
-async fn mark_generation_job_submitting(db: &D1Database, job_id: &str) -> WorkerResult<bool> {
+async fn mark_generation_job_submitting(
+    db: &D1Database,
+    job_id: &str,
+    provider_account_id: &str,
+) -> WorkerResult<bool> {
     let now = now_iso_string();
     let result = db::run(
         db,
         r#"
         UPDATE generation_jobs
         SET status = 'submitted',
+            provider_account_id = COALESCE(provider_account_id, ?),
             started_at = COALESCE(started_at, ?),
             updated_at = ?
         WHERE id = ?
           AND status = 'queued'
         "#,
-        vec![json!(now), json!(now), json!(job_id)],
+        vec![
+            json!(provider_account_id),
+            json!(now),
+            json!(now),
+            json!(job_id),
+        ],
     )
     .await?;
     Ok(changed_rows(&result)? > 0)
@@ -1763,6 +1766,7 @@ async fn load_generation_job(
           blitz_batch_id,
           input_visual_reference_id,
           status,
+          provider_account_id,
           provider_job_ids_json,
           request_json,
           response_json,
@@ -1790,6 +1794,7 @@ async fn load_generation_job_by_id(
           blitz_batch_id,
           input_visual_reference_id,
           status,
+          provider_account_id,
           provider_job_ids_json,
           request_json,
           response_json,
