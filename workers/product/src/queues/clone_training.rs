@@ -1,11 +1,13 @@
 use crate::db;
+use crate::providers::higgsfield_agent::{
+    create_soul_reference, get_soul_reference, upload_media_files as upload_agent_media_files,
+    HiggsfieldAgentError, HiggsfieldAgentMediaFile, HiggsfieldAgentUploadedMedia,
+    HIGGSFIELD_AGENT_API_BASE_URL,
+};
 use crate::providers::higgsfield_auth::{
     provider_account_access_token, HiggsfieldAuthError, HiggsfieldAuthPhase,
 };
-use crate::providers::higgsfield_mcp::{
-    call_tool, extract_provider_soul_id, extract_provider_status, extract_provider_tool_error,
-    upload_media_files, HiggsfieldMcpError, HiggsfieldMcpMediaFile, HiggsfieldUploadedMedia,
-};
+use crate::providers::higgsfield_mcp::{extract_provider_soul_id, extract_provider_status};
 use crate::queues::messages::CloneTrainingMessage;
 use crate::services::provider_accounts::{choose_provider_account, ProviderAccountCandidate};
 use serde::Deserialize;
@@ -16,7 +18,7 @@ use worker::{
 };
 
 const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER";
-const HIGGSFIELD_TRAINING_TOOL_VAR: &str = "HIGGSFIELD_MCP_CLONE_TRAINING_TOOL";
+const HIGGSFIELD_AGENT_API_URL_VAR: &str = "HIGGSFIELD_API_URL";
 const ACTIVE_LEASE_MINUTES: f64 = 30.0;
 const SUBMITTED_LEASE_MINUTES: f64 = 360.0;
 const CLONE_TRAINING_POLL_DELAY_SECONDS: u32 = 60;
@@ -57,14 +59,14 @@ enum CloneTrainingUploadError {
     #[error(transparent)]
     Worker(#[from] Error),
     #[error(transparent)]
-    Mcp(#[from] HiggsfieldMcpError),
+    Agent(#[from] HiggsfieldAgentError),
 }
 
 impl CloneTrainingUploadError {
     fn into_worker_error(self) -> Error {
         match self {
             Self::Worker(error) => error,
-            Self::Mcp(error) => map_mcp_error(error),
+            Self::Agent(error) => map_agent_error(error),
         }
     }
 }
@@ -77,8 +79,6 @@ enum CloneTrainingProviderError {
     HiggsfieldRefreshTokenInvalid,
     #[error("Higgsfield provider access token is invalid or expired.")]
     HiggsfieldProviderAuthInvalid,
-    #[error("Higgsfield MCP clone training tool is not configured.")]
-    HiggsfieldMcpToolMissing,
     #[error("No healthy Higgsfield provider account is available.")]
     HiggsfieldProviderAccountUnavailable,
 }
@@ -89,7 +89,6 @@ impl CloneTrainingProviderError {
             Self::HiggsfieldSecretMissing => "higgsfield_secret_missing",
             Self::HiggsfieldRefreshTokenInvalid => "higgsfield_refresh_token_invalid",
             Self::HiggsfieldProviderAuthInvalid => "higgsfield_provider_auth_invalid",
-            Self::HiggsfieldMcpToolMissing => "higgsfield_mcp_tool_missing",
             Self::HiggsfieldProviderAccountUnavailable => "higgsfield_provider_account_unavailable",
         }
     }
@@ -239,23 +238,7 @@ async fn handle_clone_training_message(
     }
     ensure_clone_training_status(db, clone_id, user_id).await?;
 
-    let tool_name = match env.var(HIGGSFIELD_TRAINING_TOOL_VAR) {
-        Ok(tool_name) if !tool_name.to_string().trim().is_empty() => tool_name.to_string(),
-        _ => {
-            mark_provider_action_required(
-                db,
-                job_id,
-                clone_id,
-                user_id,
-                idempotency_key,
-                &CloneTrainingProviderError::HiggsfieldMcpToolMissing,
-                None,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
+    let api_base_url = higgsfield_agent_api_base_url(env);
     let candidates = load_provider_candidates(db).await?;
     let provider_account = choose_provider_account(&candidates).cloned();
     let Some(provider_account) = provider_account else {
@@ -324,6 +307,7 @@ async fn handle_clone_training_message(
 
     let uploaded_images = match load_and_upload_training_references(
         env,
+        &api_base_url,
         &token.access_token,
         clone_id,
         user_id,
@@ -331,10 +315,10 @@ async fn handle_clone_training_message(
     .await
     {
         Ok(images) => images,
-        Err(CloneTrainingUploadError::Mcp(error)) => {
+        Err(CloneTrainingUploadError::Agent(error)) => {
             release_provider_lease(db, job_id).await?;
-            if let Some(provider_error) = higgsfield_mcp_provider_action_error(&error) {
-                let detail = mcp_error_detail(&error, "media_upload");
+            if let Some(provider_error) = higgsfield_agent_provider_action_error(&error) {
+                let detail = agent_error_detail(&error, "media_upload");
                 mark_provider_action_required(
                     db,
                     job_id,
@@ -348,7 +332,7 @@ async fn handle_clone_training_message(
                 return Ok(());
             }
             if let Some((error_code, error_message, raw_json)) =
-                mcp_media_url_not_ready_failure(&error)
+                agent_terminal_failure(&error, "media_upload", "higgsfield_upload_failed")
             {
                 fail_clone_training_job(
                     db,
@@ -363,42 +347,26 @@ async fn handle_clone_training_message(
                 .await?;
                 return Ok(());
             }
-            if let Some((error_code, error_message, raw_json)) =
-                mcp_invalid_response_failure(&error, "media_upload")
-            {
-                fail_clone_training_job(
-                    db,
-                    job_id,
-                    clone_id,
-                    user_id,
-                    idempotency_key,
-                    error_code,
-                    &error_message,
-                    &raw_json,
-                )
-                .await?;
-                return Ok(());
-            }
-            return Err(map_mcp_error(error));
+            return Err(map_agent_error(error));
         }
         Err(error) => {
             release_provider_lease(db, job_id).await?;
             return Err(error.into_worker_error());
         }
     };
-    let result = match call_tool(
+    let result = match create_soul_reference(
+        &api_base_url,
         &token.access_token,
-        json!(job_id),
-        &tool_name,
-        clone_training_submission_arguments(&job.clone_display_name, uploaded_images),
+        &job.clone_display_name,
+        &uploaded_images,
     )
     .await
     {
         Ok(result) => result,
         Err(error) => {
             release_provider_lease(db, job_id).await?;
-            if let Some(provider_error) = higgsfield_mcp_provider_action_error(&error) {
-                let detail = mcp_error_detail(&error, "clone_submit");
+            if let Some(provider_error) = higgsfield_agent_provider_action_error(&error) {
+                let detail = agent_error_detail(&error, "clone_submit");
                 mark_provider_action_required(
                     db,
                     job_id,
@@ -411,28 +379,25 @@ async fn handle_clone_training_message(
                 .await?;
                 return Ok(());
             }
-            return Err(map_mcp_error(error));
+            if let Some((error_code, error_message, raw_json)) =
+                agent_terminal_failure(&error, "clone_submit", "higgsfield_clone_submit_failed")
+            {
+                fail_clone_training_job(
+                    db,
+                    job_id,
+                    clone_id,
+                    user_id,
+                    idempotency_key,
+                    error_code,
+                    &error_message,
+                    &raw_json,
+                )
+                .await?;
+                return Ok(());
+            }
+            return Err(map_agent_error(error));
         }
     };
-
-    if let Some(error_message) = extract_provider_tool_error(&result.raw_json) {
-        release_provider_lease(db, job_id).await?;
-        fail_clone_training_job(
-            db,
-            job_id,
-            clone_id,
-            user_id,
-            idempotency_key,
-            "higgsfield_clone_submit_failed",
-            &format!(
-                "Higgsfield MCP clone training submission failed: {}",
-                sanitize_error_detail(&error_message)
-            ),
-            &result.raw_json,
-        )
-        .await?;
-        return Ok(());
-    }
 
     let provider_soul_id = match extract_provider_soul_id(&result.raw_json) {
         Some(provider_soul_id) => provider_soul_id,
@@ -516,25 +481,7 @@ async fn poll_clone_training_message(
         return Ok(());
     }
 
-    let tool_name = match env.var(HIGGSFIELD_TRAINING_TOOL_VAR) {
-        Ok(tool_name) if !tool_name.to_string().trim().is_empty() => tool_name.to_string(),
-        _ => {
-            fail_clone_training_job(
-                db,
-                job_id,
-                clone_id,
-                user_id,
-                idempotency_key,
-                "higgsfield_mcp_tool_missing",
-                "Higgsfield MCP clone training tool is not configured.",
-                &json!({ "providerSoulId": provider_soul_id }),
-            )
-            .await?;
-            release_provider_lease(db, job_id).await?;
-            return Ok(());
-        }
-    };
-
+    let api_base_url = higgsfield_agent_api_base_url(env);
     let Some(provider_account_id) = job
         .provider_account_id
         .as_deref()
@@ -596,18 +543,17 @@ async fn poll_clone_training_message(
             .await;
         }
     };
-    let result = match call_tool(
+    let result = match get_soul_reference(
+        &api_base_url,
         &token.access_token,
-        json!(format!("status:{job_id}:{attempt}")),
-        &tool_name,
-        clone_training_status_arguments(provider_soul_id),
+        provider_soul_id,
     )
     .await
     {
         Ok(result) => result,
         Err(error) => {
-            if let Some(provider_error) = higgsfield_mcp_provider_action_error(&error) {
-                let detail = mcp_error_detail(&error, "clone_status");
+            if let Some(provider_error) = higgsfield_agent_provider_action_error(&error) {
+                let detail = agent_error_detail(&error, "clone_status");
                 mark_provider_action_required(
                     db,
                     job_id,
@@ -616,6 +562,23 @@ async fn poll_clone_training_message(
                     idempotency_key,
                     &provider_error,
                     Some(&detail),
+                )
+                .await?;
+                release_provider_lease(db, job_id).await?;
+                return Ok(());
+            }
+            if let Some((error_code, error_message, raw_json)) =
+                agent_terminal_failure(&error, "clone_status", "clone_training_poll_failed")
+            {
+                fail_clone_training_job(
+                    db,
+                    job_id,
+                    clone_id,
+                    user_id,
+                    idempotency_key,
+                    error_code,
+                    &error_message,
+                    &raw_json,
                 )
                 .await?;
                 release_provider_lease(db, job_id).await?;
@@ -632,7 +595,7 @@ async fn poll_clone_training_message(
                 attempt,
                 max_attempts,
                 "clone_training_poll_failed",
-                &map_mcp_error(error).to_string(),
+                &map_agent_error(error).to_string(),
             )
             .await;
         }
@@ -1026,6 +989,7 @@ async fn load_training_job_for_poll(
 
 async fn load_and_upload_training_references(
     env: &Env,
+    api_base_url: &str,
     access_token: &str,
     clone_id: &str,
     user_id: &str,
@@ -1052,15 +1016,15 @@ async fn load_and_upload_training_references(
             .unwrap_or("image/jpeg")
             .to_string();
         let bytes = read_media_object_bytes(env, storage_key).await?;
-        files.push(HiggsfieldMcpMediaFile {
+        files.push(HiggsfieldAgentMediaFile {
             filename: training_upload_filename(&reference.media_asset_id, &content_type),
             content_type,
             bytes,
         });
     }
 
-    let uploaded = upload_media_files(access_token, &files).await?;
-    Ok(uploaded_media_reference_values(uploaded))
+    let uploaded = upload_agent_media_files(api_base_url, access_token, &files).await?;
+    Ok(uploaded_media_ids(uploaded))
 }
 
 async fn load_training_references(
@@ -1365,26 +1329,17 @@ async fn enqueue_clone_training_poll(
         .await
 }
 
-fn clone_training_submission_arguments(name: &str, images: Vec<String>) -> Value {
-    json!({
-        "action": "train",
-        "name": name,
-        "images": images,
-    })
+fn higgsfield_agent_api_base_url(env: &Env) -> String {
+    env.var(HIGGSFIELD_AGENT_API_URL_VAR)
+        .map(|value| value.to_string())
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| HIGGSFIELD_AGENT_API_BASE_URL.to_string())
 }
 
-fn uploaded_media_reference_values(uploaded: Vec<HiggsfieldUploadedMedia>) -> Vec<String> {
-    uploaded
-        .into_iter()
-        .map(|media| media.reference_value)
-        .collect()
-}
-
-fn clone_training_status_arguments(provider_soul_id: &str) -> Value {
-    json!({
-        "action": "status",
-        "soul_id": provider_soul_id,
-    })
+fn uploaded_media_ids(uploaded: Vec<HiggsfieldAgentUploadedMedia>) -> Vec<String> {
+    uploaded.into_iter().map(|media| media.media_id).collect()
 }
 
 fn provider_training_ready(raw_json: &Value) -> bool {
@@ -1498,9 +1453,9 @@ fn changed_rows(result: &worker::D1Result) -> WorkerResult<usize> {
         .unwrap_or_default())
 }
 
-fn map_mcp_error(error: HiggsfieldMcpError) -> Error {
+fn map_agent_error(error: HiggsfieldAgentError) -> Error {
     match error {
-        HiggsfieldMcpError::Worker(worker_error) => worker_error,
+        HiggsfieldAgentError::Worker(worker_error) => worker_error,
         other => Error::RustError(other.to_string()),
     }
 }
@@ -1527,63 +1482,86 @@ fn higgsfield_auth_provider_action_error(
     }
 }
 
-fn higgsfield_mcp_provider_action_error(
-    error: &HiggsfieldMcpError,
+fn higgsfield_agent_provider_action_error(
+    error: &HiggsfieldAgentError,
 ) -> Option<CloneTrainingProviderError> {
     match error {
-        HiggsfieldMcpError::HttpStatus { status, .. } if matches!(*status, 401 | 422) => {
+        HiggsfieldAgentError::HttpStatus { status, .. } if matches!(*status, 401 | 403) => {
             Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
         }
         _ => None,
     }
 }
 
-fn mcp_error_detail(error: &HiggsfieldMcpError, phase: &str) -> String {
+fn agent_error_detail(error: &HiggsfieldAgentError, phase: &str) -> String {
     match error {
-        HiggsfieldMcpError::HttpStatus { status, .. } => {
-            format!("Higgsfield provider MCP auth failed: phase={phase} status={status}")
+        HiggsfieldAgentError::HttpStatus { status, .. } => {
+            format!("Higgsfield provider Agent API request failed: phase={phase} status={status}")
         }
         other => format!(
-            "Higgsfield provider MCP auth failed: phase={phase} detail={}",
+            "Higgsfield provider Agent API request failed: phase={phase} detail={}",
             sanitize_error_detail(&other.to_string())
         ),
     }
 }
 
-fn mcp_invalid_response_failure(
-    error: &HiggsfieldMcpError,
+fn agent_terminal_failure(
+    error: &HiggsfieldAgentError,
     phase: &str,
+    error_code: &'static str,
 ) -> Option<(&'static str, String, Value)> {
     match error {
-        HiggsfieldMcpError::InvalidResponse { message, raw_json } => Some((
-            "higgsfield_mcp_invalid_response",
+        HiggsfieldAgentError::InvalidResponse { message, raw_json } => Some((
+            "higgsfield_agent_invalid_response",
             format!(
-                "Higgsfield MCP {phase} response was invalid: {}",
+                "Higgsfield Agent API {phase} response was invalid: {}",
                 sanitize_error_detail(message)
             ),
             raw_json.clone(),
+        )),
+        HiggsfieldAgentError::HttpStatus {
+            status,
+            raw_json: Some(raw_json),
+        } if matches!(*status, 400 | 404 | 409 | 422) => Some((
+            error_code,
+            format!(
+                "Higgsfield Agent API {phase} request failed with status {status}: {}",
+                sanitize_error_detail(&provider_error_message(raw_json))
+            ),
+            raw_json.clone(),
+        )),
+        HiggsfieldAgentError::HttpStatus {
+            status,
+            raw_json: None,
+        } if matches!(*status, 400 | 404 | 409 | 422) => Some((
+            error_code,
+            format!("Higgsfield Agent API {phase} request failed with status {status}."),
+            json!({
+                "errorCode": error_code,
+                "status": status,
+                "phase": phase,
+            }),
         )),
         _ => None,
     }
 }
 
-fn mcp_media_url_not_ready_failure(
-    error: &HiggsfieldMcpError,
-) -> Option<(&'static str, String, Value)> {
-    match error {
-        HiggsfieldMcpError::MediaUrlNotReady { url } => Some((
-            "higgsfield_media_url_not_ready",
-            format!(
-                "Higgsfield MCP uploaded media URL was not fetchable after confirmation: {}",
-                sanitize_error_detail(url)
-            ),
-            json!({
-                "errorCode": "higgsfield_media_url_not_ready",
-                "url": url,
-            }),
-        )),
-        _ => None,
-    }
+fn provider_error_message(raw_json: &Value) -> String {
+    [
+        "/message",
+        "/error/message",
+        "/error",
+        "/detail",
+        "/details",
+        "/result/error",
+        "/data/error",
+    ]
+    .into_iter()
+    .find_map(|path| raw_json.pointer(path).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(ToString::to_string)
+    .unwrap_or_else(|| raw_json.to_string())
 }
 
 fn sanitize_error_detail(message: &str) -> String {
@@ -1618,14 +1596,12 @@ fn now_iso_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        clone_training_status_arguments, clone_training_submission_arguments,
-        has_provider_submission, higgsfield_auth_provider_action_error,
-        higgsfield_mcp_provider_action_error, lease_is_expired, mcp_error_detail,
-        mcp_invalid_response_failure, mcp_media_url_not_ready_failure,
-        uploaded_media_reference_values, CloneTrainingProviderError, TrainingJobRow,
+        agent_error_detail, agent_terminal_failure, has_provider_submission,
+        higgsfield_agent_provider_action_error, higgsfield_auth_provider_action_error,
+        lease_is_expired, uploaded_media_ids, CloneTrainingProviderError, TrainingJobRow,
     };
+    use crate::providers::higgsfield_agent::{HiggsfieldAgentError, HiggsfieldAgentUploadedMedia};
     use crate::providers::higgsfield_auth::{HiggsfieldAuthError, HiggsfieldAuthPhase};
-    use crate::providers::higgsfield_mcp::{HiggsfieldMcpError, HiggsfieldUploadedMedia};
     use serde_json::json;
 
     fn job(provider_job_id: Option<&str>, response_json: &str) -> TrainingJobRow {
@@ -1670,58 +1646,24 @@ mod tests {
     }
 
     #[test]
-    fn clone_training_submission_arguments_match_show_characters_train_payload() {
+    fn uploaded_media_ids_use_higgsfield_agent_upload_ids_for_soul_training() {
         assert_eq!(
-            clone_training_submission_arguments(
-                "Maya",
-                vec![
-                    "https://higgsfield.example/maya-01.png".to_string(),
-                    "7ea59a7b-244e-41b1-b683-a60e1ff2df70".to_string(),
-                ],
-            ),
-            json!({
-                "action": "train",
-                "name": "Maya",
-                "images": [
-                    "https://higgsfield.example/maya-01.png",
-                    "7ea59a7b-244e-41b1-b683-a60e1ff2df70"
-                ]
-            })
-        );
-    }
-
-    #[test]
-    fn uploaded_media_reference_values_use_url_or_media_id_reference() {
-        assert_eq!(
-            uploaded_media_reference_values(vec![
-                HiggsfieldUploadedMedia {
-                    media_id: "media_1".to_string(),
+            uploaded_media_ids(vec![
+                HiggsfieldAgentUploadedMedia {
+                    media_id: "22222222-2222-2222-2222-222222222222".to_string(),
                     url: Some("https://higgsfield.example/maya-01.png".to_string()),
-                    reference_value: "https://higgsfield.example/maya-01.png".to_string(),
                     content_type: "image/png".to_string(),
                 },
-                HiggsfieldUploadedMedia {
-                    media_id: "7ea59a7b-244e-41b1-b683-a60e1ff2df70".to_string(),
-                    url: None,
-                    reference_value: "7ea59a7b-244e-41b1-b683-a60e1ff2df70".to_string(),
+                HiggsfieldAgentUploadedMedia {
+                    media_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                    url: Some("https://higgsfield.example/maya-02.png".to_string()),
                     content_type: "image/jpeg".to_string(),
                 },
             ]),
             vec![
-                "https://higgsfield.example/maya-01.png".to_string(),
-                "7ea59a7b-244e-41b1-b683-a60e1ff2df70".to_string(),
+                "22222222-2222-2222-2222-222222222222".to_string(),
+                "33333333-3333-3333-3333-333333333333".to_string(),
             ]
-        );
-    }
-
-    #[test]
-    fn clone_training_status_arguments_match_show_characters_status_payload() {
-        assert_eq!(
-            clone_training_status_arguments("soul_1"),
-            json!({
-                "action": "status",
-                "soul_id": "soul_1"
-            })
         );
     }
 
@@ -1778,63 +1720,61 @@ mod tests {
     }
 
     #[test]
-    fn mcp_auth_rejection_requires_provider_action_instead_of_queue_retry() {
-        let error = HiggsfieldMcpError::HttpStatus {
-            status: 401,
+    fn agent_auth_rejection_requires_provider_action_instead_of_queue_retry() {
+        let error = HiggsfieldAgentError::HttpStatus {
+            status: 403,
             raw_json: None,
         };
 
         assert_eq!(
-            higgsfield_mcp_provider_action_error(&error),
+            higgsfield_agent_provider_action_error(&error),
             Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
         );
         assert_eq!(
-            mcp_error_detail(&error, "clone_submit"),
-            "Higgsfield provider MCP auth failed: phase=clone_submit status=401"
+            agent_error_detail(&error, "clone_submit"),
+            "Higgsfield provider Agent API request failed: phase=clone_submit status=403"
         );
     }
 
     #[test]
-    fn mcp_invalid_upload_response_becomes_terminal_failure_details() {
+    fn agent_invalid_upload_response_becomes_terminal_failure_details() {
         let raw_json = json!({"result": {"content": [{"type": "text", "text": "no slots"}]}});
-        let error = HiggsfieldMcpError::InvalidResponse {
-            message: "media_upload response did not include upload slots".to_string(),
+        let error = HiggsfieldAgentError::InvalidResponse {
+            message: "upload response did not include id and upload_url".to_string(),
             raw_json: raw_json.clone(),
         };
 
         let (error_code, error_message, failure_json) =
-            mcp_invalid_response_failure(&error, "media_upload").expect("failure detail");
+            agent_terminal_failure(&error, "media_upload", "higgsfield_upload_failed")
+                .expect("failure detail");
 
-        assert_eq!(error_code, "higgsfield_mcp_invalid_response");
+        assert_eq!(error_code, "higgsfield_agent_invalid_response");
         assert_eq!(
             error_message,
-            "Higgsfield MCP media_upload response was invalid: media_upload response did not include upload slots"
+            "Higgsfield Agent API media_upload response was invalid: upload response did not include id and upload_url"
         );
         assert_eq!(failure_json, raw_json);
-        assert_eq!(higgsfield_mcp_provider_action_error(&error), None);
+        assert_eq!(higgsfield_agent_provider_action_error(&error), None);
     }
 
     #[test]
-    fn media_url_not_ready_becomes_terminal_clone_training_failure_details() {
-        let error = HiggsfieldMcpError::MediaUrlNotReady {
-            url: "https://cdn.example/private/maya-01.png".to_string(),
+    fn agent_validation_response_becomes_terminal_clone_training_failure_details() {
+        let raw_json = json!({"error": "Soul training requires 5-20 uploaded images"});
+        let error = HiggsfieldAgentError::HttpStatus {
+            status: 422,
+            raw_json: Some(raw_json.clone()),
         };
 
         let (error_code, error_message, failure_json) =
-            mcp_media_url_not_ready_failure(&error).expect("failure detail");
+            agent_terminal_failure(&error, "clone_submit", "higgsfield_clone_submit_failed")
+                .expect("failure detail");
 
-        assert_eq!(error_code, "higgsfield_media_url_not_ready");
+        assert_eq!(error_code, "higgsfield_clone_submit_failed");
         assert_eq!(
             error_message,
-            "Higgsfield MCP uploaded media URL was not fetchable after confirmation: https://cdn.example/private/maya-01.png"
+            "Higgsfield Agent API clone_submit request failed with status 422: Soul training requires 5-20 uploaded images"
         );
-        assert_eq!(
-            failure_json,
-            json!({
-                "errorCode": "higgsfield_media_url_not_ready",
-                "url": "https://cdn.example/private/maya-01.png"
-            })
-        );
-        assert_eq!(higgsfield_mcp_provider_action_error(&error), None);
+        assert_eq!(failure_json, raw_json);
+        assert_eq!(higgsfield_agent_provider_action_error(&error), None);
     }
 }

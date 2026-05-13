@@ -1,3 +1,4 @@
+pub mod higgsfield_agent;
 #[allow(dead_code)]
 pub mod higgsfield_auth;
 #[allow(dead_code)]

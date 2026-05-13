@@ -1,16 +1,36 @@
-# Higgsfield MCP Process
+# Higgsfield Provider Process
 
 Validated on 2026-05-12 against `https://mcp.higgsfield.ai/mcp`.
 Auth endpoint behavior rechecked on 2026-05-13.
+Agent REST upload and Soul creation behavior traced from `higgsfield 0.1.40`
+on 2026-05-13.
 
-This document records the working MCP flow for the two Higgsfield operations
-Mirai needs:
+This document records the working Higgsfield flows Mirai needs:
 
 1. Create/train a reusable Soul from 5-20 same-character images.
 2. Generate an image with that Soul using one reference image and an empty app
    prompt.
 
-## Validated Run
+Clone training now uses the same Agent REST API as the Higgsfield CLI. Image
+generation still uses MCP.
+
+## Validated Product Clone Training Run
+
+Successful local product-worker run on 2026-05-13:
+
+- Training job ID: `train_51bc5c3c0e904c8cacd90145a4e24f4b`
+- Clone ID: `clone_e2aa9cbe423d4b31b98ff7b99c48aa84`
+- Display name: `My Soul`
+- Provider account: `pa_higgsfield_founder`
+- Provider Soul ID: `e6ef6721-cf69-4bc0-978d-a19f3045f6d9`
+- Final status: `completed`
+- Provider response preview:
+  `{"id":"e6ef6721-cf69-4bc0-978d-a19f3045f6d9","name":"My Soul","status":"completed","type":"soul_2"}`
+
+This Soul appeared in the Higgsfield dashboard. The successful path was the
+Agent REST API flow documented below, not MCP `show_characters`.
+
+## Validated MCP Generation Run
 
 Training input:
 
@@ -103,6 +123,48 @@ Content-Type: application/json
 Accept: application/json, text/event-stream
 ```
 
+## Agent REST Soul Creation
+
+The Higgsfield CLI does not create Souls through MCP `media_upload` and
+`show_characters`. It uses `https://fnf.higgsfield.ai` with the same bearer token
+and these endpoints:
+
+```http
+POST /agents/uploads?type=image
+PUT <upload_url>
+POST /agents/uploads/<upload-id>/confirm?type=image
+POST /agents/custom-references
+GET /agents/custom-references/<soul-id>
+```
+
+Headers used by the CLI:
+
+```http
+Authorization: Bearer <access-token>
+Content-Type: application/json
+X-Hf-Mcp-Client-Name: codex
+```
+
+`POST /agents/uploads?type=image` has an empty body and returns an upload ID,
+public URL, and `upload_url`. After the `PUT`, `POST
+/agents/uploads/<upload-id>/confirm?type=image` confirms the media input.
+
+Soul creation payload:
+
+```json
+{
+  "input_images": [
+    { "id": "<upload-id-1>", "type": "media_input" },
+    { "id": "<upload-id-2>", "type": "media_input" }
+  ],
+  "name": "My Soul",
+  "type": "soul_2"
+}
+```
+
+The returned `id` is the provider Soul ID. Poll `GET
+/agents/custom-references/<soul-id>` until `status` is `ready` or `completed`.
+
 ## MCP Tools
 
 The live MCP tools are generic tool names, not direct model names:
@@ -161,9 +223,13 @@ Observed behavior:
 - `show_characters` validates image references as media ID UUIDs, completed
   image generation job IDs, or HTTPS URLs.
 
-## Soul Creation
+## Legacy MCP Soul Creation
 
-Working payload:
+This was the previously validated MCP payload. The product worker no longer uses
+it for clone training because MCP text-mode uploads can yield media IDs that
+`show_characters` rejects even after `media_confirm`.
+
+Working historical payload:
 
 ```json
 {
@@ -314,11 +380,12 @@ Until that is validated, the safe statement is:
 
 ## Product App Implications
 
-Wrangler env values should use MCP tool names:
+Wrangler env values should use the Agent API for clone training and MCP tool
+names for generation:
 
 ```json
 {
-  "HIGGSFIELD_MCP_CLONE_TRAINING_TOOL": "show_characters",
+  "HIGGSFIELD_API_URL": "https://fnf.higgsfield.ai",
   "HIGGSFIELD_MCP_GENERATION_TOOL": "generate_image"
 }
 ```
@@ -340,14 +407,29 @@ wrangler secret put HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER -c workers/product
 Clone training should not pass app-shaped fields directly to MCP. It should:
 
 1. Load the 5-20 selected clone reference images from R2.
-2. Call `media_upload`.
-3. `PUT` image bytes to the returned `upload_url` values.
-4. Call `media_confirm`.
-5. Wait until the returned HTTPS media URLs are fetchable.
-6. Call `show_characters` with `action: "train"`, a clone name, and
-   `images: [<https-url>, ...]`.
-7. Poll `show_characters` with `action: "status"` until `ready`.
-8. Store the returned `soul_id` as the clone provider Soul ID.
+2. For each image, call `POST /agents/uploads?type=image`.
+3. `PUT` image bytes to the returned `upload_url`.
+4. Call `POST /agents/uploads/<upload-id>/confirm?type=image`.
+5. Call `POST /agents/custom-references` with `input_images` upload IDs.
+6. Poll `GET /agents/custom-references/<soul-id>` until `ready`.
+7. Store the returned `id` as the clone provider Soul ID.
+
+Queue behavior for clone training:
+
+1. `POST /api/clones/manual-upload` writes the clone/training rows and enqueues
+   `SubmitCloneTraining`.
+2. The submit queue message uploads all selected images and creates the Agent
+   REST custom reference. This first queue execution is expected to be the long
+   one because it performs every image upload.
+3. After provider submission, the worker enqueues `PollCloneTraining` with a
+   60 second delay.
+4. Each poll calls `GET /agents/custom-references/<soul-id>`. If Higgsfield still
+   reports `training`, the worker records the poll response and enqueues another
+   delayed poll.
+5. Wrangler logs one `QUEUE mirai-clone-training 1/1` line per consumed queue
+   message. A normal successful Soul training run therefore shows one long submit
+   line followed by multiple short poll lines until Higgsfield returns
+   `completed` or `ready`.
 
 Generation should:
 
