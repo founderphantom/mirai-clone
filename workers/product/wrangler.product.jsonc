@@ -37,6 +37,14 @@
     "binding": "AI",
     "remote": true
   },
+  "durable_objects": {
+    "bindings": [
+      { "name": "HIGGSFIELD_CREDENTIALS", "class_name": "HiggsfieldCredentials" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["HiggsfieldCredentials"] }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

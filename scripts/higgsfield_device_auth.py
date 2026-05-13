@@ -21,6 +21,13 @@ CLIENT_NAME = "mirai-product-worker"
 SECRET_NAME = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER"
 WRANGLER_CONFIG = "workers/product/wrangler.product.jsonc"
 USER_AGENT = "OpenClaw/1.0 MCP Client"
+REQUIRED_SMOKE_TOOLS = {
+    "show_characters",
+    "media_upload",
+    "media_confirm",
+    "generate_image",
+    "job_status",
+}
 
 
 class HttpJsonError(RuntimeError):
@@ -45,6 +52,11 @@ def parse_args() -> argparse.Namespace:
         "--list-tools",
         action="store_true",
         help="list Higgsfield MCP tool names after auth completes",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="refresh, validate, and list required MCP tools before printing storage instructions",
     )
     parser.add_argument(
         "--client-name",
@@ -173,7 +185,7 @@ def first_present(data: dict[str, Any], *keys: str) -> Any:
     return None
 
 
-def discover_device_flow_urls() -> tuple[str, str, str]:
+def discover_device_flow_urls() -> tuple[str, str, str, str]:
     auth_server = DEVICE_AUTH_SERVER_FALLBACK
     try:
         metadata = get_json(PROTECTED_RESOURCE_METADATA_URL)
@@ -203,7 +215,12 @@ def discover_device_flow_urls() -> tuple[str, str, str]:
                         break
 
     auth_server = auth_server.rstrip("/")
-    return f"{auth_server}/authorize", f"{auth_server}/token", f"{auth_server}/refresh"
+    return (
+        f"{auth_server}/authorize",
+        f"{auth_server}/token",
+        f"{auth_server}/refresh",
+        f"{auth_server}/validate",
+    )
 
 
 def authorize(authorize_url: str, client_name: str) -> dict[str, Any]:
@@ -237,12 +254,20 @@ def poll_for_token(
     raise TimeoutError("timed out waiting for Higgsfield device authorization")
 
 
-def refresh_access_token(refresh_url: str, refresh_token: str) -> str:
+def refresh_access_token(refresh_url: str, refresh_token: str) -> dict[str, Any]:
     response = post_json(refresh_url, {"refresh_token": refresh_token})
     access_token = first_present(response, "accessToken", "access_token")
     if not access_token:
         raise RuntimeError(f"refresh response missing access token: {response}")
-    return str(access_token)
+    return response
+
+
+def validate_access_token(validate_url: str, access_token: str) -> dict[str, Any]:
+    response = post_json(validate_url, {"token": access_token})
+    user_id = first_present(response, "userId", "user_id")
+    if not user_id:
+        raise RuntimeError(f"validate response missing user id: {response}")
+    return response
 
 
 def list_mcp_tools(mcp_url: str, access_token: str) -> list[dict[str, Any]]:
@@ -284,10 +309,17 @@ def print_mcp_tools(tools: list[dict[str, Any]]) -> None:
             print(f"- {name}")
 
 
+def assert_required_tools_present(tools: list[dict[str, Any]]) -> None:
+    names = {str(tool.get("name")) for tool in tools if tool.get("name")}
+    missing = sorted(REQUIRED_SMOKE_TOOLS - names)
+    if missing:
+        raise RuntimeError(f"MCP tools/list missing required tools: {', '.join(missing)}")
+
+
 def main() -> int:
     args = parse_args()
 
-    authorize_url, token_url, refresh_url = discover_device_flow_urls()
+    authorize_url, token_url, refresh_url, validate_url = discover_device_flow_urls()
     auth = authorize(authorize_url, args.client_name)
     authorize_url = first_present(
         auth,
@@ -310,15 +342,31 @@ def main() -> int:
     refresh_token = first_present(token, "refreshToken", "refresh_token")
     if not refresh_token:
         raise RuntimeError(f"token response missing refresh token: {token}")
+    refresh_token = str(refresh_token)
 
     print("Refresh token received.")
-    print(f"wrangler secret put {SECRET_NAME} -c {WRANGLER_CONFIG}")
-    if args.list_tools:
-        access_token = first_present(token, "accessToken", "access_token")
-        if not access_token:
-            access_token = refresh_access_token(refresh_url, str(refresh_token))
-        tools = list_mcp_tools(args.mcp_url, str(access_token))
+    should_smoke = args.smoke or args.list_tools
+    if should_smoke:
+        refresh_response = refresh_access_token(refresh_url, refresh_token)
+        access_token = str(first_present(refresh_response, "accessToken", "access_token"))
+        rotated_refresh_token = first_present(
+            refresh_response,
+            "refreshToken",
+            "refresh_token",
+        )
+        if rotated_refresh_token:
+            refresh_token = str(rotated_refresh_token)
+            print("Rotated refresh token received from /refresh.")
+        validation = validate_access_token(validate_url, access_token)
+        print(
+            f"Validated access token for Higgsfield user {first_present(validation, 'userId', 'user_id')}."
+        )
+        tools = list_mcp_tools(args.mcp_url, access_token)
         print_mcp_tools(tools)
+        if args.smoke:
+            assert_required_tools_present(tools)
+            print("Smoke check passed.")
+    print(f"wrangler secret put {SECRET_NAME} -c {WRANGLER_CONFIG}")
     if args.print_token:
         print(refresh_token)
 

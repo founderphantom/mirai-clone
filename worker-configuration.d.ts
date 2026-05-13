@@ -2,7 +2,10 @@ interface CloudflareBindings {
   ASSETS: Fetcher;
   DB: D1Database;
   MEDIA: R2Bucket;
+  HIGGSFIELD_CREDENTIALS: DurableObjectNamespace;
+  CLONE_TRAINING_QUEUE: Queue;
   GENERATION_QUEUE: Queue<import("./src/server/queue/messages").GenerationQueueMessage>;
+  NICHE_RESEARCH_QUEUE: Queue;
   ONBOARDING_QUEUE: Queue<import("./src/server/queue/messages").OnboardingQueueMessage>;
   APP_NAME: string;
   APP_URL: string;
@@ -27,4 +30,7 @@ interface CloudflareBindings {
   HIGGSFIELD_CLIENT_COOKIE?: string;
   HIGGSFIELD_DEFAULT_CHARACTER_ID?: string;
   HIGGSFIELD_DEFAULT_STYLE_ID?: string;
+  HIGGSFIELD_MCP_CLONE_TRAINING_TOOL?: string;
+  HIGGSFIELD_MCP_GENERATION_TOOL?: string;
+  HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER?: string;
 }

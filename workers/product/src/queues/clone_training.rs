@@ -1,6 +1,6 @@
 use crate::db;
 use crate::providers::higgsfield_auth::{
-    refresh_provider_account_access_token, validate_access_token, HiggsfieldAuthError,
+    provider_account_access_token, HiggsfieldAuthError, HiggsfieldAuthPhase,
 };
 use crate::providers::higgsfield_mcp::{
     call_tool, extract_provider_soul_id, extract_provider_status, upload_media_files,
@@ -52,12 +52,31 @@ enum ProviderLeaseReservation {
     Submitted { provider_account_id: String },
 }
 
+#[derive(Debug, Error)]
+enum CloneTrainingUploadError {
+    #[error(transparent)]
+    Worker(#[from] Error),
+    #[error(transparent)]
+    Mcp(#[from] HiggsfieldMcpError),
+}
+
+impl CloneTrainingUploadError {
+    fn into_worker_error(self) -> Error {
+        match self {
+            Self::Worker(error) => error,
+            Self::Mcp(error) => map_mcp_error(error),
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 enum CloneTrainingProviderError {
     #[error("Higgsfield provider refresh token secret is not configured.")]
     HiggsfieldSecretMissing,
     #[error("Higgsfield provider refresh token is invalid or expired.")]
     HiggsfieldRefreshTokenInvalid,
+    #[error("Higgsfield provider access token is invalid or expired.")]
+    HiggsfieldProviderAuthInvalid,
     #[error("Higgsfield MCP clone training tool is not configured.")]
     HiggsfieldMcpToolMissing,
     #[error("No healthy Higgsfield provider account is available.")]
@@ -69,6 +88,7 @@ impl CloneTrainingProviderError {
         match self {
             Self::HiggsfieldSecretMissing => "higgsfield_secret_missing",
             Self::HiggsfieldRefreshTokenInvalid => "higgsfield_refresh_token_invalid",
+            Self::HiggsfieldProviderAuthInvalid => "higgsfield_provider_auth_invalid",
             Self::HiggsfieldMcpToolMissing => "higgsfield_mcp_tool_missing",
             Self::HiggsfieldProviderAccountUnavailable => "higgsfield_provider_account_unavailable",
         }
@@ -229,6 +249,7 @@ async fn handle_clone_training_message(
                 user_id,
                 idempotency_key,
                 &CloneTrainingProviderError::HiggsfieldMcpToolMissing,
+                None,
             )
             .await?;
             return Ok(());
@@ -245,13 +266,13 @@ async fn handle_clone_training_message(
             user_id,
             idempotency_key,
             &CloneTrainingProviderError::HiggsfieldProviderAccountUnavailable,
+            None,
         )
         .await?;
         return Ok(());
     };
 
-    let token = match refresh_provider_account_access_token(
-        db,
+    let token = match provider_account_access_token(
         env,
         &provider_account.id,
         HIGGSFIELD_REFRESH_SECRET_NAME,
@@ -263,6 +284,7 @@ async fn handle_clone_training_message(
             let Some(provider_error) = higgsfield_auth_provider_action_error(&error) else {
                 return Err(Error::RustError(error.to_string()));
             };
+            let detail = error.sanitized_message();
             mark_provider_action_required(
                 db,
                 job_id,
@@ -270,15 +292,12 @@ async fn handle_clone_training_message(
                 user_id,
                 idempotency_key,
                 &provider_error,
+                Some(&detail),
             )
             .await?;
             return Ok(());
         }
     };
-
-    validate_access_token(&token.access_token)
-        .await
-        .map_err(|error| Error::RustError(error.to_string()))?;
 
     match reserve_provider_lease(db, &provider_account.id, job_id).await? {
         ProviderLeaseReservation::Acquired => {}
@@ -312,9 +331,27 @@ async fn handle_clone_training_message(
     .await
     {
         Ok(images) => images,
+        Err(CloneTrainingUploadError::Mcp(error)) => {
+            release_provider_lease(db, job_id).await?;
+            if let Some(provider_error) = higgsfield_mcp_provider_action_error(&error) {
+                let detail = mcp_error_detail(&error, "media_upload");
+                mark_provider_action_required(
+                    db,
+                    job_id,
+                    clone_id,
+                    user_id,
+                    idempotency_key,
+                    &provider_error,
+                    Some(&detail),
+                )
+                .await?;
+                return Ok(());
+            }
+            return Err(map_mcp_error(error));
+        }
         Err(error) => {
             release_provider_lease(db, job_id).await?;
-            return Err(error);
+            return Err(error.into_worker_error());
         }
     };
     let result = match call_tool(
@@ -328,6 +365,20 @@ async fn handle_clone_training_message(
         Ok(result) => result,
         Err(error) => {
             release_provider_lease(db, job_id).await?;
+            if let Some(provider_error) = higgsfield_mcp_provider_action_error(&error) {
+                let detail = mcp_error_detail(&error, "clone_submit");
+                mark_provider_action_required(
+                    db,
+                    job_id,
+                    clone_id,
+                    user_id,
+                    idempotency_key,
+                    &provider_error,
+                    Some(&detail),
+                )
+                .await?;
+                return Ok(());
+            }
             return Err(map_mcp_error(error));
         }
     };
@@ -454,8 +505,7 @@ async fn poll_clone_training_message(
         )
         .await;
     };
-    let token = match refresh_provider_account_access_token(
-        db,
+    let token = match provider_account_access_token(
         env,
         provider_account_id,
         HIGGSFIELD_REFRESH_SECRET_NAME,
@@ -464,6 +514,21 @@ async fn poll_clone_training_message(
     {
         Ok(token) => token,
         Err(error) => {
+            if let Some(provider_error) = higgsfield_auth_provider_action_error(&error) {
+                let detail = error.sanitized_message();
+                mark_provider_action_required(
+                    db,
+                    job_id,
+                    clone_id,
+                    user_id,
+                    idempotency_key,
+                    &provider_error,
+                    Some(&detail),
+                )
+                .await?;
+                release_provider_lease(db, job_id).await?;
+                return Ok(());
+            }
             return retry_clone_training_poll_after_error(
                 db,
                 env,
@@ -475,28 +540,11 @@ async fn poll_clone_training_message(
                 attempt,
                 max_attempts,
                 "clone_training_poll_auth_failed",
-                &error.to_string(),
+                &error.sanitized_message(),
             )
             .await;
         }
     };
-    if let Err(error) = validate_access_token(&token.access_token).await {
-        return retry_clone_training_poll_after_error(
-            db,
-            env,
-            job_id,
-            clone_id,
-            user_id,
-            idempotency_key,
-            provider_soul_id,
-            attempt,
-            max_attempts,
-            "clone_training_poll_auth_failed",
-            &error.to_string(),
-        )
-        .await;
-    }
-
     let result = match call_tool(
         &token.access_token,
         json!(format!("status:{job_id}:{attempt}")),
@@ -507,6 +555,21 @@ async fn poll_clone_training_message(
     {
         Ok(result) => result,
         Err(error) => {
+            if let Some(provider_error) = higgsfield_mcp_provider_action_error(&error) {
+                let detail = mcp_error_detail(&error, "clone_status");
+                mark_provider_action_required(
+                    db,
+                    job_id,
+                    clone_id,
+                    user_id,
+                    idempotency_key,
+                    &provider_error,
+                    Some(&detail),
+                )
+                .await?;
+                release_provider_lease(db, job_id).await?;
+                return Ok(());
+            }
             return retry_clone_training_poll_after_error(
                 db,
                 env,
@@ -915,12 +978,10 @@ async fn load_and_upload_training_references(
     access_token: &str,
     clone_id: &str,
     user_id: &str,
-) -> WorkerResult<Vec<String>> {
+) -> Result<Vec<String>, CloneTrainingUploadError> {
     let references = load_training_references(&env.d1("DB")?, clone_id, user_id).await?;
     if references.is_empty() {
-        return Err(Error::RustError(
-            "clone_training_references_missing".to_string(),
-        ));
+        return Err(Error::RustError("clone_training_references_missing".to_string()).into());
     }
 
     let mut files = Vec::with_capacity(references.len());
@@ -947,9 +1008,7 @@ async fn load_and_upload_training_references(
         });
     }
 
-    let uploaded = upload_media_files(access_token, &files)
-        .await
-        .map_err(map_mcp_error)?;
+    let uploaded = upload_media_files(access_token, &files).await?;
     Ok(uploaded.into_iter().map(|media| media.url).collect())
 }
 
@@ -1321,9 +1380,13 @@ async fn mark_provider_action_required(
     user_id: &str,
     idempotency_key: &str,
     error: &CloneTrainingProviderError,
+    detail: Option<&str>,
 ) -> WorkerResult<()> {
     let now = now_iso_string();
-    let message = error.to_string();
+    let message = match detail.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(detail) => format!("{} {}", error, detail),
+        None => error.to_string(),
+    };
 
     let job_result = db::run(
         db,
@@ -1391,10 +1454,64 @@ fn higgsfield_auth_provider_action_error(
         HiggsfieldAuthError::MissingSecret { .. } => {
             Some(CloneTrainingProviderError::HiggsfieldSecretMissing)
         }
-        HiggsfieldAuthError::HttpStatus { status } if matches!(*status, 401 | 422) => {
+        HiggsfieldAuthError::HttpStatus {
+            phase: HiggsfieldAuthPhase::Refresh,
+            status,
+        }
+        | HiggsfieldAuthError::CredentialsObjectStatus {
+            phase: HiggsfieldAuthPhase::Refresh,
+            status,
+            ..
+        } if matches!(*status, 401 | 422) => {
             Some(CloneTrainingProviderError::HiggsfieldRefreshTokenInvalid)
         }
+        HiggsfieldAuthError::HttpStatus {
+            phase: HiggsfieldAuthPhase::Validate,
+            status,
+        }
+        | HiggsfieldAuthError::CredentialsObjectStatus {
+            phase: HiggsfieldAuthPhase::Validate,
+            status,
+            ..
+        } if matches!(*status, 401 | 422) => {
+            Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
+        }
         _ => None,
+    }
+}
+
+fn higgsfield_mcp_provider_action_error(
+    error: &HiggsfieldMcpError,
+) -> Option<CloneTrainingProviderError> {
+    match error {
+        HiggsfieldMcpError::HttpStatus { status, .. } if matches!(*status, 401 | 422) => {
+            Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
+        }
+        _ => None,
+    }
+}
+
+fn mcp_error_detail(error: &HiggsfieldMcpError, phase: &str) -> String {
+    match error {
+        HiggsfieldMcpError::HttpStatus { status, .. } => {
+            format!("Higgsfield provider MCP auth failed: phase={phase} status={status}")
+        }
+        other => format!(
+            "Higgsfield provider MCP auth failed: phase={phase} detail={}",
+            sanitize_error_detail(&other.to_string())
+        ),
+    }
+}
+
+fn sanitize_error_detail(message: &str) -> String {
+    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated = compact.chars().take(240).collect::<String>();
+    if truncated.len() < compact.len() {
+        format!("{truncated}...")
+    } else if compact.is_empty() {
+        "unavailable".to_string()
+    } else {
+        compact
     }
 }
 
@@ -1419,10 +1536,12 @@ fn now_iso_string() -> String {
 mod tests {
     use super::{
         clone_training_status_arguments, clone_training_submission_arguments,
-        has_provider_submission, higgsfield_auth_provider_action_error, lease_is_expired,
+        has_provider_submission, higgsfield_auth_provider_action_error,
+        higgsfield_mcp_provider_action_error, lease_is_expired, mcp_error_detail,
         CloneTrainingProviderError, TrainingJobRow,
     };
-    use crate::providers::higgsfield_auth::HiggsfieldAuthError;
+    use crate::providers::higgsfield_auth::{HiggsfieldAuthError, HiggsfieldAuthPhase};
+    use crate::providers::higgsfield_mcp::HiggsfieldMcpError;
     use serde_json::json;
 
     fn job(provider_job_id: Option<&str>, response_json: &str) -> TrainingJobRow {
@@ -1501,16 +1620,69 @@ mod tests {
     #[test]
     fn refresh_token_rejection_requires_provider_action_instead_of_queue_retry() {
         assert_eq!(
-            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus { status: 401 }),
+            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus {
+                phase: HiggsfieldAuthPhase::Refresh,
+                status: 401
+            }),
             Some(CloneTrainingProviderError::HiggsfieldRefreshTokenInvalid)
         );
         assert_eq!(
-            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus { status: 422 }),
+            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus {
+                phase: HiggsfieldAuthPhase::Refresh,
+                status: 422
+            }),
             Some(CloneTrainingProviderError::HiggsfieldRefreshTokenInvalid)
         );
         assert_eq!(
-            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus { status: 500 }),
+            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus {
+                phase: HiggsfieldAuthPhase::Refresh,
+                status: 500
+            }),
             None
+        );
+    }
+
+    #[test]
+    fn validate_rejection_uses_provider_auth_error_code() {
+        assert_eq!(
+            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::HttpStatus {
+                phase: HiggsfieldAuthPhase::Validate,
+                status: 401
+            }),
+            Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
+        );
+        assert_eq!(
+            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::CredentialsObjectStatus {
+                phase: HiggsfieldAuthPhase::Refresh,
+                status: 422,
+                message: "Higgsfield provider auth failed: phase=refresh status=422".to_string()
+            }),
+            Some(CloneTrainingProviderError::HiggsfieldRefreshTokenInvalid)
+        );
+        assert_eq!(
+            higgsfield_auth_provider_action_error(&HiggsfieldAuthError::CredentialsObjectStatus {
+                phase: HiggsfieldAuthPhase::Validate,
+                status: 422,
+                message: "Higgsfield provider auth failed: phase=validate status=422".to_string()
+            }),
+            Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
+        );
+    }
+
+    #[test]
+    fn mcp_auth_rejection_requires_provider_action_instead_of_queue_retry() {
+        let error = HiggsfieldMcpError::HttpStatus {
+            status: 401,
+            raw_json: None,
+        };
+
+        assert_eq!(
+            higgsfield_mcp_provider_action_error(&error),
+            Some(CloneTrainingProviderError::HiggsfieldProviderAuthInvalid)
+        );
+        assert_eq!(
+            mcp_error_detail(&error, "clone_submit"),
+            "Higgsfield provider MCP auth failed: phase=clone_submit status=401"
         );
     }
 }

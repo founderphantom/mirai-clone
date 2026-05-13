@@ -16,13 +16,14 @@ OPENCODE_GO_API_KEY=
 
 ## Higgsfield Provider Auth
 
-The Rust product Worker uses a Higgsfield OAuth device refresh token stored only
-as a Cloudflare Secret. Do not write Higgsfield access or refresh tokens to D1.
+The Rust product Worker uses a Higgsfield OAuth device refresh token seeded from
+a Cloudflare Secret. Rotated refresh tokens live in Durable Object storage. Do
+not write Higgsfield access or refresh tokens to D1.
 
 Run:
 
 ```bash
-python3 scripts/higgsfield_device_auth.py
+python3 scripts/higgsfield_device_auth.py --smoke
 ```
 
 The script prints an authorization URL and then, after approval, prints:

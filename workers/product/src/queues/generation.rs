@@ -1,7 +1,5 @@
 use crate::db;
-use crate::providers::higgsfield_auth::{
-    refresh_provider_account_access_token, validate_access_token,
-};
+use crate::providers::higgsfield_auth::provider_account_access_token;
 use crate::providers::higgsfield_mcp::{
     call_tool, upload_media_files, HiggsfieldMcpError, HiggsfieldMcpMediaFile,
 };
@@ -283,8 +281,7 @@ async fn submit_generation_job(
     }
 
     let tool_name = generation_tool_name(env)?;
-    let token = match refresh_provider_account_access_token(
-        db,
+    let token = match provider_account_access_token(
         env,
         HIGGSFIELD_PROVIDER_ACCOUNT_ID,
         HIGGSFIELD_REFRESH_SECRET_NAME,
@@ -299,24 +296,12 @@ async fn submit_generation_job(
                 job_id,
                 batch_id,
                 "provider_submission_auth_retry",
-                &error.to_string(),
+                &error.sanitized_message(),
             )
             .await?;
             return Ok(());
         }
     };
-    if let Err(error) = validate_access_token(&token.access_token).await {
-        schedule_submission_retry(
-            db,
-            env,
-            job_id,
-            batch_id,
-            "provider_submission_validation_retry",
-            &error.to_string(),
-        )
-        .await?;
-        return Ok(());
-    }
 
     if !mark_generation_job_submitting(db, job_id, HIGGSFIELD_PROVIDER_ACCOUNT_ID).await? {
         return Ok(());
@@ -622,8 +607,7 @@ async fn poll_generation(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(HIGGSFIELD_PROVIDER_ACCOUNT_ID);
-    let token = match refresh_provider_account_access_token(
-        db,
+    let token = match provider_account_access_token(
         env,
         provider_account_id,
         HIGGSFIELD_REFRESH_SECRET_NAME,
@@ -640,24 +624,11 @@ async fn poll_generation(
                 attempt,
                 max_attempts,
                 "provider_poll_auth_failed",
-                &error.to_string(),
+                &error.sanitized_message(),
             )
             .await;
         }
     };
-    if let Err(error) = validate_access_token(&token.access_token).await {
-        return handle_poll_failure(
-            db,
-            env,
-            job_id,
-            batch_id,
-            attempt,
-            max_attempts,
-            "provider_poll_auth_failed",
-            &error.to_string(),
-        )
-        .await;
-    }
 
     let provider_job_ids =
         serde_json::from_str::<Value>(&job.provider_job_ids_json).unwrap_or_else(|_| json!([]));
