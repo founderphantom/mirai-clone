@@ -14,6 +14,10 @@ use mirai_product_worker::domain::media_validation::{
     is_supported_reference_content_type, validate_reference_count, ReferenceCountError,
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
+use mirai_product_worker::domain::visual_reference::{
+    accept_visual_review, selected_moodboard_count_is_valid, visual_review_tags, MoodboardBrief,
+    VisualReferenceReview,
+};
 use mirai_product_worker::routes::blitz::{
     map_blitz_service_error, parse_history_limit, read_required_query_param,
 };
@@ -101,7 +105,8 @@ fn blitz_route_does_not_swallow_unknown_service_errors() {
 
 #[test]
 fn visual_reference_pipeline_schema_has_required_columns_and_config() {
-    let migration = include_str!("../../../config/d1/migrations/1007_visual_reference_pipeline.sql");
+    let migration =
+        include_str!("../../../config/d1/migrations/1007_visual_reference_pipeline.sql");
 
     assert!(migration.contains("DROP TABLE IF EXISTS visual_reference_candidates"));
     assert!(migration.contains("CREATE TABLE IF NOT EXISTS visual_reference_candidates"));
@@ -116,6 +121,217 @@ fn visual_reference_pipeline_schema_has_required_columns_and_config() {
     assert!(migration.contains("media_asset_id TEXT"));
     assert!(migration.contains("moodboard_instagram_handles_json"));
     assert!(migration.contains("instagram_candidate_review_limit"));
+}
+
+#[test]
+fn visual_review_accepts_one_likely_adult_editorial_portrait() {
+    let selected = vec![MoodboardBrief {
+        id: "mb_flash".to_string(),
+        slug: "flash-editorial".to_string(),
+        title: "Flash editorial".to_string(),
+        vibe_summary: "Direct flash, crisp styling, magazine energy.".to_string(),
+        search_queries: vec!["flash editorial portrait".to_string()],
+    }];
+    let review = VisualReferenceReview {
+        decision: "approved".to_string(),
+        best_moodboard_slug: "flash-editorial".to_string(),
+        human_count: 1,
+        adult_likely: true,
+        age_unclear: false,
+        minor_likely: false,
+        youth_coded: false,
+        revealing_fashion: false,
+        explicit: false,
+        unsafe_content: false,
+        is_moodboard: false,
+        is_screenshot: false,
+        is_product_shot: false,
+        is_tutorial: false,
+        is_generic: false,
+        instagram_post_worthy: true,
+        visual_fit_score: 0.91,
+        pose: "standing three-quarter pose".to_string(),
+        scene: "night street outside venue".to_string(),
+        lighting: "direct flash".to_string(),
+        framing: "vertical full-body portrait".to_string(),
+        camera_feel: "compact camera flash".to_string(),
+        styling_direction: "confident editorial streetwear energy".to_string(),
+        rejection_reason: None,
+        reason: "One likely adult in a strong editorial street portrait.".to_string(),
+    };
+
+    let accepted = accept_visual_review(&review, &selected).unwrap();
+
+    assert_eq!(accepted.moodboard_slug, "flash-editorial");
+    assert_eq!(accepted.niche_cluster, "flash-editorial");
+    assert!(visual_review_tags(&review).contains(&"direct flash".to_string()));
+}
+
+#[test]
+fn visual_review_rejects_hard_guardrail_failures() {
+    let selected = selected_moodboard_fixture();
+
+    let cases: [(&str, fn(&mut VisualReferenceReview)); 12] = [
+        ("no_human", |r: &mut VisualReferenceReview| {
+            r.human_count = 0
+        }),
+        ("multiple_humans", |r: &mut VisualReferenceReview| {
+            r.human_count = 2
+        }),
+        ("minor_likely", |r: &mut VisualReferenceReview| {
+            r.minor_likely = true
+        }),
+        ("age_unclear", |r: &mut VisualReferenceReview| {
+            r.age_unclear = true
+        }),
+        ("youth_coded", |r: &mut VisualReferenceReview| {
+            r.youth_coded = true
+        }),
+        ("explicit", |r: &mut VisualReferenceReview| {
+            r.explicit = true
+        }),
+        ("unsafe", |r: &mut VisualReferenceReview| {
+            r.unsafe_content = true
+        }),
+        ("moodboard", |r: &mut VisualReferenceReview| {
+            r.is_moodboard = true
+        }),
+        ("screenshot", |r: &mut VisualReferenceReview| {
+            r.is_screenshot = true
+        }),
+        ("product_shot", |r: &mut VisualReferenceReview| {
+            r.is_product_shot = true
+        }),
+        ("tutorial", |r: &mut VisualReferenceReview| {
+            r.is_tutorial = true
+        }),
+        ("generic", |r: &mut VisualReferenceReview| {
+            r.is_generic = true
+        }),
+    ];
+
+    for (label, mutate) in cases {
+        let mut review = approved_review_fixture();
+        mutate(&mut review);
+
+        assert_eq!(
+            accept_visual_review(&review, &selected).unwrap_err(),
+            label,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn visual_review_rejects_acceptance_contract_failures() {
+    let selected = selected_moodboard_fixture();
+    let cases: [(&str, fn(&mut VisualReferenceReview)); 7] = [
+        ("adult_not_likely", |r: &mut VisualReferenceReview| {
+            r.adult_likely = false
+        }),
+        (
+            "not_instagram_post_worthy",
+            |r: &mut VisualReferenceReview| r.instagram_post_worthy = false,
+        ),
+        ("weak_visual_fit", |r: &mut VisualReferenceReview| {
+            r.visual_fit_score = 0.71
+        }),
+        ("weak_visual_fit", |r: &mut VisualReferenceReview| {
+            r.visual_fit_score = f64::NAN
+        }),
+        ("weak_visual_fit", |r: &mut VisualReferenceReview| {
+            r.visual_fit_score = 1.01
+        }),
+        ("not_approved", |r: &mut VisualReferenceReview| {
+            r.decision = "rejected".to_string()
+        }),
+        ("unselected_moodboard", |r: &mut VisualReferenceReview| {
+            r.best_moodboard_slug = "warm-ambient".to_string()
+        }),
+    ];
+
+    for (label, mutate) in cases {
+        let mut review = approved_review_fixture();
+        mutate(&mut review);
+
+        assert_eq!(
+            accept_visual_review(&review, &selected).unwrap_err(),
+            label,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn visual_review_acceptance_trims_selected_moodboard_slug() {
+    let selected = selected_moodboard_fixture();
+    let mut review = approved_review_fixture();
+    review.best_moodboard_slug = " Flash-Editorial ".to_string();
+
+    let accepted = accept_visual_review(&review, &selected).unwrap();
+
+    assert_eq!(accepted.moodboard_slug, "flash-editorial");
+}
+
+#[test]
+fn visual_review_deserializes_kimi_human_count_and_default_text_fields() {
+    let mut review_json = json!({
+        "decision": "approved",
+        "humanCount": 1,
+        "adultLikely": true,
+        "ageUnclear": false,
+        "minorLikely": false,
+        "youthCoded": false,
+        "revealingFashion": false,
+        "explicit": false,
+        "unsafe": false,
+        "isMoodboard": false,
+        "isScreenshot": false,
+        "isProductShot": false,
+        "isTutorial": false,
+        "isGeneric": false,
+        "instagramPostWorthy": true,
+        "visualFitScore": 0.91
+    });
+
+    let review: VisualReferenceReview = serde_json::from_value(review_json.clone()).unwrap();
+    assert_eq!(review.human_count, 1);
+    assert_eq!(review.best_moodboard_slug, "");
+    assert_eq!(review.pose, "");
+    assert_eq!(review.reason, "");
+
+    review_json["humanCount"] = json!(1.0);
+    let review: VisualReferenceReview = serde_json::from_value(review_json.clone()).unwrap();
+    assert_eq!(review.human_count, 1);
+
+    for invalid_count in [json!(1.25), json!(-1), json!(4294967296_u64)] {
+        review_json["humanCount"] = invalid_count;
+        assert!(serde_json::from_value::<VisualReferenceReview>(review_json.clone()).is_err());
+    }
+}
+
+#[test]
+fn visual_review_helpers_validate_counts_and_tags() {
+    assert!(!selected_moodboard_count_is_valid(0));
+    assert!(selected_moodboard_count_is_valid(1));
+    assert!(selected_moodboard_count_is_valid(10));
+    assert!(!selected_moodboard_count_is_valid(11));
+
+    let mut review = approved_review_fixture();
+    review.pose = " Direct Flash ".to_string();
+    review.scene = "direct flash".to_string();
+    review.lighting = " Street ".to_string();
+    review.framing = "street".to_string();
+
+    assert_eq!(
+        visual_review_tags(&review),
+        vec![
+            "Direct Flash".to_string(),
+            "Street".to_string(),
+            "compact camera".to_string(),
+            "editorial fashion".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -148,6 +364,46 @@ fn text_only_models_are_not_chosen_for_vision_tasks() {
     assert_eq!(selected.provider, "workers_ai");
     assert_eq!(selected.model, "@cf/moonshotai/kimi-k2.6");
     assert!(selected.supports_vision);
+}
+
+fn approved_review_fixture() -> VisualReferenceReview {
+    VisualReferenceReview {
+        decision: "approved".to_string(),
+        best_moodboard_slug: "flash-editorial".to_string(),
+        human_count: 1,
+        adult_likely: true,
+        age_unclear: false,
+        minor_likely: false,
+        youth_coded: false,
+        revealing_fashion: false,
+        explicit: false,
+        unsafe_content: false,
+        is_moodboard: false,
+        is_screenshot: false,
+        is_product_shot: false,
+        is_tutorial: false,
+        is_generic: false,
+        instagram_post_worthy: true,
+        visual_fit_score: 0.9,
+        pose: "standing".to_string(),
+        scene: "street".to_string(),
+        lighting: "direct flash".to_string(),
+        framing: "vertical portrait".to_string(),
+        camera_feel: "compact camera".to_string(),
+        styling_direction: "editorial fashion".to_string(),
+        rejection_reason: None,
+        reason: "strong adult portrait".to_string(),
+    }
+}
+
+fn selected_moodboard_fixture() -> Vec<MoodboardBrief> {
+    vec![MoodboardBrief {
+        id: "mb_flash".to_string(),
+        slug: "flash-editorial".to_string(),
+        title: "Flash editorial".to_string(),
+        vibe_summary: "Direct flash portraits.".to_string(),
+        search_queries: Vec::new(),
+    }]
 }
 
 #[test]
@@ -687,10 +943,7 @@ fn human_presence_accepts_single_organic_recent_images_only() {
 
     let mut studio = accepted.clone();
     studio.capture_style = "professional_studio".to_string();
-    assert_eq!(
-        can_accept_human_presence(&studio).unwrap_err(),
-        "too_professional"
-    );
+    assert!(can_accept_human_presence(&studio).is_ok());
 
     let mut no_human = accepted.clone();
     no_human.has_human = false;
@@ -718,7 +971,7 @@ fn human_presence_accepts_single_organic_recent_images_only() {
     render_like.capture_style = "render_like".to_string();
     assert_eq!(
         can_accept_human_presence(&render_like).unwrap_err(),
-        "too_professional"
+        "too_synthetic"
     );
 
     let mut mannequin = accepted.clone();

@@ -156,12 +156,8 @@ pub fn can_accept_human_presence(review: &HumanPresenceReview) -> Result<(), &'s
     }
 
     let capture_style = normalize_words(&review.capture_style);
-    if capture_style.contains("professional studio")
-        || capture_style.contains("studio")
-        || capture_style.contains("editorial")
-        || capture_style.contains("render")
-    {
-        return Err("too_professional");
+    if capture_style.contains("render") {
+        return Err("too_synthetic");
     }
 
     Ok(())
