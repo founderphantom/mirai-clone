@@ -15,7 +15,8 @@ use mirai_product_worker::domain::media_validation::{
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
 use mirai_product_worker::domain::visual_reference::{
-    accept_visual_review, selected_moodboard_count_is_valid, visual_review_tags, MoodboardBrief,
+    accept_visual_review, rank_candidates_for_review, selected_moodboard_count_is_valid,
+    visual_review_tags, CandidateDiversityCaps, MoodboardBrief, VisualCandidateForRanking,
     VisualReferenceReview,
 };
 use mirai_product_worker::instagram_references::{
@@ -127,6 +128,342 @@ fn visual_reference_pipeline_schema_has_required_columns_and_config() {
     assert!(migration.contains("media_asset_id TEXT"));
     assert!(migration.contains("moodboard_instagram_handles_json"));
     assert!(migration.contains("instagram_candidate_review_limit"));
+}
+
+#[test]
+fn candidate_ranking_prefers_static_configured_recent_engaged_images() {
+    let candidates = vec![
+        ranking_candidate(
+            "related_video",
+            "related_profile",
+            "warm-ambient",
+            "handle_b",
+            2,
+            99_000,
+            "2026-01-01T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "configured_static",
+            "configured_handle",
+            "warm-ambient",
+            "handle_a",
+            1,
+            1_000,
+            "2026-01-02T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "carousel",
+            "configured_handle",
+            "flash-editorial",
+            "handle_c",
+            8,
+            5_000,
+            "2026-01-01T00:00:00.000Z",
+        ),
+    ];
+    let caps = CandidateDiversityCaps {
+        review_limit: 3,
+        per_handle_review_cap: 3,
+        per_moodboard_review_cap: 3,
+    };
+
+    let ranked = rank_candidates_for_review(candidates, &caps);
+
+    assert_eq!(ranked[0].id, "configured_static");
+    assert_eq!(ranked[1].id, "carousel");
+    assert_eq!(ranked[2].id, "related_video");
+}
+
+#[test]
+fn candidate_ranking_caps_handle_and_moodboard_concentration() {
+    let candidates = vec![
+        ranking_candidate(
+            "a1",
+            "configured_handle",
+            "warm-ambient",
+            "same_handle",
+            1,
+            10_000,
+            "2026-01-04T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "a2",
+            "configured_handle",
+            "warm-ambient",
+            "same_handle",
+            1,
+            9_000,
+            "2026-01-03T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "a3",
+            "configured_handle",
+            "warm-ambient",
+            "same_handle",
+            1,
+            8_000,
+            "2026-01-02T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "b1",
+            "configured_handle",
+            "flash-editorial",
+            "other_handle",
+            1,
+            7_000,
+            "2026-01-01T00:00:00.000Z",
+        ),
+    ];
+    let caps = CandidateDiversityCaps {
+        review_limit: 10,
+        per_handle_review_cap: 2,
+        per_moodboard_review_cap: 2,
+    };
+
+    let ranked = rank_candidates_for_review(candidates, &caps);
+    let ids = ranked
+        .into_iter()
+        .map(|candidate| candidate.id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["a1", "a2", "b1"]);
+}
+
+#[test]
+fn candidate_ranking_accepted_handle_outranks_related_profile() {
+    let candidates = vec![
+        ranking_candidate(
+            "related",
+            "related_profile",
+            "warm-ambient",
+            "handle_a",
+            1,
+            1_000,
+            "2026-01-01T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "accepted",
+            "accepted_handle",
+            "warm-ambient",
+            "handle_b",
+            1,
+            1_000,
+            "2026-01-01T00:00:00.000Z",
+        ),
+    ];
+    let caps = CandidateDiversityCaps {
+        review_limit: 2,
+        per_handle_review_cap: 2,
+        per_moodboard_review_cap: 2,
+    };
+
+    let ranked = rank_candidates_for_review(candidates, &caps);
+
+    assert_eq!(ranked[0].id, "accepted");
+    assert_eq!(ranked[1].id, "related");
+}
+
+#[test]
+fn candidate_ranking_diversity_caps_normalize_handle_and_moodboard_keys() {
+    let candidates = vec![
+        ranking_candidate(
+            "a1",
+            "configured_handle",
+            " Warm-Ambient ",
+            " Same_Handle ",
+            1,
+            10_000,
+            "2026-01-04T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "a2",
+            "configured_handle",
+            "warm-ambient",
+            "same_handle",
+            1,
+            9_000,
+            "2026-01-03T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "b1",
+            "configured_handle",
+            "Flash-Editorial",
+            "Other_Handle",
+            1,
+            8_000,
+            "2026-01-02T00:00:00.000Z",
+        ),
+    ];
+    let caps = CandidateDiversityCaps {
+        review_limit: 10,
+        per_handle_review_cap: 1,
+        per_moodboard_review_cap: 1,
+    };
+
+    let ranked = rank_candidates_for_review(candidates, &caps);
+    let ids = ranked
+        .into_iter()
+        .map(|candidate| candidate.id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["a1", "b1"]);
+}
+
+#[test]
+fn candidate_ranking_equal_scores_use_ascending_id_tie_break() {
+    let candidates = vec![
+        ranking_candidate(
+            "candidate_b",
+            "configured_handle",
+            "warm-ambient",
+            "handle_b",
+            1,
+            1_000,
+            "2026-01-01T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "candidate_a",
+            "configured_handle",
+            "warm-ambient",
+            "handle_a",
+            1,
+            1_000,
+            "2026-01-01T00:00:00.000Z",
+        ),
+    ];
+    let caps = CandidateDiversityCaps {
+        review_limit: 2,
+        per_handle_review_cap: 2,
+        per_moodboard_review_cap: 2,
+    };
+
+    let ranked = rank_candidates_for_review(candidates, &caps);
+
+    assert_eq!(ranked[0].id, "candidate_a");
+    assert_eq!(ranked[1].id, "candidate_b");
+}
+
+#[test]
+fn candidate_ranking_prefers_engagement_before_recency_for_same_class() {
+    let candidates = vec![
+        ranking_candidate(
+            "newer_low_engagement",
+            "configured_handle",
+            "warm-ambient",
+            "handle_a",
+            1,
+            100,
+            "2026-01-04T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "older_high_engagement",
+            "configured_handle",
+            "warm-ambient",
+            "handle_b",
+            1,
+            10_000,
+            "2026-01-01T00:00:00.000Z",
+        ),
+    ];
+    let caps = CandidateDiversityCaps {
+        review_limit: 2,
+        per_handle_review_cap: 2,
+        per_moodboard_review_cap: 2,
+    };
+
+    let ranked = rank_candidates_for_review(candidates, &caps);
+
+    assert_eq!(ranked[0].id, "older_high_engagement");
+    assert_eq!(ranked[1].id, "newer_low_engagement");
+}
+
+#[test]
+fn candidate_ranking_invalid_timestamp_does_not_outrank_valid_timestamp() {
+    let candidates = vec![
+        ranking_candidate(
+            "invalid_timestamp",
+            "configured_handle",
+            "warm-ambient",
+            "handle_a",
+            1,
+            1_000,
+            "9999-not-a-date",
+        ),
+        ranking_candidate(
+            "valid_timestamp",
+            "configured_handle",
+            "warm-ambient",
+            "handle_b",
+            1,
+            1_000,
+            "2026-01-01T00:00:00.000Z",
+        ),
+    ];
+    let caps = CandidateDiversityCaps {
+        review_limit: 2,
+        per_handle_review_cap: 2,
+        per_moodboard_review_cap: 2,
+    };
+
+    let ranked = rank_candidates_for_review(candidates, &caps);
+
+    assert_eq!(ranked[0].id, "valid_timestamp");
+    assert_eq!(ranked[1].id, "invalid_timestamp");
+}
+
+#[test]
+fn candidate_ranking_malformed_calendar_date_does_not_outrank_valid_timestamp() {
+    let candidates = vec![
+        ranking_candidate(
+            "malformed_calendar_date",
+            "configured_handle",
+            "warm-ambient",
+            "handle_a",
+            1,
+            1_000,
+            "2026-02-31T00:00:00.000Z",
+        ),
+        ranking_candidate(
+            "valid_timestamp",
+            "configured_handle",
+            "warm-ambient",
+            "handle_b",
+            1,
+            1_000,
+            "2026-02-01T00:00:00.000Z",
+        ),
+    ];
+    let caps = CandidateDiversityCaps {
+        review_limit: 2,
+        per_handle_review_cap: 2,
+        per_moodboard_review_cap: 2,
+    };
+
+    let ranked = rank_candidates_for_review(candidates, &caps);
+
+    assert_eq!(ranked[0].id, "valid_timestamp");
+    assert_eq!(ranked[1].id, "malformed_calendar_date");
+}
+
+fn ranking_candidate(
+    id: &str,
+    discovered_via: &str,
+    moodboard_slug: &str,
+    source_handle: &str,
+    media_type: u8,
+    like_count: u64,
+    source_published_at: &str,
+) -> VisualCandidateForRanking {
+    VisualCandidateForRanking {
+        id: id.to_string(),
+        discovered_via: discovered_via.to_string(),
+        moodboard_slug: moodboard_slug.to_string(),
+        source_handle: source_handle.to_string(),
+        media_type,
+        like_count: Some(like_count),
+        comment_count: Some(0),
+        source_published_at: Some(source_published_at.to_string()),
+    }
 }
 
 #[test]

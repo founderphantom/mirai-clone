@@ -1,6 +1,9 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
 use std::fmt;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +145,113 @@ pub fn visual_review_tags(review: &VisualReferenceReview) -> Vec<String> {
 
 pub fn selected_moodboard_count_is_valid(count: usize) -> bool {
     (1..=10).contains(&count)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualCandidateForRanking {
+    pub id: String,
+    pub discovered_via: String,
+    pub moodboard_slug: String,
+    pub source_handle: String,
+    pub media_type: u8,
+    pub like_count: Option<u64>,
+    pub comment_count: Option<u64>,
+    pub source_published_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateDiversityCaps {
+    pub review_limit: usize,
+    pub per_handle_review_cap: usize,
+    pub per_moodboard_review_cap: usize,
+}
+
+pub fn rank_candidates_for_review(
+    mut candidates: Vec<VisualCandidateForRanking>,
+    caps: &CandidateDiversityCaps,
+) -> Vec<VisualCandidateForRanking> {
+    candidates.sort_by(|left, right| {
+        candidate_score(right)
+            .cmp(&candidate_score(left))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut ranked = Vec::new();
+    let mut handle_counts: HashMap<String, usize> = HashMap::new();
+    let mut moodboard_counts: HashMap<String, usize> = HashMap::new();
+
+    for candidate in candidates {
+        if ranked.len() >= caps.review_limit {
+            break;
+        }
+
+        let handle_key = ranking_key(&candidate.source_handle);
+        let moodboard_key = ranking_key(&candidate.moodboard_slug);
+        let handle_count = handle_counts.get(&handle_key).copied().unwrap_or_default();
+        let moodboard_count = moodboard_counts
+            .get(&moodboard_key)
+            .copied()
+            .unwrap_or_default();
+
+        if handle_count >= caps.per_handle_review_cap {
+            continue;
+        }
+        if moodboard_count >= caps.per_moodboard_review_cap {
+            continue;
+        }
+
+        *handle_counts.entry(handle_key).or_default() += 1;
+        *moodboard_counts.entry(moodboard_key).or_default() += 1;
+        ranked.push(candidate);
+    }
+
+    ranked
+}
+
+fn candidate_score(candidate: &VisualCandidateForRanking) -> (u16, u16, u64, i64) {
+    (
+        media_type_score(candidate.media_type),
+        discovered_via_score(&candidate.discovered_via),
+        engagement_score(candidate.like_count, candidate.comment_count),
+        recency_score(candidate.source_published_at.as_deref()),
+    )
+}
+
+fn media_type_score(media_type: u8) -> u16 {
+    match media_type {
+        1 => 300,
+        8 => 200,
+        2 => 100,
+        _ => 0,
+    }
+}
+
+fn discovered_via_score(discovered_via: &str) -> u16 {
+    match discovered_via.trim().to_ascii_lowercase().as_str() {
+        "configured_handle" | "accepted_handle" => 200,
+        "related_profile" => 100,
+        _ => 0,
+    }
+}
+
+fn engagement_score(like_count: Option<u64>, comment_count: Option<u64>) -> u64 {
+    like_count
+        .unwrap_or_default()
+        .saturating_add(comment_count.unwrap_or_default().saturating_mul(2))
+}
+
+fn recency_score(source_published_at: Option<&str>) -> i64 {
+    let Some(value) = source_published_at.map(str::trim) else {
+        return 0;
+    };
+
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map(|timestamp| timestamp.unix_timestamp())
+        .unwrap_or_default()
+}
+
+fn ranking_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn push_tag(tags: &mut Vec<String>, value: &str) {
