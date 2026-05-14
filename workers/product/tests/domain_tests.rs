@@ -3334,6 +3334,9 @@ fn influence_accumulates_likes_and_dislikes_from_metadata() {
             action: "like".to_string(),
             aesthetic_tags: vec!["minimalist".to_string(), "street".to_string()],
             niche_cluster: Some("outfit-inspo".to_string()),
+            moodboard_id: Some("moodboard_outfit".to_string()),
+            moodboard_slug: Some("outfit-inspo".to_string()),
+            source_handle: Some("Creator_A".to_string()),
             source_platform: "tiktok".to_string(),
             visual_reference_id: Some("vref_1".to_string()),
         },
@@ -3341,6 +3344,9 @@ fn influence_accumulates_likes_and_dislikes_from_metadata() {
             action: "dislike".to_string(),
             aesthetic_tags: vec!["neon".to_string()],
             niche_cluster: Some("formal-wear".to_string()),
+            moodboard_id: Some("moodboard_formal".to_string()),
+            moodboard_slug: Some("formal-wear".to_string()),
+            source_handle: Some("Creator_B".to_string()),
             source_platform: "instagram".to_string(),
             visual_reference_id: Some("vref_2".to_string()),
         },
@@ -3350,6 +3356,10 @@ fn influence_accumulates_likes_and_dislikes_from_metadata() {
     assert_eq!(influence.liked_clusters["outfit-inspo"], 1);
     assert_eq!(influence.disliked_tags["neon"], 1);
     assert_eq!(influence.disliked_clusters["formal-wear"], 1);
+    assert_eq!(influence.liked_moodboards["outfit-inspo"], 1);
+    assert_eq!(influence.disliked_moodboards["formal-wear"], 1);
+    assert_eq!(influence.liked_handles["creator_a"], 1);
+    assert_eq!(influence.disliked_handles["creator_b"], 1);
     assert_eq!(influence.liked_platforms["tiktok"], 1);
     assert_eq!(influence.liked_visual_reference_ids["vref_1"], 1);
 }
@@ -3360,12 +3370,17 @@ fn influence_normalizes_text_keys_but_preserves_reference_id_case() {
         action: "like".to_string(),
         aesthetic_tags: vec![" Minimalist ".to_string()],
         niche_cluster: Some(" Outfit-Inspo ".to_string()),
+        moodboard_id: Some(" Moodboard_A ".to_string()),
+        moodboard_slug: Some(" Warm-Ambient ".to_string()),
+        source_handle: Some(" Creator_A ".to_string()),
         source_platform: "TikTok".to_string(),
         visual_reference_id: Some(" VRef_A ".to_string()),
     }]);
 
     assert_eq!(influence.liked_tags["minimalist"], 1);
     assert_eq!(influence.liked_clusters["outfit-inspo"], 1);
+    assert_eq!(influence.liked_moodboards["warm-ambient"], 1);
+    assert_eq!(influence.liked_handles["creator_a"], 1);
     assert_eq!(influence.liked_platforms["tiktok"], 1);
     assert_eq!(influence.liked_visual_reference_ids["VRef_A"], 1);
 
@@ -3375,6 +3390,9 @@ fn influence_normalizes_text_keys_but_preserves_reference_id_case() {
             source_platform: "instagram".to_string(),
             source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some("other".to_string()),
+            moodboard_id: Some("moodboard_other".to_string()),
+            moodboard_slug: Some("other".to_string()),
+            source_handle: Some("other_creator".to_string()),
             aesthetic_tags: vec!["other".to_string()],
             human_presence_score: 0.8,
             organic_photo_score: 0.8,
@@ -3387,6 +3405,9 @@ fn influence_normalizes_text_keys_but_preserves_reference_id_case() {
             source_platform: "tiktok".to_string(),
             source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some("outfit-inspo".to_string()),
+            moodboard_id: Some("moodboard_warm".to_string()),
+            moodboard_slug: Some("warm-ambient".to_string()),
+            source_handle: Some("creator_a".to_string()),
             aesthetic_tags: vec!["minimalist".to_string()],
             human_presence_score: 0.8,
             organic_photo_score: 0.8,
@@ -3402,6 +3423,59 @@ fn influence_normalizes_text_keys_but_preserves_reference_id_case() {
 }
 
 #[test]
+fn influence_scores_moodboard_and_handle_preferences() {
+    let influence = accumulate_influence(&[
+        SwipeMetadata {
+            action: "like".to_string(),
+            aesthetic_tags: Vec::new(),
+            niche_cluster: None,
+            moodboard_id: Some("moodboard_warm".to_string()),
+            moodboard_slug: Some(" Warm-Ambient ".to_string()),
+            source_handle: Some(" Creator_A ".to_string()),
+            source_platform: "instagram".to_string(),
+            visual_reference_id: None,
+        },
+        SwipeMetadata {
+            action: "dislike".to_string(),
+            aesthetic_tags: Vec::new(),
+            niche_cluster: None,
+            moodboard_id: Some("moodboard_flash".to_string()),
+            moodboard_slug: Some("Flash-Editorial".to_string()),
+            source_handle: Some("Creator_B".to_string()),
+            source_platform: "instagram".to_string(),
+            visual_reference_id: None,
+        },
+    ]);
+
+    let refs = vec![
+        blitz_selection_ref(
+            "aaa_disliked",
+            "moodboard_flash",
+            "flash-editorial",
+            "creator_b",
+            "instagram",
+            0.95,
+        ),
+        blitz_selection_ref(
+            "zzz_liked",
+            "moodboard_warm",
+            "warm-ambient",
+            "creator_a",
+            "instagram",
+            0.86,
+        ),
+    ];
+
+    let selected = select_visual_references(&refs, &influence, 1, 4, "2026-05-11T00:00:00.000Z");
+
+    assert_eq!(selected[0].id, "zzz_liked");
+    assert_eq!(influence.liked_moodboards["warm-ambient"], 1);
+    assert_eq!(influence.liked_handles["creator_a"], 1);
+    assert_eq!(influence.disliked_moodboards["flash-editorial"], 1);
+    assert_eq!(influence.disliked_handles["creator_b"], 1);
+}
+
+#[test]
 fn selection_respects_influence_variety_and_reuse_cap() {
     let refs = vec![
         VisualReferenceForSelection {
@@ -3409,6 +3483,9 @@ fn selection_respects_influence_variety_and_reuse_cap() {
             source_platform: "tiktok".to_string(),
             source_published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some("outfit-inspo".to_string()),
+            moodboard_id: Some("moodboard_outfit".to_string()),
+            moodboard_slug: Some("outfit-inspo".to_string()),
+            source_handle: Some("creator_a".to_string()),
             aesthetic_tags: vec!["minimalist".to_string()],
             human_presence_score: 0.8,
             organic_photo_score: 0.8,
@@ -3421,6 +3498,9 @@ fn selection_respects_influence_variety_and_reuse_cap() {
             source_platform: "instagram".to_string(),
             source_published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some("outfit-inspo".to_string()),
+            moodboard_id: Some("moodboard_outfit".to_string()),
+            moodboard_slug: Some("outfit-inspo".to_string()),
+            source_handle: Some("creator_b".to_string()),
             aesthetic_tags: vec!["minimalist".to_string()],
             human_presence_score: 0.95,
             organic_photo_score: 0.8,
@@ -3433,6 +3513,9 @@ fn selection_respects_influence_variety_and_reuse_cap() {
             source_platform: "instagram".to_string(),
             source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some("mirror-fit".to_string()),
+            moodboard_id: Some("moodboard_mirror".to_string()),
+            moodboard_slug: Some("mirror-fit".to_string()),
+            source_handle: Some("creator_c".to_string()),
             aesthetic_tags: vec!["street".to_string()],
             human_presence_score: 0.7,
             organic_photo_score: 0.8,
@@ -3445,6 +3528,9 @@ fn selection_respects_influence_variety_and_reuse_cap() {
             source_platform: "tiktok".to_string(),
             source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some("mirror-fit".to_string()),
+            moodboard_id: Some("moodboard_mirror".to_string()),
+            moodboard_slug: Some("mirror-fit".to_string()),
+            source_handle: Some("creator_d".to_string()),
             aesthetic_tags: vec!["street".to_string()],
             human_presence_score: 0.9,
             organic_photo_score: 0.8,
@@ -3471,6 +3557,77 @@ fn selection_respects_influence_variety_and_reuse_cap() {
 }
 
 #[test]
+fn blitz_reference_selection_caps_handle_and_moodboard_repetition() {
+    let refs = vec![
+        blitz_selection_ref("r1", "mb_a", "warm-ambient", "handle_a", "instagram", 0.95),
+        blitz_selection_ref("r2", "mb_a", "warm-ambient", "handle_a", "instagram", 0.94),
+        blitz_selection_ref("r3", "mb_a", "warm-ambient", "handle_a", "tiktok", 0.93),
+        blitz_selection_ref("r4", "mb_b", "flash-editorial", "handle_b", "tiktok", 0.92),
+        blitz_selection_ref("r5", "mb_b", "flash-editorial", "handle_c", "tiktok", 0.91),
+    ];
+
+    let selected = select_visual_references(
+        &refs,
+        &Influence::default(),
+        5,
+        4,
+        "2026-05-14T00:00:00.000Z",
+    );
+    let ids = selected
+        .iter()
+        .map(|reference| reference.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["r1", "r4", "r2", "r5"]);
+}
+
+#[test]
+fn blitz_reference_selection_represents_moodboards_before_second_reference() {
+    let refs = vec![
+        blitz_selection_ref("r1", "mb_a", "warm-ambient", "handle_a", "instagram", 0.95),
+        blitz_selection_ref("r2", "mb_a", "warm-ambient", "handle_b", "instagram", 0.94),
+        blitz_selection_ref("r3", "mb_b", "flash-editorial", "handle_c", "tiktok", 0.93),
+    ];
+
+    let selected = select_visual_references(
+        &refs,
+        &Influence::default(),
+        2,
+        4,
+        "2026-05-14T00:00:00.000Z",
+    );
+    let ids = selected
+        .iter()
+        .map(|reference| reference.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["r1", "r3"]);
+}
+
+#[test]
+fn blitz_reference_selection_allows_second_moodboard_after_available_moodboards_are_represented() {
+    let refs = vec![
+        blitz_selection_ref("r1", "mb_a", "warm-ambient", "handle_a", "instagram", 0.95),
+        blitz_selection_ref("r2", "mb_a", "warm-ambient", "handle_b", "instagram", 0.94),
+        blitz_selection_ref("r3", "mb_b", "flash-editorial", "handle_c", "tiktok", 0.93),
+    ];
+
+    let selected = select_visual_references(
+        &refs,
+        &Influence::default(),
+        3,
+        4,
+        "2026-05-14T00:00:00.000Z",
+    );
+    let ids = selected
+        .iter()
+        .map(|reference| reference.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["r1", "r3", "r2"]);
+}
+
+#[test]
 fn selection_filters_invalid_scores_and_future_sources() {
     let refs = vec![
         VisualReferenceForSelection {
@@ -3478,6 +3635,9 @@ fn selection_filters_invalid_scores_and_future_sources() {
             source_platform: "instagram".to_string(),
             source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some("valid".to_string()),
+            moodboard_id: Some("moodboard_valid".to_string()),
+            moodboard_slug: Some("valid".to_string()),
+            source_handle: Some("creator_a".to_string()),
             aesthetic_tags: vec!["street".to_string()],
             human_presence_score: 0.7,
             organic_photo_score: 0.8,
@@ -3490,6 +3650,9 @@ fn selection_filters_invalid_scores_and_future_sources() {
             source_platform: "tiktok".to_string(),
             source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some("invalid".to_string()),
+            moodboard_id: Some("moodboard_invalid".to_string()),
+            moodboard_slug: Some("invalid".to_string()),
+            source_handle: Some("creator_b".to_string()),
             aesthetic_tags: vec!["street".to_string()],
             human_presence_score: f64::NAN,
             organic_photo_score: 1.0,
@@ -3502,6 +3665,9 @@ fn selection_filters_invalid_scores_and_future_sources() {
             source_platform: "tiktok".to_string(),
             source_published_at: Some("2026-05-12T00:00:00.000Z".to_string()),
             niche_cluster: Some("future".to_string()),
+            moodboard_id: Some("moodboard_future".to_string()),
+            moodboard_slug: Some("future".to_string()),
+            source_handle: Some("creator_c".to_string()),
             aesthetic_tags: vec!["street".to_string()],
             human_presence_score: 0.95,
             organic_photo_score: 0.95,
@@ -3531,6 +3697,9 @@ fn selection_caps_cluster_and_platform_variety() {
             source_platform: "tiktok".to_string(),
             source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some("same-cluster".to_string()),
+            moodboard_id: Some("moodboard_same".to_string()),
+            moodboard_slug: Some("same-cluster".to_string()),
+            source_handle: Some(format!("cluster_creator_{index}")),
             aesthetic_tags: vec!["street".to_string()],
             human_presence_score: 0.9 - (index as f64 * 0.01),
             organic_photo_score: 0.8,
@@ -3543,6 +3712,9 @@ fn selection_caps_cluster_and_platform_variety() {
             source_platform: "instagram".to_string(),
             source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
             niche_cluster: Some(format!("cluster_{index}")),
+            moodboard_id: Some(format!("moodboard_{index}")),
+            moodboard_slug: Some(format!("cluster_{index}")),
+            source_handle: Some(format!("platform_creator_{index}")),
             aesthetic_tags: vec!["minimalist".to_string()],
             human_presence_score: 0.85 - (index as f64 * 0.01),
             organic_photo_score: 0.8,
@@ -3572,6 +3744,31 @@ fn selection_caps_cluster_and_platform_variety() {
     assert_eq!(same_cluster_count, 2);
     assert_eq!(instagram_count, 3);
     assert!(selected.len() <= 5);
+}
+
+fn blitz_selection_ref(
+    id: &str,
+    moodboard_id: &str,
+    moodboard_slug: &str,
+    source_handle: &str,
+    source_platform: &str,
+    score: f64,
+) -> VisualReferenceForSelection {
+    VisualReferenceForSelection {
+        id: id.to_string(),
+        source_platform: source_platform.to_string(),
+        source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+        niche_cluster: Some(moodboard_slug.to_string()),
+        moodboard_id: Some(moodboard_id.to_string()),
+        moodboard_slug: Some(moodboard_slug.to_string()),
+        source_handle: Some(source_handle.to_string()),
+        aesthetic_tags: vec!["direct flash".to_string()],
+        human_presence_score: score,
+        organic_photo_score: score,
+        freshness_visual_score: score,
+        generation_use_count: 0,
+        last_liked_at: None,
+    }
 }
 
 #[test]

@@ -102,6 +102,9 @@ struct SwipeMetadataSnapshot {
     #[serde(default)]
     aesthetic_tags: Vec<String>,
     niche_cluster: Option<String>,
+    moodboard_id: Option<String>,
+    moodboard_slug: Option<String>,
+    source_handle: Option<String>,
     #[serde(default)]
     source_platform: String,
     visual_reference_id: Option<String>,
@@ -113,6 +116,9 @@ struct VisualReferenceRow {
     source_platform: String,
     source_published_at: Option<String>,
     niche_cluster: Option<String>,
+    moodboard_id: Option<String>,
+    moodboard_slug: Option<String>,
+    source_handle: Option<String>,
     aesthetic_tags_json: String,
     human_presence_score: f64,
     organic_photo_score: f64,
@@ -157,7 +163,16 @@ struct OutputSwipeRow {
     visual_reference_id: Option<String>,
     source_platform: Option<String>,
     niche_cluster: Option<String>,
+    moodboard_id: Option<String>,
+    moodboard_slug: Option<String>,
+    source_handle: Option<String>,
     aesthetic_tags_json: Option<String>,
+    pose: Option<String>,
+    scene: Option<String>,
+    lighting: Option<String>,
+    framing: Option<String>,
+    camera_feel: Option<String>,
+    styling_direction: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -612,8 +627,17 @@ pub async fn record_swipe(
     let metadata = json!({
         "aestheticTags": parse_string_array(output.aesthetic_tags_json.as_deref().unwrap_or("[]")),
         "nicheCluster": output.niche_cluster,
+        "moodboardId": output.moodboard_id,
+        "moodboardSlug": output.moodboard_slug,
+        "sourceHandle": output.source_handle,
         "sourcePlatform": output.source_platform.clone().unwrap_or_default(),
         "visualReferenceId": output.visual_reference_id,
+        "pose": output.pose,
+        "scene": output.scene,
+        "lighting": output.lighting,
+        "framing": output.framing,
+        "cameraFeel": output.camera_feel,
+        "stylingDirection": output.styling_direction,
     });
 
     let insert_result = db::run(
@@ -951,6 +975,15 @@ async fn load_influence(
                 niche_cluster: snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.niche_cluster.clone()),
+                moodboard_id: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.moodboard_id.clone()),
+                moodboard_slug: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.moodboard_slug.clone()),
+                source_handle: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.source_handle.clone()),
                 source_platform: snapshot
                     .as_ref()
                     .map(|snapshot| snapshot.source_platform.clone())
@@ -975,6 +1008,9 @@ async fn load_visual_references_for_selection(
           source_platform,
           source_published_at,
           niche_cluster,
+          moodboard_id,
+          moodboard_slug,
+          source_handle,
           aesthetic_tags_json,
           human_presence_score,
           organic_photo_score,
@@ -996,6 +1032,9 @@ async fn load_visual_references_for_selection(
             source_platform: row.source_platform,
             source_published_at: row.source_published_at,
             niche_cluster: row.niche_cluster,
+            moodboard_id: row.moodboard_id,
+            moodboard_slug: row.moodboard_slug,
+            source_handle: row.source_handle,
             aesthetic_tags: parse_string_array(&row.aesthetic_tags_json),
             human_presence_score: row.human_presence_score,
             organic_photo_score: row.organic_photo_score,
@@ -1204,7 +1243,16 @@ async fn load_output_for_swipe(
           gj.input_visual_reference_id AS visual_reference_id,
           vr.source_platform,
           vr.niche_cluster,
-          vr.aesthetic_tags_json
+          vr.moodboard_id,
+          vr.moodboard_slug,
+          vr.source_handle,
+          vr.aesthetic_tags_json,
+          vr.pose,
+          vr.scene,
+          vr.lighting,
+          vr.framing,
+          vr.camera_feel,
+          vr.styling_direction
         FROM generation_outputs go
         INNER JOIN generation_jobs gj
           ON gj.id = go.job_id

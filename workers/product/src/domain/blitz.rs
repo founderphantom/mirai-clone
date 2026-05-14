@@ -33,6 +33,10 @@ pub struct Influence {
     pub disliked_tags: HashMap<String, u32>,
     pub liked_clusters: HashMap<String, u32>,
     pub disliked_clusters: HashMap<String, u32>,
+    pub liked_moodboards: HashMap<String, u32>,
+    pub disliked_moodboards: HashMap<String, u32>,
+    pub liked_handles: HashMap<String, u32>,
+    pub disliked_handles: HashMap<String, u32>,
     pub liked_platforms: HashMap<String, u32>,
     pub disliked_platforms: HashMap<String, u32>,
     pub liked_visual_reference_ids: HashMap<String, u32>,
@@ -45,6 +49,9 @@ pub struct SwipeMetadata {
     pub action: String,
     pub aesthetic_tags: Vec<String>,
     pub niche_cluster: Option<String>,
+    pub moodboard_id: Option<String>,
+    pub moodboard_slug: Option<String>,
+    pub source_handle: Option<String>,
     pub source_platform: String,
     pub visual_reference_id: Option<String>,
 }
@@ -56,6 +63,9 @@ pub struct VisualReferenceForSelection {
     pub source_platform: String,
     pub source_published_at: Option<String>,
     pub niche_cluster: Option<String>,
+    pub moodboard_id: Option<String>,
+    pub moodboard_slug: Option<String>,
+    pub source_handle: Option<String>,
     pub aesthetic_tags: Vec<String>,
     pub human_presence_score: f64,
     pub organic_photo_score: f64,
@@ -181,6 +191,11 @@ pub fn accumulate_influence(swipes: &[SwipeMetadata]) -> Influence {
                     &mut influence.liked_clusters,
                     swipe.niche_cluster.as_deref(),
                 );
+                increment_option(
+                    &mut influence.liked_moodboards,
+                    swipe.moodboard_slug.as_deref(),
+                );
+                increment_option(&mut influence.liked_handles, swipe.source_handle.as_deref());
                 increment(&mut influence.liked_platforms, &swipe.source_platform);
                 increment_reference_option(
                     &mut influence.liked_visual_reference_ids,
@@ -192,6 +207,14 @@ pub fn accumulate_influence(swipes: &[SwipeMetadata]) -> Influence {
                 increment_option(
                     &mut influence.disliked_clusters,
                     swipe.niche_cluster.as_deref(),
+                );
+                increment_option(
+                    &mut influence.disliked_moodboards,
+                    swipe.moodboard_slug.as_deref(),
+                );
+                increment_option(
+                    &mut influence.disliked_handles,
+                    swipe.source_handle.as_deref(),
                 );
                 increment(&mut influence.disliked_platforms, &swipe.source_platform);
                 increment_reference_option(
@@ -235,28 +258,28 @@ pub fn select_visual_references(
 
     let mut selected = Vec::new();
     let mut cluster_counts: HashMap<String, u32> = HashMap::new();
+    let mut handle_counts: HashMap<String, u32> = HashMap::new();
+    let mut moodboard_counts: HashMap<String, u32> = HashMap::new();
     let mut platform_counts: HashMap<String, u32> = HashMap::new();
 
-    for (_, _, reference) in scored {
-        if selected.len() >= limit {
+    while selected.len() < limit {
+        let Some((index, reference)) = next_reference_for_selection(
+            &scored,
+            &platform_counts,
+            &cluster_counts,
+            &handle_counts,
+            &moodboard_counts,
+        ) else {
             break;
-        }
+        };
+
+        let reference = reference.clone();
+        scored.remove(index);
 
         let platform_key = normalize_key(&reference.source_platform);
-        let platform_count = platform_counts
-            .get(platform_key.as_deref().unwrap_or(""))
-            .copied()
-            .unwrap_or(0);
-        if platform_count >= 3 {
-            continue;
-        }
-
         let cluster_key = reference.niche_cluster.as_deref().and_then(normalize_key);
-        if let Some(cluster) = cluster_key.as_deref() {
-            if cluster_counts.get(cluster).copied().unwrap_or(0) >= 2 {
-                continue;
-            }
-        }
+        let handle_key = reference.source_handle.as_deref().and_then(normalize_key);
+        let moodboard_key = selection_moodboard_key(&reference);
 
         if let Some(platform) = platform_key {
             *platform_counts.entry(platform).or_insert(0) += 1;
@@ -264,10 +287,104 @@ pub fn select_visual_references(
         if let Some(cluster) = cluster_key {
             *cluster_counts.entry(cluster).or_insert(0) += 1;
         }
-        selected.push(reference.clone());
+        if let Some(handle) = handle_key {
+            *handle_counts.entry(handle).or_insert(0) += 1;
+        }
+        if let Some(moodboard) = moodboard_key {
+            *moodboard_counts.entry(moodboard).or_insert(0) += 1;
+        }
+        selected.push(reference);
     }
 
     selected
+}
+
+fn next_reference_for_selection<'a>(
+    scored: &'a [(f64, String, &'a VisualReferenceForSelection)],
+    platform_counts: &HashMap<String, u32>,
+    cluster_counts: &HashMap<String, u32>,
+    handle_counts: &HashMap<String, u32>,
+    moodboard_counts: &HashMap<String, u32>,
+) -> Option<(usize, &'a VisualReferenceForSelection)> {
+    let mut best_selectable = None;
+    let mut best_unrepresented_moodboard = None;
+
+    for (index, (_, _, reference)) in scored.iter().enumerate() {
+        if !passes_selection_caps(
+            reference,
+            platform_counts,
+            cluster_counts,
+            handle_counts,
+            moodboard_counts,
+        ) {
+            continue;
+        }
+
+        best_selectable.get_or_insert((index, *reference));
+
+        let moodboard_key = selection_moodboard_key(reference);
+        let is_unrepresented = moodboard_key
+            .as_deref()
+            .map(|moodboard| !moodboard_counts.contains_key(moodboard))
+            .unwrap_or(false);
+
+        if is_unrepresented {
+            best_unrepresented_moodboard.get_or_insert((index, *reference));
+        }
+    }
+
+    if let Some((_, best_reference)) = best_selectable {
+        let best_moodboard = selection_moodboard_key(best_reference);
+        let best_repeats_moodboard = best_moodboard
+            .as_deref()
+            .map(|moodboard| moodboard_counts.contains_key(moodboard))
+            .unwrap_or(false);
+        if best_repeats_moodboard {
+            return best_unrepresented_moodboard.or(best_selectable);
+        }
+    }
+
+    best_selectable
+}
+
+fn passes_selection_caps(
+    reference: &VisualReferenceForSelection,
+    platform_counts: &HashMap<String, u32>,
+    cluster_counts: &HashMap<String, u32>,
+    handle_counts: &HashMap<String, u32>,
+    moodboard_counts: &HashMap<String, u32>,
+) -> bool {
+    let platform_key = normalize_key(&reference.source_platform);
+    let platform_count = platform_counts
+        .get(platform_key.as_deref().unwrap_or(""))
+        .copied()
+        .unwrap_or(0);
+    if platform_count >= 3 {
+        return false;
+    }
+
+    let cluster_key = reference.niche_cluster.as_deref().and_then(normalize_key);
+    if let Some(cluster) = cluster_key.as_deref() {
+        if cluster_counts.get(cluster).copied().unwrap_or(0) >= 2 {
+            return false;
+        }
+    }
+
+    let handle_key = reference.source_handle.as_deref().and_then(normalize_key);
+    if let Some(handle) = handle_key.as_deref() {
+        if handle_counts.get(handle).copied().unwrap_or(0) >= 2 {
+            return false;
+        }
+    }
+
+    let moodboard_key = selection_moodboard_key(reference);
+    if let Some(moodboard) = moodboard_key.as_deref() {
+        if moodboard_counts.get(moodboard).copied().unwrap_or(0) >= 2 {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn score_visual_reference(
@@ -290,6 +407,20 @@ fn score_visual_reference(
         score -= normalized_count(&influence.disliked_clusters, cluster) as f64 * 0.8;
     }
 
+    if let Some(moodboard) = reference
+        .moodboard_slug
+        .as_deref()
+        .or(reference.niche_cluster.as_deref())
+    {
+        score += normalized_count(&influence.liked_moodboards, moodboard) as f64 * 0.6;
+        score -= normalized_count(&influence.disliked_moodboards, moodboard) as f64 * 0.8;
+    }
+
+    if let Some(handle) = reference.source_handle.as_deref() {
+        score += normalized_count(&influence.liked_handles, handle) as f64 * 0.4;
+        score -= normalized_count(&influence.disliked_handles, handle) as f64 * 0.6;
+    }
+
     score += normalized_count(&influence.liked_platforms, &reference.source_platform) as f64 * 0.25;
     score -=
         normalized_count(&influence.disliked_platforms, &reference.source_platform) as f64 * 0.35;
@@ -302,6 +433,14 @@ fn score_visual_reference(
     }
 
     score
+}
+
+fn selection_moodboard_key(reference: &VisualReferenceForSelection) -> Option<String> {
+    reference
+        .moodboard_slug
+        .as_deref()
+        .or(reference.niche_cluster.as_deref())
+        .and_then(normalize_key)
 }
 
 fn is_selectable_reference(reference: &VisualReferenceForSelection, now: &str) -> bool {
