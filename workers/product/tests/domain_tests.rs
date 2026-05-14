@@ -100,6 +100,25 @@ fn blitz_route_does_not_swallow_unknown_service_errors() {
 }
 
 #[test]
+fn visual_reference_pipeline_schema_has_required_columns_and_config() {
+    let migration = include_str!("../../../config/d1/migrations/1007_visual_reference_pipeline.sql");
+
+    assert!(migration.contains("DROP TABLE IF EXISTS visual_reference_candidates"));
+    assert!(migration.contains("CREATE TABLE IF NOT EXISTS visual_reference_candidates"));
+    assert!(migration.contains("moodboard_slug TEXT"));
+    assert!(migration.contains("source_handle TEXT"));
+    assert!(migration.contains("source_post_code TEXT"));
+    assert!(migration.contains("source_image_index INTEGER"));
+    assert!(migration.contains("review_json TEXT NOT NULL DEFAULT '{}'"));
+    assert!(migration.contains("review_status TEXT NOT NULL DEFAULT 'unreviewed'"));
+    assert!(migration.contains("CREATE TABLE IF NOT EXISTS visual_references"));
+    assert!(migration.contains("source_caption_removed INTEGER NOT NULL DEFAULT 1"));
+    assert!(migration.contains("media_asset_id TEXT"));
+    assert!(migration.contains("moodboard_instagram_handles_json"));
+    assert!(migration.contains("instagram_candidate_review_limit"));
+}
+
+#[test]
 fn text_only_models_are_not_chosen_for_vision_tasks() {
     let text_only = vec![ModelConfig {
         provider: "deepseek".to_string(),
