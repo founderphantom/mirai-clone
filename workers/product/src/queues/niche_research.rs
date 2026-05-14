@@ -20,6 +20,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use worker::{Ai, D1Database, Delay, Env, Error, MessageBatch, MessageExt, Result as WorkerResult};
 
+const NICHE_RESEARCH_STATUS_CAS_MISS: &str = "niche_research_status_cas_miss";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -36,6 +38,8 @@ pub enum NicheResearchMessage {
     FetchInstagramProfile {
         user_id: String,
         clone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
         moodboard_id: String,
         moodboard_slug: String,
         handle: String,
@@ -45,6 +49,8 @@ pub enum NicheResearchMessage {
     FetchInstagramPosts {
         user_id: String,
         clone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
         moodboard_id: String,
         moodboard_slug: String,
         handle: String,
@@ -55,16 +61,22 @@ pub enum NicheResearchMessage {
     ReviewVisualCandidates {
         user_id: String,
         clone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
         limit: u32,
     },
     CacheApprovedReference {
         user_id: String,
         clone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
         candidate_id: String,
     },
     FinalizeReferencePool {
         user_id: String,
         clone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
         reason: String,
     },
     RefreshPool {
@@ -76,70 +88,488 @@ pub enum NicheResearchMessage {
 
 pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<()> {
     for raw_message in batch.raw_iter() {
-        let body = match serde_wasm_bindgen::from_value::<NicheResearchMessage>(raw_message.body())
-        {
-            Ok(body) => body,
-            Err(error) => {
-                web_sys::console::error_1(
-                    &format!("failed to deserialize niche research queue message: {error:?}")
-                        .into(),
-                );
-                raw_message.ack();
-                continue;
-            }
-        };
+        let message =
+            match serde_wasm_bindgen::from_value::<NicheResearchMessage>(raw_message.body()) {
+                Ok(body) => body,
+                Err(error) => {
+                    web_sys::console::error_1(
+                        &format!("failed to deserialize niche research queue message: {error:?}")
+                            .into(),
+                    );
+                    raw_message.ack();
+                    continue;
+                }
+            };
 
-        let db = env.d1("DB")?;
-        match body {
-            NicheResearchMessage::ResearchMoodboardReferences {
-                user_id,
-                clone_id,
-                moodboard_ids,
-                reason,
-            } => {
-                handle_research_moodboard_references(
-                    &db,
-                    &env,
-                    user_id,
-                    clone_id,
-                    moodboard_ids,
-                    reason,
-                )
-                .await?;
-            }
-            NicheResearchMessage::FetchInstagramProfile { .. }
-            | NicheResearchMessage::FetchInstagramPosts { .. }
-            | NicheResearchMessage::ReviewVisualCandidates { .. }
-            | NicheResearchMessage::CacheApprovedReference { .. }
-            | NicheResearchMessage::FinalizeReferencePool { .. } => {
-                web_sys::console::log_1(
-                    &"ack niche research message for pending visual reference handler".into(),
+        let failure_context = message_failure_context(&message);
+        match handle_message(message, &env).await {
+            Ok(()) => raw_message.ack(),
+            Err(error) => {
+                let detail = error.to_string();
+                if is_niche_research_status_race_error(&detail) {
+                    web_sys::console::error_1(
+                        &format!(
+                            "retry niche research queue message after raced status write: message={}",
+                            failure_context.message_type
+                        )
+                        .into(),
+                    );
+                    raw_message.retry();
+                    continue;
+                }
+
+                web_sys::console::error_1(
+                    &format!(
+                        "niche research queue message failed without panic: code={}, detail={}",
+                        queue_error_code(&detail),
+                        compact_error_detail(&detail)
+                    )
+                    .into(),
                 );
-            }
-            NicheResearchMessage::RefreshPool {
-                user_id,
-                clone_id,
-                reason,
-            } => {
-                handle_refresh_pool(&db, &env, user_id, clone_id, reason).await?;
+                match record_message_failure(&env, &failure_context, &detail).await {
+                    Ok(outcome) => match failure_record_action(Some(outcome)) {
+                        QueueMessageAction::Ack => {
+                            if outcome != FailureRecordOutcome::Recorded {
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "ack stale niche research failure message without status write: message={}",
+                                        failure_context.message_type
+                                    )
+                                    .into(),
+                                );
+                            }
+                            raw_message.ack();
+                        }
+                        QueueMessageAction::Retry => {
+                            web_sys::console::error_1(
+                                &format!(
+                                    "retry niche research queue message after raced failure record: message={}",
+                                    failure_context.message_type
+                                )
+                                .into(),
+                            );
+                            raw_message.retry();
+                        }
+                    },
+                    Err(status_error) => {
+                        web_sys::console::error_1(
+                            &format!(
+                                "failed to record niche research queue failure: code={}, detail={}",
+                                queue_error_code(&status_error.to_string()),
+                                compact_error_detail(&status_error.to_string())
+                            )
+                            .into(),
+                        );
+                        raw_message.retry();
+                    }
+                }
             }
         }
-
-        raw_message.ack();
     }
 
     Ok(())
 }
 
-async fn handle_research_moodboard_references(
-    db: &D1Database,
-    _env: &Env,
+struct MessageFailureContext {
     user_id: String,
     clone_id: String,
-    _moodboard_ids: Vec<String>,
-    reason: String,
+    run_id: Option<String>,
+    message_type: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureRecordOutcome {
+    Recorded,
+    SkippedStale,
+    SkippedRaced,
+    MissingClone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueMessageAction {
+    Ack,
+    Retry,
+}
+
+fn failure_record_action(outcome: Option<FailureRecordOutcome>) -> QueueMessageAction {
+    match outcome {
+        Some(
+            FailureRecordOutcome::Recorded
+            | FailureRecordOutcome::SkippedStale
+            | FailureRecordOutcome::MissingClone,
+        ) => QueueMessageAction::Ack,
+        Some(FailureRecordOutcome::SkippedRaced) | None => QueueMessageAction::Retry,
+    }
+}
+
+fn is_niche_research_status_race_error(error: &str) -> bool {
+    error.contains(NICHE_RESEARCH_STATUS_CAS_MISS)
+}
+
+fn message_failure_context(message: &NicheResearchMessage) -> MessageFailureContext {
+    match message {
+        NicheResearchMessage::ResearchMoodboardReferences {
+            user_id, clone_id, ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: None,
+            message_type: "research_moodboard_references",
+        },
+        NicheResearchMessage::FetchInstagramProfile {
+            user_id,
+            clone_id,
+            run_id,
+            ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: run_id.clone(),
+            message_type: "fetch_instagram_profile",
+        },
+        NicheResearchMessage::FetchInstagramPosts {
+            user_id,
+            clone_id,
+            run_id,
+            ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: run_id.clone(),
+            message_type: "fetch_instagram_posts",
+        },
+        NicheResearchMessage::ReviewVisualCandidates {
+            user_id,
+            clone_id,
+            run_id,
+            ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: run_id.clone(),
+            message_type: "review_visual_candidates",
+        },
+        NicheResearchMessage::CacheApprovedReference {
+            user_id,
+            clone_id,
+            run_id,
+            ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: run_id.clone(),
+            message_type: "cache_approved_reference",
+        },
+        NicheResearchMessage::FinalizeReferencePool {
+            user_id,
+            clone_id,
+            run_id,
+            ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: run_id.clone(),
+            message_type: "finalize_reference_pool",
+        },
+        NicheResearchMessage::RefreshPool {
+            user_id, clone_id, ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: None,
+            message_type: "refresh_pool",
+        },
+    }
+}
+
+async fn handle_message(message: NicheResearchMessage, env: &Env) -> WorkerResult<()> {
+    let db = env.d1("DB")?;
+    match message {
+        NicheResearchMessage::ResearchMoodboardReferences {
+            user_id,
+            clone_id,
+            moodboard_ids,
+            reason,
+        } => {
+            research_moodboard_references(&db, env, &user_id, &clone_id, &moodboard_ids, &reason)
+                .await
+        }
+        NicheResearchMessage::FetchInstagramProfile {
+            user_id,
+            clone_id,
+            run_id,
+            moodboard_id,
+            moodboard_slug,
+            handle,
+            discovered_via,
+            related_depth,
+        } => {
+            fetch_instagram_profile_message(
+                &db,
+                env,
+                &user_id,
+                &clone_id,
+                run_id.as_deref(),
+                &moodboard_id,
+                &moodboard_slug,
+                &handle,
+                &discovered_via,
+                related_depth,
+            )
+            .await
+        }
+        NicheResearchMessage::FetchInstagramPosts {
+            user_id,
+            clone_id,
+            run_id,
+            moodboard_id,
+            moodboard_slug,
+            handle,
+            discovered_via,
+            next_max_id,
+            page,
+        } => {
+            fetch_instagram_posts_message(
+                &db,
+                env,
+                &user_id,
+                &clone_id,
+                run_id.as_deref(),
+                &moodboard_id,
+                &moodboard_slug,
+                &handle,
+                &discovered_via,
+                next_max_id.as_deref(),
+                page,
+            )
+            .await
+        }
+        NicheResearchMessage::ReviewVisualCandidates {
+            user_id,
+            clone_id,
+            run_id,
+            limit,
+        } => {
+            review_visual_candidates_message(
+                &db,
+                env,
+                &user_id,
+                &clone_id,
+                run_id.as_deref(),
+                limit,
+            )
+            .await
+        }
+        NicheResearchMessage::CacheApprovedReference {
+            user_id,
+            clone_id,
+            run_id,
+            candidate_id,
+        } => {
+            cache_approved_reference_message(
+                &db,
+                env,
+                &user_id,
+                &clone_id,
+                run_id.as_deref(),
+                &candidate_id,
+            )
+            .await
+        }
+        NicheResearchMessage::FinalizeReferencePool {
+            user_id,
+            clone_id,
+            run_id,
+            reason,
+        } => {
+            finalize_reference_pool_message(
+                &db,
+                env,
+                &user_id,
+                &clone_id,
+                run_id.as_deref(),
+                &reason,
+            )
+            .await
+        }
+        NicheResearchMessage::RefreshPool {
+            user_id,
+            clone_id,
+            reason,
+        } => {
+            let moodboard_ids = load_selected_moodboard_ids(&db, &user_id, &clone_id).await?;
+            research_moodboard_references(&db, env, &user_id, &clone_id, &moodboard_ids, &reason)
+                .await
+        }
+    }
+}
+
+async fn research_moodboard_references(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    _moodboard_ids: &[String],
+    reason: &str,
 ) -> WorkerResult<()> {
-    set_clone_research_status(db, &user_id, &clone_id, "research_requested", &reason).await
+    let run_id = new_research_run_id();
+    set_clone_research_status_with_run(
+        db,
+        user_id,
+        clone_id,
+        research_status_for_phase(ResearchPhase::Queued),
+        reason,
+        None,
+        Some(&run_id),
+    )
+    .await
+}
+
+async fn fetch_instagram_profile_message(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    run_id: Option<&str>,
+    _moodboard_id: &str,
+    moodboard_slug: &str,
+    handle: &str,
+    _discovered_via: &str,
+    _related_depth: u8,
+) -> WorkerResult<()> {
+    set_clone_research_status_with_run(
+        db,
+        user_id,
+        clone_id,
+        research_status_for_phase(ResearchPhase::Scraping),
+        &format!("fetching instagram profile handle={handle} moodboard={moodboard_slug}"),
+        run_id,
+        run_id,
+    )
+    .await
+}
+
+async fn fetch_instagram_posts_message(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    run_id: Option<&str>,
+    _moodboard_id: &str,
+    moodboard_slug: &str,
+    handle: &str,
+    _discovered_via: &str,
+    _next_max_id: Option<&str>,
+    page: u8,
+) -> WorkerResult<()> {
+    set_clone_research_status_with_run(
+        db,
+        user_id,
+        clone_id,
+        research_status_for_phase(ResearchPhase::Scraping),
+        &format!("fetching instagram posts handle={handle} moodboard={moodboard_slug} page={page}"),
+        run_id,
+        run_id,
+    )
+    .await
+}
+
+async fn review_visual_candidates_message(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    run_id: Option<&str>,
+    limit: u32,
+) -> WorkerResult<()> {
+    set_clone_research_status_with_run(
+        db,
+        user_id,
+        clone_id,
+        research_status_for_phase(ResearchPhase::Reviewing),
+        &format!("reviewing visual candidates limit={limit}"),
+        run_id,
+        run_id,
+    )
+    .await
+}
+
+async fn cache_approved_reference_message(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    run_id: Option<&str>,
+    candidate_id: &str,
+) -> WorkerResult<()> {
+    set_clone_research_status_with_run(
+        db,
+        user_id,
+        clone_id,
+        research_status_for_phase(ResearchPhase::Reviewing),
+        &format!("caching approved visual reference candidate={candidate_id}"),
+        run_id,
+        run_id,
+    )
+    .await
+}
+
+async fn finalize_reference_pool_message(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    run_id: Option<&str>,
+    reason: &str,
+) -> WorkerResult<()> {
+    set_clone_research_status_with_run(
+        db,
+        user_id,
+        clone_id,
+        research_status_for_phase(ResearchPhase::InsufficientRefs),
+        &format!("finalize requested before discovery expansion: {reason}"),
+        run_id,
+        run_id,
+    )
+    .await
+}
+
+async fn record_message_failure(
+    env: &Env,
+    context: &MessageFailureContext,
+    detail: &str,
+) -> WorkerResult<FailureRecordOutcome> {
+    let db = env.d1("DB")?;
+    let code = queue_error_code(detail);
+    let compact_detail = compact_error_detail(detail);
+    web_sys::console::error_1(
+        &format!(
+            "niche research queue failure recorded: message={}, code={}, detail={}",
+            context.message_type, code, compact_detail
+        )
+        .into(),
+    );
+    let result = write_clone_research_status(
+        &db,
+        &context.user_id,
+        &context.clone_id,
+        research_status_for_phase(ResearchPhase::Failed),
+        &format!(
+            "{} failed: code={}, detail={}",
+            context.message_type, code, compact_detail
+        ),
+        ResearchStatusWriteMode::Failure,
+        context.run_id.as_deref(),
+        context.run_id.as_deref(),
+    )
+    .await?;
+
+    Ok(match result {
+        ResearchStatusWriteResult::Written => FailureRecordOutcome::Recorded,
+        ResearchStatusWriteResult::SkippedStale => FailureRecordOutcome::SkippedStale,
+        ResearchStatusWriteResult::SkippedRaced => FailureRecordOutcome::SkippedRaced,
+        ResearchStatusWriteResult::MissingClone => FailureRecordOutcome::MissingClone,
+    })
 }
 
 async fn handle_seed_from_moodboards(
@@ -245,7 +675,7 @@ async fn handle_refresh_pool(
     reason: String,
 ) -> WorkerResult<()> {
     let moodboard_ids = load_selected_moodboard_ids(db, &user_id, &clone_id).await?;
-    handle_research_moodboard_references(db, env, user_id, clone_id, moodboard_ids, reason).await
+    research_moodboard_references(db, env, &user_id, &clone_id, &moodboard_ids, &reason).await
 }
 
 async fn load_clone_for_research(
@@ -1242,6 +1672,238 @@ async fn active_visual_reference_count(db: &D1Database, clone_id: &str) -> Worke
     Ok(row.map(|row| row.count).unwrap_or(0))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResearchPhase {
+    Queued,
+    Scraping,
+    Reviewing,
+    PoolReady,
+    PartialPoolReady,
+    InsufficientRefs,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResearchStatusWriteMode {
+    Normal,
+    Failure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResearchStatusWriteResult {
+    Written,
+    SkippedStale,
+    SkippedRaced,
+    MissingClone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResearchStatusSnapshot<'a> {
+    status: Option<&'a str>,
+    run_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResearchStatusWriteDecision {
+    Write,
+    SkipStale,
+    MissingClone,
+}
+
+fn research_status_for_phase(phase: ResearchPhase) -> &'static str {
+    match phase {
+        ResearchPhase::Queued => "queued",
+        ResearchPhase::Scraping => "scraping",
+        ResearchPhase::Reviewing => "reviewing",
+        ResearchPhase::PoolReady => "pool_ready",
+        ResearchPhase::PartialPoolReady => "partial_pool_ready",
+        ResearchPhase::InsufficientRefs => "insufficient_refs",
+        ResearchPhase::Failed => "research_failed",
+    }
+}
+
+fn research_phase_from_status(status: &str) -> Option<ResearchPhase> {
+    match status.trim() {
+        "queued" => Some(ResearchPhase::Queued),
+        "scraping" => Some(ResearchPhase::Scraping),
+        "reviewing" => Some(ResearchPhase::Reviewing),
+        "pool_ready" => Some(ResearchPhase::PoolReady),
+        "partial_pool_ready" => Some(ResearchPhase::PartialPoolReady),
+        "insufficient_refs" => Some(ResearchPhase::InsufficientRefs),
+        "research_failed" => Some(ResearchPhase::Failed),
+        _ => None,
+    }
+}
+
+fn research_status_transition_allowed(current: Option<&str>, next: &str) -> bool {
+    let Some(next_phase) = research_phase_from_status(next) else {
+        return true;
+    };
+    if next_phase == ResearchPhase::Queued {
+        return true;
+    }
+
+    let Some(current_phase) = current.and_then(research_phase_from_status) else {
+        return true;
+    };
+
+    match current_phase {
+        ResearchPhase::Queued => true,
+        ResearchPhase::Scraping => true,
+        ResearchPhase::Reviewing => matches!(
+            next_phase,
+            ResearchPhase::Reviewing
+                | ResearchPhase::PoolReady
+                | ResearchPhase::PartialPoolReady
+                | ResearchPhase::InsufficientRefs
+                | ResearchPhase::Failed
+        ),
+        ResearchPhase::PoolReady
+        | ResearchPhase::PartialPoolReady
+        | ResearchPhase::InsufficientRefs
+        | ResearchPhase::Failed => false,
+    }
+}
+
+#[cfg(test)]
+fn research_failure_status_transition_allowed(current: Option<&str>, next: &str) -> bool {
+    if research_phase_from_status(next) != Some(ResearchPhase::Failed) {
+        return research_status_transition_allowed(current, next);
+    }
+
+    let Some(current_phase) = current.and_then(research_phase_from_status) else {
+        return true;
+    };
+
+    matches!(
+        current_phase,
+        ResearchPhase::Scraping | ResearchPhase::Reviewing
+    )
+}
+
+fn research_failure_status_transition_allowed_for_run(
+    current: ResearchStatusSnapshot<'_>,
+    next: &str,
+    expected_run_id: Option<&str>,
+) -> bool {
+    if research_phase_from_status(next) != Some(ResearchPhase::Failed) {
+        return research_status_transition_allowed(current.status, next);
+    }
+
+    let Some(current_phase) = current.status.and_then(research_phase_from_status) else {
+        return true;
+    };
+
+    match current_phase {
+        ResearchPhase::Queued => expected_run_id.is_some() && current.run_id == expected_run_id,
+        ResearchPhase::Scraping | ResearchPhase::Reviewing => true,
+        ResearchPhase::PoolReady
+        | ResearchPhase::PartialPoolReady
+        | ResearchPhase::InsufficientRefs
+        | ResearchPhase::Failed => false,
+    }
+}
+
+fn research_status_write_decision(
+    current: Option<ResearchStatusSnapshot<'_>>,
+    next: &str,
+    mode: ResearchStatusWriteMode,
+    expected_run_id: Option<&str>,
+) -> ResearchStatusWriteDecision {
+    let Some(current) = current else {
+        return ResearchStatusWriteDecision::MissingClone;
+    };
+    let starts_new_run = research_phase_from_status(next) == Some(ResearchPhase::Queued);
+    if !starts_new_run {
+        match mode {
+            ResearchStatusWriteMode::Normal => {
+                if let Some(current_run_id) = current.run_id {
+                    if expected_run_id != Some(current_run_id) {
+                        return ResearchStatusWriteDecision::SkipStale;
+                    }
+                } else if expected_run_id.is_some() {
+                    return ResearchStatusWriteDecision::SkipStale;
+                }
+            }
+            ResearchStatusWriteMode::Failure => {
+                if let Some(expected_run_id) = expected_run_id {
+                    if current.run_id != Some(expected_run_id) {
+                        return ResearchStatusWriteDecision::SkipStale;
+                    }
+                } else if current.run_id.is_some() {
+                    return ResearchStatusWriteDecision::SkipStale;
+                }
+            }
+        }
+    }
+
+    let transition_allowed = match mode {
+        ResearchStatusWriteMode::Normal => research_status_transition_allowed(current.status, next),
+        ResearchStatusWriteMode::Failure => {
+            research_failure_status_transition_allowed_for_run(current, next, expected_run_id)
+        }
+    };
+    if transition_allowed {
+        ResearchStatusWriteDecision::Write
+    } else {
+        ResearchStatusWriteDecision::SkipStale
+    }
+}
+
+fn normal_status_write_action(result: ResearchStatusWriteResult) -> QueueMessageAction {
+    match result {
+        ResearchStatusWriteResult::Written
+        | ResearchStatusWriteResult::SkippedStale
+        | ResearchStatusWriteResult::MissingClone => QueueMessageAction::Ack,
+        ResearchStatusWriteResult::SkippedRaced => QueueMessageAction::Retry,
+    }
+}
+
+fn research_status_result_from_changed_rows(changed_rows: usize) -> ResearchStatusWriteResult {
+    if changed_rows > 0 {
+        ResearchStatusWriteResult::Written
+    } else {
+        ResearchStatusWriteResult::SkippedRaced
+    }
+}
+
+fn queue_error_code(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if is_scrapecreators_retryable_error(&normalized) {
+        "scrapecreators_retryable"
+    } else if crate::ai::workers_ai::is_workers_ai_upstream_timeout(&normalized) {
+        "ai_upstream_timeout"
+    } else {
+        "research_message_failed"
+    }
+}
+
+fn is_scrapecreators_retryable_error(normalized: &str) -> bool {
+    normalized.contains("scrapecreators")
+        && (normalized.contains("status 429")
+            || normalized.contains("status 500")
+            || normalized.contains("status 502")
+            || normalized.contains("status 503")
+            || normalized.contains("status 504"))
+}
+
+fn compact_error_detail(error: &str) -> String {
+    const MAX_DETAIL_LENGTH: usize = 240;
+    let compact = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(MAX_DETAIL_LENGTH).collect()
+}
+
+fn new_research_run_id() -> String {
+    format!("niche_run_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn changed_rows(result: &worker::D1Result) -> WorkerResult<usize> {
+    Ok(result
+        .meta()?
+        .and_then(|meta| meta.changes)
+        .unwrap_or_default())
+}
+
 async fn load_config_map(db: &D1Database) -> WorkerResult<HashMap<String, String>> {
     let rows = db::all::<ConfigRow>(
         db,
@@ -1284,6 +1946,37 @@ fn config_f64(config: &HashMap<String, String>, key: &str, default: f64) -> f64 
         .unwrap_or(default)
 }
 
+async fn load_clone_research_state(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+) -> WorkerResult<Option<ResearchStatusRow>> {
+    let row = db::first::<ResearchStatusRow>(
+        db,
+        r#"
+        SELECT
+          CASE
+            WHEN json_valid(provider_config_json)
+              THEN CAST(json_extract(provider_config_json, '$.nicheResearchStatus') AS TEXT)
+            ELSE NULL
+          END AS status,
+          CASE
+            WHEN json_valid(provider_config_json)
+              THEN CAST(json_extract(provider_config_json, '$.nicheResearchRunId') AS TEXT)
+            ELSE NULL
+          END AS run_id
+        FROM clone_profiles
+        WHERE user_id = ?
+          AND id = ?
+          AND deleted_at IS NULL
+        LIMIT 1
+        "#,
+        vec![json!(user_id), json!(clone_id)],
+    )
+    .await?;
+    Ok(row)
+}
+
 async fn set_clone_research_status(
     db: &D1Database,
     user_id: &str,
@@ -1291,8 +1984,85 @@ async fn set_clone_research_status(
     status: &str,
     detail: &str,
 ) -> WorkerResult<()> {
+    set_clone_research_status_with_run(db, user_id, clone_id, status, detail, None, None).await
+}
+
+async fn set_clone_research_status_with_run(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    status: &str,
+    detail: &str,
+    expected_run_id: Option<&str>,
+    run_id_to_store: Option<&str>,
+) -> WorkerResult<()> {
+    let result = write_clone_research_status(
+        db,
+        user_id,
+        clone_id,
+        status,
+        detail,
+        ResearchStatusWriteMode::Normal,
+        expected_run_id,
+        run_id_to_store,
+    )
+    .await?;
+    match normal_status_write_action(result) {
+        QueueMessageAction::Ack => Ok(()),
+        QueueMessageAction::Retry => {
+            Err(Error::RustError(NICHE_RESEARCH_STATUS_CAS_MISS.to_string()))
+        }
+    }
+}
+
+async fn write_clone_research_status(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    status: &str,
+    detail: &str,
+    mode: ResearchStatusWriteMode,
+    expected_run_id: Option<&str>,
+    run_id_to_store: Option<&str>,
+) -> WorkerResult<ResearchStatusWriteResult> {
+    let current_state = load_clone_research_state(db, user_id, clone_id).await?;
+    let current = current_state.as_ref().map(|state| ResearchStatusSnapshot {
+        status: state.status.as_deref(),
+        run_id: state.run_id.as_deref(),
+    });
+    match research_status_write_decision(current, status, mode, expected_run_id) {
+        ResearchStatusWriteDecision::Write => {}
+        ResearchStatusWriteDecision::MissingClone => {
+            web_sys::console::log_1(
+                &format!("skip niche research status write for missing clone next={status}").into(),
+            );
+            return Ok(ResearchStatusWriteResult::MissingClone);
+        }
+        ResearchStatusWriteDecision::SkipStale => {
+            web_sys::console::log_1(
+                &format!(
+                    "skip stale niche research status transition current={} next={} current_run={} expected_run={}",
+                    current.and_then(|state| state.status).unwrap_or(""),
+                    status,
+                    current.and_then(|state| state.run_id).unwrap_or(""),
+                    expected_run_id.unwrap_or("")
+                )
+                .into(),
+            );
+            return Ok(ResearchStatusWriteResult::SkippedStale);
+        }
+    }
+
+    let current = current.expect("write decision requires current state");
+    let starts_new_run = research_phase_from_status(status) == Some(ResearchPhase::Queued);
+    let next_run_id = if starts_new_run {
+        run_id_to_store
+    } else {
+        run_id_to_store.or(expected_run_id).or(current.run_id)
+    };
+
     let now = now_iso_string();
-    db::exec(
+    let result = db::run(
         db,
         r#"
         UPDATE clone_profiles
@@ -1306,23 +2076,91 @@ async fn set_clone_research_status(
               '$.nicheResearchDetail',
               ?,
               '$.nicheResearchUpdatedAt',
+              ?,
+              '$.nicheResearchRunId',
               ?
             ),
             updated_at = ?
         WHERE user_id = ?
           AND id = ?
           AND deleted_at IS NULL
+          AND (
+            (
+              ? IS NULL
+              AND (
+                CASE
+                  WHEN json_valid(provider_config_json)
+                    THEN CAST(json_extract(provider_config_json, '$.nicheResearchStatus') AS TEXT)
+                  ELSE NULL
+                END
+              ) IS NULL
+            )
+            OR (
+              ? IS NOT NULL
+              AND (
+                CASE
+                  WHEN json_valid(provider_config_json)
+                    THEN CAST(json_extract(provider_config_json, '$.nicheResearchStatus') AS TEXT)
+                  ELSE NULL
+                END
+              ) = ?
+            )
+          )
+          AND (
+            (
+              ? IS NULL
+              AND (
+                CASE
+                  WHEN json_valid(provider_config_json)
+                    THEN CAST(json_extract(provider_config_json, '$.nicheResearchRunId') AS TEXT)
+                  ELSE NULL
+                END
+              ) IS NULL
+            )
+            OR (
+              ? IS NOT NULL
+              AND (
+                CASE
+                  WHEN json_valid(provider_config_json)
+                    THEN CAST(json_extract(provider_config_json, '$.nicheResearchRunId') AS TEXT)
+                  ELSE NULL
+                END
+              ) = ?
+            )
+          )
         "#,
         vec![
             json!(status),
             json!(detail),
             json!(now),
+            json!(next_run_id),
             json!(now),
             json!(user_id),
             json!(clone_id),
+            json!(current.status),
+            json!(current.status),
+            json!(current.status),
+            json!(current.run_id),
+            json!(current.run_id),
+            json!(current.run_id),
         ],
     )
-    .await
+    .await?;
+
+    let result = research_status_result_from_changed_rows(changed_rows(&result)?);
+    if result == ResearchStatusWriteResult::SkippedRaced {
+        web_sys::console::log_1(
+            &format!(
+                "skip raced niche research status transition current={} next={} current_run={} expected_run={}",
+                current.status.unwrap_or(""),
+                status,
+                current.run_id.unwrap_or(""),
+                expected_run_id.unwrap_or("")
+            )
+            .into(),
+        );
+    }
+    Ok(result)
 }
 
 fn active_niche_from_moodboards(moodboards: &[MoodboardRow]) -> String {
@@ -1683,6 +2521,12 @@ struct CountRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct ResearchStatusRow {
+    status: Option<String>,
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct IdRow {
     id: String,
 }
@@ -1815,6 +2659,420 @@ mod tests {
                 && moodboard_ids == vec!["moodboard_1".to_string(), "moodboard_2".to_string()]
                 && reason == "onboarding_selection"
         ));
+    }
+
+    #[test]
+    fn optional_run_token_is_omitted_from_legacy_chunk_message_contract() {
+        let message = NicheResearchMessage::FetchInstagramProfile {
+            user_id: "user_1".to_string(),
+            clone_id: "clone_1".to_string(),
+            run_id: None,
+            moodboard_id: "moodboard_1".to_string(),
+            moodboard_slug: "flash-editorial".to_string(),
+            handle: "creator".to_string(),
+            discovered_via: "configured_handle".to_string(),
+            related_depth: 0,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            json!({
+                "type": "fetch_instagram_profile",
+                "userId": "user_1",
+                "cloneId": "clone_1",
+                "moodboardId": "moodboard_1",
+                "moodboardSlug": "flash-editorial",
+                "handle": "creator",
+                "discoveredVia": "configured_handle",
+                "relatedDepth": 0
+            })
+        );
+
+        let parsed: NicheResearchMessage = serde_json::from_value(json!({
+            "type": "fetch_instagram_profile",
+            "userId": "user_1",
+            "cloneId": "clone_1",
+            "moodboardId": "moodboard_1",
+            "moodboardSlug": "flash-editorial",
+            "handle": "creator",
+            "discoveredVia": "configured_handle",
+            "relatedDepth": 0
+        }))
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            NicheResearchMessage::FetchInstagramProfile { run_id, .. } if run_id.is_none()
+        ));
+    }
+
+    #[test]
+    fn research_statuses_match_product_contract() {
+        assert_eq!(research_status_for_phase(ResearchPhase::Queued), "queued");
+        assert_eq!(
+            research_status_for_phase(ResearchPhase::Scraping),
+            "scraping"
+        );
+        assert_eq!(
+            research_status_for_phase(ResearchPhase::Reviewing),
+            "reviewing"
+        );
+        assert_eq!(
+            research_status_for_phase(ResearchPhase::PoolReady),
+            "pool_ready"
+        );
+        assert_eq!(
+            research_status_for_phase(ResearchPhase::PartialPoolReady),
+            "partial_pool_ready"
+        );
+        assert_eq!(
+            research_status_for_phase(ResearchPhase::InsufficientRefs),
+            "insufficient_refs"
+        );
+        assert_eq!(
+            research_status_for_phase(ResearchPhase::Failed),
+            "research_failed"
+        );
+    }
+
+    #[test]
+    fn stale_chunk_statuses_do_not_overwrite_ready_statuses() {
+        for current in ["pool_ready", "partial_pool_ready"] {
+            assert!(!research_status_transition_allowed(
+                Some(current),
+                "scraping"
+            ));
+            assert!(!research_status_transition_allowed(
+                Some(current),
+                "reviewing"
+            ));
+        }
+    }
+
+    #[test]
+    fn stale_chunk_statuses_do_not_overwrite_terminal_statuses() {
+        for current in ["insufficient_refs", "research_failed"] {
+            assert!(!research_status_transition_allowed(
+                Some(current),
+                "scraping"
+            ));
+            assert!(!research_status_transition_allowed(
+                Some(current),
+                "reviewing"
+            ));
+        }
+    }
+
+    #[test]
+    fn scraping_status_does_not_overwrite_reviewing_status() {
+        assert!(!research_status_transition_allowed(
+            Some("reviewing"),
+            "scraping"
+        ));
+    }
+
+    #[test]
+    fn run_token_mismatch_skips_chunk_status_and_failure_recording() {
+        let current = Some(ResearchStatusSnapshot {
+            status: Some("queued"),
+            run_id: Some("run_new"),
+        });
+
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "scraping",
+                ResearchStatusWriteMode::Normal,
+                Some("run_old")
+            ),
+            ResearchStatusWriteDecision::SkipStale
+        );
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "research_failed",
+                ResearchStatusWriteMode::Failure,
+                Some("run_old")
+            ),
+            ResearchStatusWriteDecision::SkipStale
+        );
+    }
+
+    #[test]
+    fn tokenless_chunk_status_skips_tokened_active_run() {
+        let current = Some(ResearchStatusSnapshot {
+            status: Some("queued"),
+            run_id: Some("run_active"),
+        });
+
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "scraping",
+                ResearchStatusWriteMode::Normal,
+                None
+            ),
+            ResearchStatusWriteDecision::SkipStale
+        );
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "reviewing",
+                ResearchStatusWriteMode::Normal,
+                None
+            ),
+            ResearchStatusWriteDecision::SkipStale
+        );
+    }
+
+    #[test]
+    fn tokenless_queued_status_can_start_new_tokened_run() {
+        let current = Some(ResearchStatusSnapshot {
+            status: Some("pool_ready"),
+            run_id: Some("run_previous"),
+        });
+
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "queued",
+                ResearchStatusWriteMode::Normal,
+                None
+            ),
+            ResearchStatusWriteDecision::Write
+        );
+    }
+
+    #[test]
+    fn current_run_token_match_permits_queued_to_scraping() {
+        let current = Some(ResearchStatusSnapshot {
+            status: Some("queued"),
+            run_id: Some("run_1"),
+        });
+
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "scraping",
+                ResearchStatusWriteMode::Normal,
+                Some("run_1")
+            ),
+            ResearchStatusWriteDecision::Write
+        );
+    }
+
+    #[test]
+    fn same_run_token_queued_failure_is_recordable() {
+        let current = Some(ResearchStatusSnapshot {
+            status: Some("queued"),
+            run_id: Some("run_1"),
+        });
+
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "research_failed",
+                ResearchStatusWriteMode::Failure,
+                Some("run_1")
+            ),
+            ResearchStatusWriteDecision::Write
+        );
+    }
+
+    #[test]
+    fn tokenless_or_mismatched_queued_failure_stays_stale() {
+        let current = Some(ResearchStatusSnapshot {
+            status: Some("queued"),
+            run_id: Some("run_active"),
+        });
+
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "research_failed",
+                ResearchStatusWriteMode::Failure,
+                None
+            ),
+            ResearchStatusWriteDecision::SkipStale
+        );
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "research_failed",
+                ResearchStatusWriteMode::Failure,
+                Some("run_old")
+            ),
+            ResearchStatusWriteDecision::SkipStale
+        );
+    }
+
+    #[test]
+    fn ready_statuses_reject_same_run_failure_recording() {
+        for current_status in ["pool_ready", "partial_pool_ready"] {
+            let current = Some(ResearchStatusSnapshot {
+                status: Some(current_status),
+                run_id: Some("run_1"),
+            });
+
+            assert_eq!(
+                research_status_write_decision(
+                    current,
+                    "research_failed",
+                    ResearchStatusWriteMode::Failure,
+                    Some("run_1")
+                ),
+                ResearchStatusWriteDecision::SkipStale
+            );
+        }
+    }
+
+    #[test]
+    fn missing_expected_run_token_cannot_record_failure_over_active_run() {
+        let current = Some(ResearchStatusSnapshot {
+            status: Some("scraping"),
+            run_id: Some("run_active"),
+        });
+
+        assert_eq!(
+            research_status_write_decision(
+                current,
+                "research_failed",
+                ResearchStatusWriteMode::Failure,
+                None
+            ),
+            ResearchStatusWriteDecision::SkipStale
+        );
+    }
+
+    #[test]
+    fn zero_row_status_write_is_classified_as_raced_not_failed() {
+        assert_eq!(
+            research_status_result_from_changed_rows(0),
+            ResearchStatusWriteResult::SkippedRaced
+        );
+        assert_eq!(
+            research_status_result_from_changed_rows(1),
+            ResearchStatusWriteResult::Written
+        );
+    }
+
+    #[test]
+    fn normal_status_write_action_retries_raced_outcome() {
+        assert_eq!(
+            normal_status_write_action(ResearchStatusWriteResult::Written),
+            QueueMessageAction::Ack
+        );
+        assert_eq!(
+            normal_status_write_action(ResearchStatusWriteResult::SkippedStale),
+            QueueMessageAction::Ack
+        );
+        assert_eq!(
+            normal_status_write_action(ResearchStatusWriteResult::MissingClone),
+            QueueMessageAction::Ack
+        );
+        assert_eq!(
+            normal_status_write_action(ResearchStatusWriteResult::SkippedRaced),
+            QueueMessageAction::Retry
+        );
+    }
+
+    #[test]
+    fn failure_record_action_retries_raced_and_error_outcomes() {
+        assert_eq!(
+            failure_record_action(Some(FailureRecordOutcome::Recorded)),
+            QueueMessageAction::Ack
+        );
+        assert_eq!(
+            failure_record_action(Some(FailureRecordOutcome::SkippedStale)),
+            QueueMessageAction::Ack
+        );
+        assert_eq!(
+            failure_record_action(Some(FailureRecordOutcome::MissingClone)),
+            QueueMessageAction::Ack
+        );
+        assert_eq!(
+            failure_record_action(Some(FailureRecordOutcome::SkippedRaced)),
+            QueueMessageAction::Retry
+        );
+        assert_eq!(failure_record_action(None), QueueMessageAction::Retry);
+    }
+
+    #[test]
+    fn missing_clone_status_write_is_classified_as_ackable_skip() {
+        assert_eq!(
+            research_status_write_decision(
+                None,
+                "scraping",
+                ResearchStatusWriteMode::Normal,
+                Some("run_1")
+            ),
+            ResearchStatusWriteDecision::MissingClone
+        );
+    }
+
+    #[test]
+    fn stale_failure_status_does_not_overwrite_ready_statuses() {
+        for current in ["pool_ready", "partial_pool_ready"] {
+            assert!(!research_failure_status_transition_allowed(
+                Some(current),
+                "research_failed"
+            ));
+        }
+    }
+
+    #[test]
+    fn stale_failure_status_does_not_overwrite_new_queued_run() {
+        assert!(!research_failure_status_transition_allowed(
+            Some("queued"),
+            "research_failed"
+        ));
+    }
+
+    #[test]
+    fn active_chunk_statuses_can_record_failure_status() {
+        for current in ["scraping", "reviewing"] {
+            assert!(research_failure_status_transition_allowed(
+                Some(current),
+                "research_failed"
+            ));
+        }
+    }
+
+    #[test]
+    fn queued_status_can_start_new_run_from_terminal_statuses() {
+        for current in [
+            "pool_ready",
+            "partial_pool_ready",
+            "insufficient_refs",
+            "research_failed",
+        ] {
+            assert!(research_status_transition_allowed(Some(current), "queued"));
+        }
+    }
+
+    #[test]
+    fn retryable_error_codes_are_compact_and_stable() {
+        for status in [429, 500, 502, 503, 504] {
+            assert_eq!(
+                queue_error_code(&format!("scrapecreators endpoint returned status {status}")),
+                "scrapecreators_retryable"
+            );
+        }
+        assert_eq!(
+            queue_error_code("AiError: upstream request failed with status 504"),
+            "ai_upstream_timeout"
+        );
+        assert_eq!(
+            queue_error_code("workers ai gateway timeout"),
+            "ai_upstream_timeout"
+        );
+        assert_eq!(
+            queue_error_code("failed to decode workers ai result"),
+            "research_message_failed"
+        );
+        assert_eq!(
+            queue_error_code("failed item id 504abc"),
+            "research_message_failed"
+        );
     }
 
     #[test]
