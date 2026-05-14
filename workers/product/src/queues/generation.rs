@@ -34,6 +34,16 @@ struct VisualReferenceRow {
     storage_key: Option<String>,
     content_type: Option<String>,
     materialized_reference_url: Option<String>,
+    image_width: Option<u32>,
+    image_height: Option<u32>,
+    moodboard_id: Option<String>,
+    moodboard_slug: Option<String>,
+    pose: Option<String>,
+    scene: Option<String>,
+    lighting: Option<String>,
+    framing: Option<String>,
+    camera_feel: Option<String>,
+    styling_direction: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,22 +165,19 @@ async fn generate_blitz_batch(
         else {
             continue;
         };
-        let materialized_reference_url = reference
-            .materialized_reference_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
         let storage_key = reference
             .storage_key
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if materialized_reference_url.is_none() && storage_key.is_none() {
+        if storage_key.is_none() {
             continue;
         }
 
         let job_id = deterministic_generation_job_id(batch_id, visual_reference_id);
         let usage_date = current_utc_date();
+        let aspect_ratio =
+            aspect_ratio_from_reference_dimensions(reference.image_width, reference.image_height);
         let request_json = json!({
             "jobId": job_id,
             "batchId": batch_id,
@@ -178,12 +185,15 @@ async fn generate_blitz_batch(
             "userId": user_id,
             "idempotencyKey": format!("{idempotency_key}:{visual_reference_id}"),
             "providerSoulId": provider_soul_id,
-            "inputImageUrl": materialized_reference_url,
+            "inputImageUrl": null,
             "inputMediaAssetId": reference.media_asset_id.clone(),
             "inputStorageKey": reference.storage_key.clone(),
             "inputContentType": reference.content_type.clone(),
             "visualReferenceId": visual_reference_id,
             "usageDate": usage_date,
+            "aspectRatio": aspect_ratio,
+            "quality": "4k",
+            "generationGuidance": generation_guidance_json(&reference),
             "prompt": "",
         });
         if !insert_generation_job(
@@ -234,7 +244,6 @@ async fn generate_blitz_batch(
             idempotency_key,
             visual_reference_id,
             provider_soul_id,
-            materialized_reference_url,
         )
         .await
         {
@@ -271,7 +280,6 @@ async fn submit_generation_job(
     idempotency_key: &str,
     visual_reference_id: &str,
     provider_soul_id: &str,
-    materialized_reference_url: Option<&str>,
 ) -> WorkerResult<()> {
     let Some(job) = load_generation_job_by_id(db, job_id).await? else {
         return Ok(());
@@ -315,7 +323,7 @@ async fn submit_generation_job(
             "userId": user_id,
             "idempotencyKey": format!("{idempotency_key}:{visual_reference_id}"),
             "providerSoulId": provider_soul_id,
-            "inputImageUrl": materialized_reference_url,
+            "inputImageUrl": null,
             "visualReferenceId": visual_reference_id,
             "prompt": "",
         })
@@ -1170,45 +1178,80 @@ async fn load_visual_reference(
     db::first::<VisualReferenceRow>(
         db,
         &sql,
-        vec![
-            json!(user_id),
-            json!(visual_reference_id),
-            json!(clone_id),
-            json!(user_id),
-        ],
+        vec![json!(visual_reference_id), json!(clone_id), json!(user_id)],
     )
     .await
 }
 
-fn visual_reference_guidance_query() -> String {
-    format!(
-        r#"
+pub fn visual_reference_guidance_query() -> String {
+    r#"
         SELECT
           ma.id AS media_asset_id,
           ma.storage_key AS storage_key,
           ma.content_type AS content_type,
-          {} AS materialized_reference_url
+          NULL AS materialized_reference_url,
+          vr.image_width,
+          vr.image_height,
+          vr.moodboard_id,
+          vr.moodboard_slug,
+          vr.pose,
+          vr.scene,
+          vr.lighting,
+          vr.framing,
+          vr.camera_feel,
+          vr.styling_direction
         FROM visual_references vr
-        LEFT JOIN media_assets ma
+        INNER JOIN media_assets ma
           ON ma.id = vr.media_asset_id
          AND ma.deleted_at IS NULL
-        LEFT JOIN visual_reference_candidates vrc
-          ON vrc.id = vr.candidate_id
-         AND vrc.clone_id = vr.clone_id
-         AND (vrc.user_id IS NULL OR vrc.user_id = ?)
-        LEFT JOIN discovery_items di
-          ON di.id = vrc.discovery_item_id
+         AND ma.storage_key IS NOT NULL
         WHERE vr.id = ?
           AND vr.clone_id = ?
           AND (vr.user_id IS NULL OR vr.user_id = ?)
           AND vr.status = 'active'
-        "#,
-        visual_reference_guidance_url_expr()
-    )
+        "#
+    .to_string()
 }
 
-fn visual_reference_guidance_url_expr() -> &'static str {
-    "COALESCE(ma.remote_url, vrc.image_url, di.image_url, di.thumbnail_url, vr.source_url)"
+pub fn aspect_ratio_from_reference_dimensions(
+    width: Option<u32>,
+    height: Option<u32>,
+) -> &'static str {
+    let (Some(width), Some(height)) = (width, height) else {
+        return "4:5";
+    };
+    if width == 0 || height == 0 {
+        return "4:5";
+    }
+    let ratio = width as f64 / height as f64;
+    if (ratio - 1.0).abs() < 0.08 {
+        "1:1"
+    } else if ratio < 0.9 {
+        "4:5"
+    } else if ratio > 1.1 {
+        "5:4"
+    } else {
+        "1:1"
+    }
+}
+
+fn generation_guidance_json(reference: &VisualReferenceRow) -> Value {
+    json!({
+        "moodboardId": reference.moodboard_id,
+        "moodboardSlug": reference.moodboard_slug,
+        "visualCues": {
+            "pose": reference.pose,
+            "scene": reference.scene,
+            "lighting": reference.lighting,
+            "framing": reference.framing,
+            "cameraFeel": reference.camera_feel,
+            "stylingDirection": reference.styling_direction
+        },
+        "copyingRules": [
+            "Do not copy identity, face, likeness, exact clothing, exact background, unique marks, handles, captions, or source text.",
+            "Use only pose, framing, lighting, scene type, camera feel, styling energy, and art direction."
+        ]
+    })
 }
 
 async fn batch_has_generation_jobs(db: &D1Database, batch_id: &str) -> WorkerResult<bool> {
@@ -1235,6 +1278,10 @@ async fn insert_generation_job(
     request_json: &Value,
 ) -> WorkerResult<bool> {
     let now = now_iso_string();
+    let input_media_asset_id = json_string_at(request_json, "/inputMediaAssetId");
+    let aspect_ratio =
+        json_string_at(request_json, "/aspectRatio").unwrap_or_else(|| "4:5".to_string());
+    let quality = json_string_at(request_json, "/quality").unwrap_or_else(|| "4k".to_string());
     let result = db::run(
         db,
         r#"
@@ -1244,12 +1291,15 @@ async fn insert_generation_job(
           clone_id,
           blitz_batch_id,
           input_visual_reference_id,
+          input_media_asset_id,
           status,
+          aspect_ratio,
+          quality,
           request_json,
           queued_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
         "#,
         vec![
             json!(job_id),
@@ -1257,6 +1307,9 @@ async fn insert_generation_job(
             json!(clone_id),
             json!(batch_id),
             json!(visual_reference_id),
+            json!(input_media_asset_id),
+            json!(aspect_ratio),
+            json!(quality),
             json!(request_json.to_string()),
             json!(now),
             json!(now),
@@ -2451,17 +2504,17 @@ fn completion_updated_at_is_stale(updated_at: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_claim_failure_action, content_length_exceeds_generated_image_limit,
-        deterministic_generation_job_id, failed_generation_refund_action, final_image_url,
-        generated_image_size_too_large, generation_media_id, generation_output_id,
-        generation_poll_arguments, poll_attempt_response_json, poll_failure_action,
-        provider_asset_id, provider_ids_are_empty, provider_job_ids, provider_status,
-        request_has_usage_reservation_marker, response_has_usage_refund_marker,
-        retry_submission_claim_sql, retryable_completion_attempt,
+        aspect_ratio_from_reference_dimensions, completion_claim_failure_action,
+        content_length_exceeds_generated_image_limit, deterministic_generation_job_id,
+        failed_generation_refund_action, final_image_url, generated_image_size_too_large,
+        generation_media_id, generation_output_id, generation_poll_arguments,
+        poll_attempt_response_json, poll_failure_action, provider_asset_id, provider_ids_are_empty,
+        provider_job_ids, provider_status, request_has_usage_reservation_marker,
+        response_has_usage_refund_marker, retry_submission_claim_sql, retryable_completion_attempt,
         submission_arguments_from_request, terminal_failure_allowed_for_job_state,
         usage_date_from_request_json, visual_reference_guidance_query,
-        visual_reference_guidance_url_expr, CompletionClaimFailureAction,
-        FailedGenerationRefundAction, PollFailureAction, MAX_GENERATED_IMAGE_BYTES,
+        CompletionClaimFailureAction, FailedGenerationRefundAction, PollFailureAction,
+        MAX_GENERATED_IMAGE_BYTES,
     };
     use serde_json::json;
 
@@ -2566,18 +2619,35 @@ mod tests {
     }
 
     #[test]
-    fn visual_reference_guidance_query_prefers_real_image_urls_before_source_posts() {
-        assert_eq!(
-            visual_reference_guidance_url_expr(),
-            "COALESCE(ma.remote_url, vrc.image_url, di.image_url, di.thumbnail_url, vr.source_url)"
-        );
-
+    fn visual_reference_guidance_query_requires_cached_r2_media() {
         let query = visual_reference_guidance_query();
 
-        assert!(query.contains("LEFT JOIN visual_reference_candidates vrc"));
-        assert!(query.contains("vrc.id = vr.candidate_id"));
-        assert!(query.contains("LEFT JOIN discovery_items di"));
-        assert!(query.contains("di.id = vrc.discovery_item_id"));
+        assert!(query.contains("ma.storage_key AS storage_key"));
+        assert!(query.contains("AND ma.storage_key IS NOT NULL"));
+        assert!(!query.contains(&format!("{}{}", "source_", "caption")));
+        assert!(!query.contains("vrc.image_url"));
+        assert!(!query.contains("di.thumbnail_url"));
+        assert!(!query.contains("vr.source_url"));
+    }
+
+    #[test]
+    fn aspect_ratio_comes_from_reference_dimensions() {
+        assert_eq!(
+            aspect_ratio_from_reference_dimensions(Some(1080), Some(1350)),
+            "4:5"
+        );
+        assert_eq!(
+            aspect_ratio_from_reference_dimensions(Some(1350), Some(1080)),
+            "5:4"
+        );
+        assert_eq!(
+            aspect_ratio_from_reference_dimensions(Some(1024), Some(1024)),
+            "1:1"
+        );
+        assert_eq!(
+            aspect_ratio_from_reference_dimensions(None, Some(1350)),
+            "4:5"
+        );
     }
 
     #[test]
