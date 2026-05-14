@@ -2507,14 +2507,15 @@ mod tests {
         aspect_ratio_from_reference_dimensions, completion_claim_failure_action,
         content_length_exceeds_generated_image_limit, deterministic_generation_job_id,
         failed_generation_refund_action, final_image_url, generated_image_size_too_large,
-        generation_media_id, generation_output_id, generation_poll_arguments,
-        poll_attempt_response_json, poll_failure_action, provider_asset_id, provider_ids_are_empty,
-        provider_job_ids, provider_status, request_has_usage_reservation_marker,
-        response_has_usage_refund_marker, retry_submission_claim_sql, retryable_completion_attempt,
+        generation_guidance_json, generation_media_id, generation_output_id,
+        generation_poll_arguments, poll_attempt_response_json, poll_failure_action,
+        provider_asset_id, provider_ids_are_empty, provider_job_ids, provider_status,
+        request_has_usage_reservation_marker, response_has_usage_refund_marker,
+        retry_submission_claim_sql, retryable_completion_attempt,
         submission_arguments_from_request, terminal_failure_allowed_for_job_state,
         usage_date_from_request_json, visual_reference_guidance_query,
         CompletionClaimFailureAction, FailedGenerationRefundAction, PollFailureAction,
-        MAX_GENERATED_IMAGE_BYTES,
+        VisualReferenceRow, MAX_GENERATED_IMAGE_BYTES,
     };
     use serde_json::json;
 
@@ -2625,9 +2626,50 @@ mod tests {
         assert!(query.contains("ma.storage_key AS storage_key"));
         assert!(query.contains("AND ma.storage_key IS NOT NULL"));
         assert!(!query.contains(&format!("{}{}", "source_", "caption")));
+        assert!(!query.contains(&format!("{}{}", "source_", "handle")));
         assert!(!query.contains("vrc.image_url"));
         assert!(!query.contains("di.thumbnail_url"));
         assert!(!query.contains("vr.source_url"));
+    }
+
+    #[test]
+    fn generation_guidance_uses_visual_cues_without_source_identity_or_text() {
+        let reference = VisualReferenceRow {
+            media_asset_id: Some("media_1".to_string()),
+            storage_key: Some("visual-references/ref.jpg".to_string()),
+            content_type: Some("image/jpeg".to_string()),
+            materialized_reference_url: None,
+            image_width: Some(1080),
+            image_height: Some(1350),
+            moodboard_id: Some("mood_1".to_string()),
+            moodboard_slug: Some("street-style".to_string()),
+            pose: Some("standing three-quarter pose".to_string()),
+            scene: Some("city sidewalk".to_string()),
+            lighting: Some("soft daylight".to_string()),
+            framing: Some("full body".to_string()),
+            camera_feel: Some("phone camera".to_string()),
+            styling_direction: Some("clean layered outfit energy".to_string()),
+        };
+
+        assert_eq!(
+            generation_guidance_json(&reference),
+            json!({
+                "moodboardId": "mood_1",
+                "moodboardSlug": "street-style",
+                "visualCues": {
+                    "pose": "standing three-quarter pose",
+                    "scene": "city sidewalk",
+                    "lighting": "soft daylight",
+                    "framing": "full body",
+                    "cameraFeel": "phone camera",
+                    "stylingDirection": "clean layered outfit energy"
+                },
+                "copyingRules": [
+                    "Do not copy identity, face, likeness, exact clothing, exact background, unique marks, handles, captions, or source text.",
+                    "Use only pose, framing, lighting, scene type, camera feel, styling energy, and art direction."
+                ]
+            })
+        );
     }
 
     #[test]
@@ -2812,7 +2854,17 @@ mod tests {
             "visualReferenceId": "vref_1",
             "usageDate": "2026-05-11",
             "prompt": "",
-            "uploadedReferenceValue": "7ea59a7b-244e-41b1-b683-a60e1ff2df70"
+            "uploadedReferenceValue": "7ea59a7b-244e-41b1-b683-a60e1ff2df70",
+            "sourceCaption": "audit caption must not forward",
+            "sourceHandle": "audit_creator",
+            "source_caption": "snake audit caption must not forward",
+            "source_handle": "snake_audit_creator",
+            "generationGuidance": {
+                "visualCues": {
+                    "pose": "standing"
+                },
+                "copyingRules": ["do not copy captions or handles"]
+            }
         });
 
         assert_eq!(
