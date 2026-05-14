@@ -27,12 +27,45 @@ use worker::{Ai, D1Database, Delay, Env, Error, MessageBatch, MessageExt, Result
     rename_all_fields = "camelCase"
 )]
 pub enum NicheResearchMessage {
-    SeedFromMoodboards {
+    ResearchMoodboardReferences {
         user_id: String,
         clone_id: String,
         moodboard_ids: Vec<String>,
-        moderation_level: u8,
-        platforms: Vec<String>,
+        reason: String,
+    },
+    FetchInstagramProfile {
+        user_id: String,
+        clone_id: String,
+        moodboard_id: String,
+        moodboard_slug: String,
+        handle: String,
+        discovered_via: String,
+        related_depth: u8,
+    },
+    FetchInstagramPosts {
+        user_id: String,
+        clone_id: String,
+        moodboard_id: String,
+        moodboard_slug: String,
+        handle: String,
+        discovered_via: String,
+        next_max_id: Option<String>,
+        page: u8,
+    },
+    ReviewVisualCandidates {
+        user_id: String,
+        clone_id: String,
+        limit: u32,
+    },
+    CacheApprovedReference {
+        user_id: String,
+        clone_id: String,
+        candidate_id: String,
+    },
+    FinalizeReferencePool {
+        user_id: String,
+        clone_id: String,
+        reason: String,
     },
     RefreshPool {
         user_id: String,
@@ -58,23 +91,30 @@ pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<
 
         let db = env.d1("DB")?;
         match body {
-            NicheResearchMessage::SeedFromMoodboards {
+            NicheResearchMessage::ResearchMoodboardReferences {
                 user_id,
                 clone_id,
                 moodboard_ids,
-                moderation_level,
-                platforms,
+                reason,
             } => {
-                handle_seed_from_moodboards(
+                handle_research_moodboard_references(
                     &db,
                     &env,
                     user_id,
                     clone_id,
                     moodboard_ids,
-                    moderation_level,
-                    platforms,
+                    reason,
                 )
                 .await?;
+            }
+            NicheResearchMessage::FetchInstagramProfile { .. }
+            | NicheResearchMessage::FetchInstagramPosts { .. }
+            | NicheResearchMessage::ReviewVisualCandidates { .. }
+            | NicheResearchMessage::CacheApprovedReference { .. }
+            | NicheResearchMessage::FinalizeReferencePool { .. } => {
+                web_sys::console::log_1(
+                    &"ack niche research message for pending visual reference handler".into(),
+                );
             }
             NicheResearchMessage::RefreshPool {
                 user_id,
@@ -89,6 +129,17 @@ pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<
     }
 
     Ok(())
+}
+
+async fn handle_research_moodboard_references(
+    db: &D1Database,
+    _env: &Env,
+    user_id: String,
+    clone_id: String,
+    _moodboard_ids: Vec<String>,
+    reason: String,
+) -> WorkerResult<()> {
+    set_clone_research_status(db, &user_id, &clone_id, "research_requested", &reason).await
 }
 
 async fn handle_seed_from_moodboards(
@@ -193,18 +244,8 @@ async fn handle_refresh_pool(
     clone_id: String,
     reason: String,
 ) -> WorkerResult<()> {
-    set_clone_research_status(db, &user_id, &clone_id, "refresh_requested", &reason).await?;
     let moodboard_ids = load_selected_moodboard_ids(db, &user_id, &clone_id).await?;
-    handle_seed_from_moodboards(
-        db,
-        env,
-        user_id,
-        clone_id,
-        moodboard_ids,
-        4,
-        vec!["tiktok".to_string(), "instagram".to_string()],
-    )
-    .await
+    handle_research_moodboard_references(db, env, user_id, clone_id, moodboard_ids, reason).await
 }
 
 async fn load_clone_for_research(
@@ -1735,35 +1776,45 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn niche_research_messages_serialize_platform_allowlist() {
-        let seed = NicheResearchMessage::SeedFromMoodboards {
+    fn visual_reference_research_messages_serialize_as_queue_contract() {
+        let message = NicheResearchMessage::ResearchMoodboardReferences {
             user_id: "user_1".to_string(),
             clone_id: "clone_1".to_string(),
-            moodboard_ids: vec!["moodboard_1".to_string()],
-            moderation_level: 4,
-            platforms: vec!["tiktok".to_string(), "instagram".to_string()],
+            moodboard_ids: vec!["moodboard_1".to_string(), "moodboard_2".to_string()],
+            reason: "onboarding_selection".to_string(),
         };
+
         assert_eq!(
-            serde_json::to_value(seed).unwrap(),
+            serde_json::to_value(&message).unwrap(),
             json!({
-                "type": "seed_from_moodboards",
+                "type": "research_moodboard_references",
                 "userId": "user_1",
                 "cloneId": "clone_1",
-                "moodboardIds": ["moodboard_1"],
-                "moderationLevel": 4,
-                "platforms": ["tiktok", "instagram"]
+                "moodboardIds": ["moodboard_1", "moodboard_2"],
+                "reason": "onboarding_selection"
             })
         );
 
-        let refresh = NicheResearchMessage::RefreshPool {
-            user_id: "user_1".to_string(),
-            clone_id: "clone_1".to_string(),
-            reason: "pool_depleted".to_string(),
-        };
-        assert_eq!(
-            serde_json::to_value(refresh).unwrap()["type"],
-            json!("refresh_pool")
-        );
+        let parsed: NicheResearchMessage = serde_json::from_value(json!({
+            "type": "research_moodboard_references",
+            "userId": "user_1",
+            "cloneId": "clone_1",
+            "moodboardIds": ["moodboard_1", "moodboard_2"],
+            "reason": "onboarding_selection"
+        }))
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            NicheResearchMessage::ResearchMoodboardReferences {
+                user_id,
+                clone_id,
+                moodboard_ids,
+                reason
+            } if user_id == "user_1"
+                && clone_id == "clone_1"
+                && moodboard_ids == vec!["moodboard_1".to_string(), "moodboard_2".to_string()]
+                && reason == "onboarding_selection"
+        ));
     }
 
     #[test]

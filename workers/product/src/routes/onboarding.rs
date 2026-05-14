@@ -1,4 +1,3 @@
-use crate::ai::model_router::clamp_moderation_level;
 use crate::auth_client::verify_session;
 use crate::db;
 use crate::http::error::ApiError;
@@ -252,11 +251,8 @@ pub async fn save_moodboards(mut req: Request, ctx: RouteContext<()>) -> WorkerR
 
     let requested_moodboard_ids = unique_selected_moodboard_ids(input.moodboard_ids);
     if !valid_selected_moodboard_count(requested_moodboard_ids.len()) {
-        return ApiError::bad_request(
-            "invalid_moodboard_selection",
-            "Choose exactly 5 moodboards.",
-        )
-        .to_response();
+        return ApiError::bad_request("invalid_moodboard_selection", "Choose 1 to 10 moodboards.")
+            .to_response();
     }
 
     let selected_moodboard_ids = load_matching_moodboard_ids(
@@ -281,15 +277,13 @@ pub async fn save_moodboards(mut req: Request, ctx: RouteContext<()>) -> WorkerR
     )
     .await?;
 
-    let moderation_level = clamp_moderation_level(input.moderation_level.unwrap_or(4));
     ctx.env
         .queue("NICHE_RESEARCH_QUEUE")?
-        .send(NicheResearchMessage::SeedFromMoodboards {
+        .send(NicheResearchMessage::ResearchMoodboardReferences {
             user_id: auth.user_id.clone(),
             clone_id: active_clone.id.clone(),
             moodboard_ids: selected_moodboard_ids,
-            moderation_level,
-            platforms: vec!["tiktok".to_string(), "instagram".to_string()],
+            reason: "onboarding_selection".to_string(),
         })
         .await?;
 
@@ -522,7 +516,7 @@ fn all_requested_moodboards_matched(matched_ids: &[String], requested_ids: &[Str
 }
 
 fn valid_selected_moodboard_count(count: usize) -> bool {
-    count == 5
+    (1..=10).contains(&count)
 }
 
 async fn count_inspiration_pool(db: &worker::D1Database, user_id: &str) -> WorkerResult<u32> {
@@ -584,22 +578,13 @@ mod tests {
     fn save_moodboards_request_accepts_moodboard_ids_contract() {
         let request = serde_json::from_value::<SaveMoodboardsRequest>(json!({
             "cloneId": "clone_1",
-            "moodboardIds": ["moodboard_1", "moodboard_2", "moodboard_3", "moodboard_4", "moodboard_5"],
+            "moodboardIds": ["moodboard_1"],
             "moderationLevel": 7
         }))
         .unwrap();
 
         assert_eq!(request.clone_id.as_deref(), Some("clone_1"));
-        assert_eq!(
-            request.moodboard_ids,
-            vec![
-                "moodboard_1",
-                "moodboard_2",
-                "moodboard_3",
-                "moodboard_4",
-                "moodboard_5"
-            ]
-        );
+        assert_eq!(request.moodboard_ids, vec!["moodboard_1"]);
         assert_eq!(request.moderation_level, Some(7));
     }
 
@@ -617,15 +602,16 @@ mod tests {
     }
 
     #[test]
-    fn selected_moodboard_count_must_be_exactly_five_for_research() {
+    fn selected_moodboard_count_accepts_one_to_ten_for_research() {
         assert!(!valid_selected_moodboard_count(0));
-        assert!(!valid_selected_moodboard_count(4));
+        assert!(valid_selected_moodboard_count(1));
         assert!(valid_selected_moodboard_count(5));
-        assert!(!valid_selected_moodboard_count(6));
+        assert!(valid_selected_moodboard_count(10));
+        assert!(!valid_selected_moodboard_count(11));
     }
 
     #[test]
-    fn moodboard_selection_requires_five_unique_ids_for_research() {
+    fn moodboard_selection_dedupes_before_counting_for_research() {
         let selected = unique_selected_moodboard_ids(vec![
             "moodboard_1".to_string(),
             "moodboard_2".to_string(),
@@ -637,7 +623,7 @@ mod tests {
 
         assert_eq!(selected.len(), 5);
         assert!(valid_selected_moodboard_count(selected.len()));
-        assert!(!valid_selected_moodboard_count(selected.len() - 1));
+        assert!(valid_selected_moodboard_count(selected.len() - 1));
     }
 
     #[test]
