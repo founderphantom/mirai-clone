@@ -51,6 +51,9 @@ use mirai_product_worker::services::media::{media_storage_key, normalize_extensi
 use mirai_product_worker::services::provider_accounts::{
     choose_provider_account, ProviderAccountCandidate,
 };
+use mirai_product_worker::services::visual_reference_cache::{
+    supported_visual_reference_content_type, visual_reference_storage_key,
+};
 use serde_json::json;
 
 #[test]
@@ -129,6 +132,25 @@ fn visual_reference_pipeline_schema_has_required_columns_and_config() {
     assert!(migration.contains("media_asset_id TEXT"));
     assert!(migration.contains("moodboard_instagram_handles_json"));
     assert!(migration.contains("instagram_candidate_review_limit"));
+}
+
+#[test]
+fn visual_reference_storage_key_uses_expected_shape() {
+    assert_eq!(
+        visual_reference_storage_key("user/1", "clone:1", "vref_1", "image/webp"),
+        "visual-references/user-1/clone-1/vref_1/source.webp"
+    );
+}
+
+#[test]
+fn visual_reference_cache_accepts_static_image_content_types() {
+    assert!(supported_visual_reference_content_type("image/jpeg"));
+    assert!(supported_visual_reference_content_type(
+        "image/png; charset=binary"
+    ));
+    assert!(supported_visual_reference_content_type("image/webp"));
+    assert!(!supported_visual_reference_content_type("image/gif"));
+    assert!(!supported_visual_reference_content_type("text/html"));
 }
 
 #[test]
