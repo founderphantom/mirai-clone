@@ -18,6 +18,12 @@ use mirai_product_worker::domain::visual_reference::{
     accept_visual_review, selected_moodboard_count_is_valid, visual_review_tags, MoodboardBrief,
     VisualReferenceReview,
 };
+use mirai_product_worker::instagram_references::{
+    build_instagram_post_url, build_instagram_profile_url, build_instagram_user_posts_url,
+    normalize_instagram_post_detail, normalize_instagram_post_detail_with_policy,
+    normalize_instagram_profile_related_handles, normalize_instagram_user_posts,
+    InstagramFallbackPolicy,
+};
 use mirai_product_worker::routes::blitz::{
     map_blitz_service_error, parse_history_limit, read_required_query_param,
 };
@@ -121,6 +127,1845 @@ fn visual_reference_pipeline_schema_has_required_columns_and_config() {
     assert!(migration.contains("media_asset_id TEXT"));
     assert!(migration.contains("moodboard_instagram_handles_json"));
     assert!(migration.contains("instagram_candidate_review_limit"));
+}
+
+#[test]
+fn instagram_endpoint_builders_match_scrapecreators_contract() {
+    assert_eq!(
+        build_instagram_profile_url("https://api.scrapecreators.com", " Creator.Name ").unwrap(),
+        "https://api.scrapecreators.com/v1/instagram/profile?handle=Creator.Name&trim=true"
+    );
+    assert_eq!(
+        build_instagram_user_posts_url("https://api.scrapecreators.com/", "creator", Some("cursor 1")).unwrap(),
+        "https://api.scrapecreators.com/v2/instagram/user/posts?handle=creator&next_max_id=cursor%201&trim=true"
+    );
+    assert_eq!(
+        build_instagram_post_url(
+            "https://api.scrapecreators.com",
+            "https://www.instagram.com/p/ABC123/",
+            "US"
+        )
+        .unwrap(),
+        "https://api.scrapecreators.com/v1/instagram/post?url=https%3A%2F%2Fwww.instagram.com%2Fp%2FABC123%2F&region=US&trim=true"
+    );
+}
+
+#[test]
+fn instagram_endpoint_builders_reject_invalid_handles() {
+    assert!(build_instagram_profile_url("https://api.scrapecreators.com", "bad handle").is_err());
+    assert!(
+        build_instagram_user_posts_url("https://api.scrapecreators.com", "bad/handle", None)
+            .is_err()
+    );
+    for handle in [".", "..", "_", ".creator", "creator.", "creator..name"] {
+        assert!(
+            build_instagram_profile_url("https://api.scrapecreators.com", handle).is_err(),
+            "{handle}"
+        );
+    }
+}
+
+#[test]
+fn instagram_post_url_builder_rejects_non_instagram_posts() {
+    assert!(build_instagram_post_url("https://api.scrapecreators.com", "", "US").is_err());
+    assert!(build_instagram_post_url("https://api.scrapecreators.com", "not a url", "US").is_err());
+    assert!(build_instagram_post_url(
+        "https://api.scrapecreators.com",
+        "https://example.com/p/ABC123/",
+        "US"
+    )
+    .is_err());
+    assert!(build_instagram_post_url(
+        "https://api.scrapecreators.com",
+        "https://www.instagram.com/stories/creator/1/",
+        "US"
+    )
+    .is_err());
+    assert!(build_instagram_post_url(
+        "https://api.scrapecreators.com",
+        "https://www.instagram.com/p/ABC123/not-a-post-route",
+        "US"
+    )
+    .is_err());
+    assert!(build_instagram_post_url(
+        "https://api.scrapecreators.com",
+        "http://www.instagram.com/p/ABC123/",
+        "US"
+    )
+    .is_err());
+    assert!(build_instagram_post_url(
+        "https://api.scrapecreators.com",
+        "https://www.instagram.com/p/BAD CODE/",
+        "US"
+    )
+    .is_err());
+    assert!(build_instagram_post_url(
+        "https://api.scrapecreators.com",
+        "https://www.instagram.com/p/ABC123/",
+        "EU"
+    )
+    .is_err());
+    assert!(build_instagram_post_url(
+        "https://api.scrapecreators.com",
+        "https://instagram.com/reel/ABC123/",
+        "US"
+    )
+    .is_ok());
+    assert!(build_instagram_post_url(
+        "https://api.scrapecreators.com",
+        "https://www.instagram.com/tv/ABC123/",
+        "US"
+    )
+    .is_ok());
+}
+
+#[test]
+fn instagram_profile_related_handles_skip_private_and_profile_pictures() {
+    let raw = json!({
+        "data": {
+            "user": {
+                "username": "seed",
+                "is_private": false,
+                "profile_pic_url": "https://cdn.example/profile.jpg",
+                "edge_related_profiles": {
+                    "edges": [
+                        { "node": { "username": "public_a", "is_private": false } },
+                        { "node": { "username": "public_a", "is_private": false } },
+                        { "node": { "username": "private_b", "is_private": true } },
+                        { "node": { "username": "private_c", "is_private": "true" } }
+                    ]
+                }
+            }
+        }
+    });
+
+    let handles = normalize_instagram_profile_related_handles(&raw, 2);
+
+    assert_eq!(handles, vec!["public_a".to_string()]);
+}
+
+#[test]
+fn instagram_profile_related_handles_skip_parent_private_profile() {
+    let raw = json!({
+        "data": {
+            "user": {
+                "username": "seed",
+                "is_private": "1",
+                "edge_related_profiles": {
+                    "edges": [
+                        { "node": { "username": "public_a", "is_private": false } }
+                    ]
+                }
+            }
+        }
+    });
+
+    let handles = normalize_instagram_profile_related_handles(&raw, 2);
+
+    assert!(handles.is_empty());
+}
+
+#[test]
+fn instagram_user_posts_carousel_normalizer_skips_video_children() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "CAR123",
+            "media_type": 8,
+            "caption": { "text": "Carousel fit" },
+            "carousel_media": [
+                {
+                    "id": "child_1",
+                    "media_type": 1,
+                    "image_versions2": {
+                        "candidates": [
+                            { "url": "https://cdn.example/static.jpg", "width": 1080, "height": 1350 }
+                        ]
+                    }
+                },
+                {
+                    "id": "child_2",
+                    "media_type": 2,
+                    "thumbnail_url": "https://cdn.example/video.jpg",
+                    "image_versions2": {
+                        "candidates": [
+                            { "url": "https://cdn.example/video-cover.jpg", "width": 1080, "height": 1350 }
+                        ]
+                    }
+                }
+            ],
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/static.jpg");
+    assert_eq!(candidates[0].source_image_index, 0);
+}
+
+#[test]
+fn instagram_user_posts_carousel_video_thumbnails_require_explicit_fallback_policy() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "CAR123",
+            "media_type": 8,
+            "carousel_media": [{
+                "id": "child_1",
+                "media_type": 2,
+                "image_versions2": {
+                    "candidates": [
+                        { "url": "https://cdn.example/video-small.jpg", "width": 320, "height": 320 },
+                        { "url": "https://cdn.example/video-large.jpg", "width": 1080, "height": 1350 }
+                    ]
+                }
+            }],
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let skipped = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+    let fallback = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::AllowVideoThumbnails,
+        3,
+    );
+
+    assert!(skipped.is_empty());
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0].image_url, "https://cdn.example/video-large.jpg");
+    assert_eq!(fallback[0].source_image_index, 0);
+}
+
+#[test]
+fn instagram_user_posts_carousel_uses_first_non_empty_sidecar_shape_once() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "CAR123",
+            "media_type": 8,
+            "edge_sidecar_to_children": {
+                "edges": [
+                    { "node": { "id": "child_1", "display_url": "https://cdn.example/static.jpg" } }
+                ]
+            },
+            "carousel_media": [
+                { "id": "child_1", "display_url": "https://cdn.example/static.jpg" }
+            ],
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/static.jpg");
+}
+
+#[test]
+fn instagram_user_posts_carousel_prefers_first_usable_sidecar_shape() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "CAR123",
+            "media_type": 8,
+            "edge_sidecar_to_children": {
+                "edges": [
+                    { "node": { "id": "edge_child_1", "display_url": "https://cdn.example/edge-1.jpg" } },
+                    { "node": { "id": "edge_child_2", "display_url": "https://cdn.example/edge-2.jpg" } }
+                ]
+            },
+            "carousel_media": [
+                { "id": "carousel_child_1", "display_url": "https://cdn.example/carousel-1.jpg" },
+                { "id": "carousel_child_2", "display_url": "https://cdn.example/carousel-2.jpg" }
+            ],
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/edge-1.jpg");
+    assert_eq!(candidates[1].image_url, "https://cdn.example/edge-2.jpg");
+}
+
+#[test]
+fn instagram_user_posts_carousel_falls_back_to_later_valid_sidecar_shape() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "CAR123",
+            "media_type": 8,
+            "edge_sidecar_to_children": {
+                "edges": [
+                    { "node": { "id": "child_1", "display_url": "https://cdn.example/profile_pic.jpg" } }
+                ]
+            },
+            "carousel_media": [
+                { "id": "child_2", "display_url": "https://cdn.example/static.jpg" }
+            ],
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/static.jpg");
+}
+
+#[test]
+fn instagram_user_posts_carousel_preserves_original_child_index_after_filtering() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "CAR123",
+            "media_type": 8,
+            "caption": { "text": "Carousel fit" },
+            "carousel_media": [
+                {
+                    "id": "child_1",
+                    "media_type": 1,
+                    "display_url": "https://cdn.example/profile_pic.jpg"
+                },
+                {
+                    "id": "child_2",
+                    "media_type": 1,
+                    "display_url": "https://cdn.example/valid.jpg",
+                    "dimensions": { "width": 1080, "height": 1350 }
+                }
+            ],
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/valid.jpg");
+    assert_eq!(candidates[0].source_image_index, 1);
+}
+
+#[test]
+fn instagram_user_posts_carousel_ignores_parent_video_metadata_for_static_children() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "CAR123",
+            "media_type": 8,
+            "video": { "url": "https://cdn.example/parent.mp4" },
+            "caption": { "text": "Carousel fit" },
+            "carousel_media": [{
+                "id": "child_1",
+                "media_type": 1,
+                "display_url": "https://cdn.example/static.jpg",
+                "dimensions": { "width": 1080, "height": 1350 }
+            }],
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/static.jpg");
+}
+
+#[test]
+fn instagram_user_posts_carousel_without_media_type_ignores_parent_video_metadata() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "CAR123",
+            "video_url": "https://cdn.example/parent.mp4",
+            "caption": { "text": "Carousel fit" },
+            "carousel_media": [{
+                "id": "child_1",
+                "display_url": "https://cdn.example/static.jpg",
+                "dimensions": { "width": 1080, "height": 1350 }
+            }],
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/static.jpg");
+    assert_eq!(candidates[0].media_type, 8);
+}
+
+#[test]
+fn instagram_user_posts_normalizer_extracts_static_and_skips_videos() {
+    let raw = json!({
+        "items": [
+            {
+                "id": "post_1",
+                "code": "ABC123",
+                "media_type": 1,
+                "taken_at": 1778716800,
+                "caption": { "text": "Night fit" },
+                "like_count": 1200,
+                "comment_count": 20,
+                "image_versions2": {
+                    "candidates": [
+                        { "url": "https://cdn.example/small.jpg", "width": 300, "height": 400 },
+                        { "url": "https://cdn.example/large.jpg", "width": 1200, "height": 1600 }
+                    ]
+                },
+                "user": { "username": "creator" },
+                "url": "https://www.instagram.com/p/ABC123/"
+            },
+            {
+                "id": "post_2",
+                "code": "VID123",
+                "media_type": 2,
+                "thumbnail_url": "https://cdn.example/video.jpg",
+                "user": { "username": "creator" }
+            }
+        ]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/large.jpg");
+    assert_eq!(candidates[0].source_post_code, "ABC123");
+    assert_eq!(candidates[0].source_caption.as_deref(), Some("Night fit"));
+}
+
+#[test]
+fn instagram_user_posts_static_without_media_type_emits_image_media_type() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "IMG123",
+            "display_url": "https://cdn.example/static.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].media_type, 1);
+}
+
+#[test]
+fn instagram_user_posts_static_with_unrelated_items_uses_parent_image() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "IMG123",
+            "display_url": "https://cdn.example/parent-static.jpg",
+            "items": [
+                { "label": "metadata", "value": "not media" }
+            ],
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].image_url,
+        "https://cdn.example/parent-static.jpg"
+    );
+    assert_eq!(candidates[0].source_image_index, 0);
+    assert_eq!(candidates[0].media_type, 1);
+}
+
+#[test]
+fn instagram_user_posts_allows_s150x150_post_image_urls() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "IMG123",
+            "display_url": "https://cdn.example/s150x150/static.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].image_url,
+        "https://cdn.example/s150x150/static.jpg"
+    );
+}
+
+#[test]
+fn instagram_user_posts_extracts_static_image_url_field() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "IMG123",
+            "image_url": "https://cdn.example/image-url.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/image-url.jpg");
+}
+
+#[test]
+fn instagram_user_posts_uses_shortcode_when_code_is_missing() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "shortcode": "SHORT123",
+            "display_url": "https://cdn.example/static.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_post_code, "SHORT123");
+    assert_eq!(
+        candidates[0].source_url.as_deref(),
+        Some("https://www.instagram.com/p/SHORT123/")
+    );
+}
+
+#[test]
+fn instagram_user_posts_malformed_code_does_not_synthesize_source_url() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "BAD CODE",
+            "display_url": "https://cdn.example/static.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_post_code, "BAD CODE");
+    assert_eq!(candidates[0].source_url, None);
+}
+
+#[test]
+fn instagram_user_posts_id_only_item_does_not_synthesize_fake_source_url() {
+    let raw = json!({
+        "items": [{
+            "id": "raw_post_123",
+            "display_url": "https://cdn.example/static.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_post_code, "raw_post_123");
+    assert_eq!(candidates[0].source_post_id, "raw_post_123");
+    assert_eq!(candidates[0].source_url, None);
+}
+
+#[test]
+fn instagram_user_posts_drops_non_https_image_urls() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "IMG123",
+            "display_url": "http://cdn.example/static.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn instagram_user_posts_drops_invalid_provider_source_url() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "IMG123",
+            "url": "https://example.com/not-instagram",
+            "display_url": "https://cdn.example/static.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].source_url.as_deref(),
+        Some("https://www.instagram.com/p/IMG123/")
+    );
+}
+
+#[test]
+fn instagram_user_posts_drops_items_missing_stable_post_identity() {
+    let raw = json!({
+        "items": [{
+            "display_url": "https://cdn.example/static.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn instagram_user_posts_normalizer_reads_wrapped_items() {
+    let data_items_raw = json!({
+        "data": {
+            "items": [{
+                "id": "post_1",
+                "code": "DATAITEM",
+                "display_url": "https://cdn.example/data-items.jpg",
+                "user": { "username": "creator" }
+            }]
+        }
+    });
+    let data_array_raw = json!({
+        "data": [{
+            "id": "post_2",
+            "code": "DATAARRAY",
+            "display_url": "https://cdn.example/data-array.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let data_items_candidates = normalize_instagram_user_posts(
+        &data_items_raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+    let data_array_candidates = normalize_instagram_user_posts(
+        &data_array_raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(data_items_candidates.len(), 1);
+    assert_eq!(
+        data_items_candidates[0].image_url,
+        "https://cdn.example/data-items.jpg"
+    );
+    assert_eq!(data_array_candidates.len(), 1);
+    assert_eq!(
+        data_array_candidates[0].image_url,
+        "https://cdn.example/data-array.jpg"
+    );
+}
+
+#[test]
+fn instagram_user_posts_normalizer_filters_synthetic_caption_shapes() {
+    let raw = json!({
+        "items": [
+            {
+                "id": "post_1",
+                "code": "CAPSTR",
+                "caption": "AI generated outfit reference",
+                "display_url": "https://cdn.example/caption-string.jpg",
+                "user": { "username": "creator" }
+            },
+            {
+                "id": "post_2",
+                "code": "CAPTEXT",
+                "caption_text": "Midjourney fashion render",
+                "display_url": "https://cdn.example/caption-text.jpg",
+                "user": { "username": "creator" }
+            },
+            {
+                "id": "post_3",
+                "code": "VALID",
+                "caption": "real street fit",
+                "display_url": "https://cdn.example/valid.jpg",
+                "user": { "username": "creator" }
+            }
+        ]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_post_code, "VALID");
+    assert_eq!(
+        candidates[0].source_caption.as_deref(),
+        Some("real street fit")
+    );
+}
+
+#[test]
+fn instagram_caption_filter_scans_all_available_caption_shapes() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "MIXEDCAP",
+            "caption": { "text": "real street fit" },
+            "caption_text": "AI generated outfit reference",
+            "display_url": "https://cdn.example/mixed-caption.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn instagram_caption_filter_scans_all_edge_caption_values() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "EDGECAP",
+                "display_url": "https://cdn.example/edge-caption.jpg",
+                "edge_media_to_caption": {
+                    "edges": [
+                        { "node": { "text": "real street fit" } },
+                        { "node": { "text": "AI generated outfit reference" } }
+                    ]
+                }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/EDGECAP/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn instagram_user_posts_normalizer_uses_additional_image_candidates() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "ADD123",
+            "media_type": 1,
+            "caption": { "text": "Additional candidate fit" },
+            "image_versions2": {
+                "additional_candidates": {
+                    "first_frame": { "url": "https://cdn.example/additional.jpg", "width": 1080, "height": 1350 },
+                    "tiny": "https://cdn.example/tiny.jpg"
+                }
+            },
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].image_url,
+        "https://cdn.example/additional.jpg"
+    );
+}
+
+#[test]
+fn instagram_user_posts_normalizer_uses_owner_user_profile_id_chain() {
+    let raw = json!({
+        "items": [
+            {
+                "id": "post_1",
+                "code": "USR123",
+                "media_type": 1,
+                "display_url": "https://cdn.example/user.jpg",
+                "user": { "username": "creator", "id": "user_123" }
+            },
+            {
+                "id": "post_2",
+                "code": "OWN123",
+                "media_type": 1,
+                "display_url": "https://cdn.example/owner.jpg",
+                "owner": { "username": "owner_creator", "pk": "owner_pk_456" }
+            }
+        ]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].source_profile_id.as_deref(), Some("user_123"));
+    assert_eq!(
+        candidates[1].source_profile_id.as_deref(),
+        Some("owner_pk_456")
+    );
+}
+
+#[test]
+fn instagram_user_posts_normalizer_keeps_owner_identity_pair_consistent() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "OWNUSR123",
+            "media_type": 1,
+            "display_url": "https://cdn.example/owner-user.jpg",
+            "owner": { "username": "owner_creator", "id": "owner_123" },
+            "user": { "username": "user_creator", "id": "user_456" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "fallback_creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_handle, "owner_creator");
+    assert_eq!(
+        candidates[0].source_profile_id.as_deref(),
+        Some("owner_123")
+    );
+}
+
+#[test]
+fn instagram_user_posts_normalizer_skips_video_markers_without_media_type() {
+    let raw = json!({
+        "items": [
+            {
+                "id": "post_1",
+                "code": "VID123",
+                "is_video": true,
+                "thumbnail_url": "https://cdn.example/video.jpg",
+                "image_versions2": {
+                    "candidates": [
+                        { "url": "https://cdn.example/video-cover.jpg", "width": 1080, "height": 1350 }
+                    ]
+                },
+                "user": { "username": "creator" }
+            },
+            {
+                "id": "post_2",
+                "code": "VID456",
+                "video_versions": [
+                    { "url": "https://cdn.example/video.mp4" }
+                ],
+                "thumbnail_url": "https://cdn.example/video2.jpg",
+                "user": { "username": "creator" }
+            }
+        ]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn instagram_user_posts_video_fallback_uses_image_versions_thumbnail() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "VID123",
+            "media_type": 2,
+            "image_versions2": {
+                "candidates": [
+                    { "url": "https://cdn.example/video-small.jpg", "width": 300, "height": 400 },
+                    { "url": "https://cdn.example/video-large.jpg", "width": 1080, "height": 1350 }
+                ]
+            },
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::AllowVideoThumbnails,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].image_url,
+        "https://cdn.example/video-large.jpg"
+    );
+    assert_eq!(candidates[0].image_width, Some(1080));
+    assert_eq!(candidates[0].image_height, Some(1350));
+}
+
+#[test]
+fn instagram_user_posts_video_fallback_prefers_best_image_over_thumbnail_url() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "VID123",
+            "media_type": 2,
+            "thumbnail_url": "https://cdn.example/small-thumbnail.jpg",
+            "image_versions2": {
+                "candidates": [
+                    { "url": "https://cdn.example/video-large.jpg", "width": 1080, "height": 1350 }
+                ]
+            },
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::AllowVideoThumbnails,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].image_url,
+        "https://cdn.example/video-large.jpg"
+    );
+    assert_eq!(candidates[0].image_width, Some(1080));
+    assert_eq!(candidates[0].image_height, Some(1350));
+}
+
+#[test]
+fn instagram_user_posts_normalizer_skips_generic_video_metadata() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "VID123",
+            "video": { "url": "https://cdn.example/video.mp4" },
+            "display_url": "https://cdn.example/video-cover.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn instagram_user_posts_normalizer_ignores_empty_video_markers() {
+    let raw = json!({
+        "items": [
+            {
+                "id": "post_1",
+                "code": "IMG123",
+                "video_url": "",
+                "video": null,
+                "video_versions": [],
+                "video_dash_manifest": "",
+                "display_url": "https://cdn.example/static.jpg",
+                "user": { "username": "creator" }
+            },
+            {
+                "id": "post_2",
+                "code": "IMG456",
+                "video": {},
+                "display_url": "https://cdn.example/static2.jpg",
+                "user": { "username": "creator" }
+            }
+        ]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/static.jpg");
+    assert_eq!(candidates[1].image_url, "https://cdn.example/static2.jpg");
+}
+
+#[test]
+fn instagram_user_posts_normalizer_skips_typename_video_markers() {
+    let raw = json!({
+        "items": [{
+            "id": "post_1",
+            "code": "VID123",
+            "__typename": "GraphVideo",
+            "display_url": "https://cdn.example/video-cover.jpg",
+            "user": { "username": "creator" }
+        }]
+    });
+
+    let candidates = normalize_instagram_user_posts(
+        &raw,
+        "creator",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::SkipVideos,
+        3,
+    );
+
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn instagram_post_detail_sidecar_normalizer_skips_video_children() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "CAR123",
+                "edge_media_to_caption": { "edges": [{ "node": { "text": "Carousel fit" } }] },
+                "edge_sidecar_to_children": {
+                    "edges": [
+                        {
+                            "node": {
+                                "id": "child_1",
+                                "is_video": false,
+                                "display_url": "https://cdn.example/static.jpg",
+                                "dimensions": { "width": 1080, "height": 1350 }
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": "child_2",
+                                "is_video": true,
+                                "display_url": "https://cdn.example/video-cover.jpg",
+                                "dimensions": { "width": 1080, "height": 1350 }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/CAR123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/static.jpg");
+    assert_eq!(candidates[0].source_image_index, 0);
+}
+
+#[test]
+fn instagram_post_detail_all_video_sidecar_does_not_fall_back_to_parent_image() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "CAR123",
+                "display_url": "https://cdn.example/parent.jpg",
+                "edge_media_to_caption": { "edges": [{ "node": { "text": "Video carousel" } }] },
+                "edge_sidecar_to_children": {
+                    "edges": [
+                        {
+                            "node": {
+                                "id": "child_1",
+                                "is_video": true,
+                                "display_url": "https://cdn.example/video-cover.jpg",
+                                "dimensions": { "width": 1080, "height": 1350 }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/CAR123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn instagram_post_detail_video_sidecar_thumbnails_require_explicit_fallback_policy() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "CAR123",
+                "edge_sidecar_to_children": {
+                    "edges": [
+                        {
+                            "node": {
+                                "id": "child_1",
+                                "is_video": true,
+                                "image_versions2": {
+                                    "candidates": [
+                                        { "url": "https://cdn.example/child-small.jpg", "width": 320, "height": 320 },
+                                        { "url": "https://cdn.example/child-large.jpg", "width": 1080, "height": 1350 }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    });
+
+    let default_candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/CAR123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+    let fallback_candidates = normalize_instagram_post_detail_with_policy(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/CAR123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::AllowVideoThumbnails,
+        3,
+    );
+
+    assert!(default_candidates.is_empty());
+    assert_eq!(fallback_candidates.len(), 1);
+    assert_eq!(
+        fallback_candidates[0].image_url,
+        "https://cdn.example/child-large.jpg"
+    );
+    assert_eq!(fallback_candidates[0].source_image_index, 0);
+}
+
+#[test]
+fn instagram_post_detail_cap_counts_only_valid_sidecar_images() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "CAR123",
+                "edge_media_to_caption": { "edges": [{ "node": { "text": "Carousel fit" } }] },
+                "edge_sidecar_to_children": {
+                    "edges": [
+                        {
+                            "node": {
+                                "id": "child_1",
+                                "display_url": "https://cdn.example/profile_pic.jpg",
+                                "dimensions": { "width": 1080, "height": 1350 }
+                            }
+                        },
+                        {
+                            "node": {
+                                "id": "child_2",
+                                "display_url": "https://cdn.example/valid.jpg",
+                                "dimensions": { "width": 1080, "height": 1350 }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/CAR123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        1,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_url, "https://cdn.example/valid.jpg");
+    assert_eq!(candidates[0].source_image_index, 1);
+}
+
+#[test]
+fn instagram_post_detail_normalizer_extracts_top_level_static_image() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "IMG123",
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "dimensions": { "width": 1080, "height": 1350 },
+                "edge_media_to_caption": { "edges": [{ "node": { "text": "Static detail fit" } }] }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/IMG123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].image_url,
+        "https://cdn.example/static-detail.jpg"
+    );
+    assert_eq!(candidates[0].source_image_index, 0);
+    assert_eq!(
+        candidates[0].source_caption.as_deref(),
+        Some("Static detail fit")
+    );
+}
+
+#[test]
+fn instagram_post_detail_video_thumbnail_requires_explicit_fallback_policy() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "video_1",
+                "shortcode": "REEL123",
+                "__typename": "XDTGraphVideo",
+                "video_play_count": 42,
+                "edge_liked_by": { "count": 17 },
+                "image_versions2": {
+                    "candidates": [
+                        { "url": "https://cdn.example/small.jpg", "width": 320, "height": 320 },
+                        { "url": "https://cdn.example/large.jpg", "width": 1080, "height": 1350 }
+                    ]
+                }
+            }
+        }
+    });
+
+    let default_candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/reel/REEL123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+    let fallback_candidates = normalize_instagram_post_detail_with_policy(
+        &raw,
+        "creator",
+        "https://www.instagram.com/reel/REEL123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        InstagramFallbackPolicy::AllowVideoThumbnails,
+        3,
+    );
+
+    assert!(default_candidates.is_empty());
+    assert_eq!(fallback_candidates.len(), 1);
+    assert_eq!(
+        fallback_candidates[0].image_url,
+        "https://cdn.example/large.jpg"
+    );
+    assert_eq!(fallback_candidates[0].image_width, Some(1080));
+    assert_eq!(fallback_candidates[0].image_height, Some(1350));
+    assert_eq!(fallback_candidates[0].media_type, 2);
+    assert_eq!(fallback_candidates[0].like_count, Some(17));
+    assert_eq!(fallback_candidates[0].play_count, Some(42));
+}
+
+#[test]
+fn instagram_post_detail_uses_source_url_shortcode_when_raw_identity_missing() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "dimensions": { "width": 1080, "height": 1350 }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/CAR123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_post_code, "CAR123");
+    assert_eq!(candidates[0].source_post_id, "CAR123");
+    assert_ne!(candidates[0].source_post_id, "unknown_post");
+}
+
+#[test]
+fn instagram_post_detail_synthesizes_source_url_from_valid_raw_shortcode() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "CAR123",
+                "thumbnail_url": "https://cdn.example/static-detail.jpg"
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "not an instagram url",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].source_url.as_deref(),
+        Some("https://www.instagram.com/p/CAR123/")
+    );
+    assert_eq!(
+        candidates[0].image_url,
+        "https://cdn.example/static-detail.jpg"
+    );
+}
+
+#[test]
+fn instagram_post_detail_uses_raw_id_when_shortcode_sources_missing() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "raw_post_123",
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "dimensions": { "width": 1080, "height": 1350 }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://example.com/not-instagram",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_post_code, "raw_post_123");
+    assert_eq!(candidates[0].source_post_id, "raw_post_123");
+    assert_eq!(candidates[0].source_url, None);
+    assert_ne!(candidates[0].source_post_id, "unknown_post");
+}
+
+#[test]
+fn instagram_post_detail_normalizer_uses_preview_comment_count() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "IMG123",
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "edge_media_preview_comment": { "count": 42 },
+                "edge_media_to_caption": { "edges": [{ "node": { "text": "Static detail fit" } }] }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/IMG123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].comment_count, Some(42));
+}
+
+#[test]
+fn instagram_post_detail_normalizer_uses_parent_comment_count() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "IMG123",
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "edge_media_to_parent_comment": { "count": 17 },
+                "edge_media_to_caption": { "edges": [{ "node": { "text": "Static detail fit" } }] }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/IMG123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].comment_count, Some(17));
+}
+
+#[test]
+fn instagram_post_detail_normalizer_uses_top_level_metric_fallbacks() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "METRIC123",
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "like_count": 25,
+                "comment_count": 7,
+                "taken_at": 1_767_222_400
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/METRIC123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].like_count, Some(25));
+    assert_eq!(candidates[0].comment_count, Some(7));
+    assert_eq!(
+        candidates[0].source_published_at.as_deref(),
+        Some("2025-12-31T23:06:40.000Z")
+    );
+}
+
+#[test]
+fn instagram_post_detail_timestamp_falls_back_from_blank_string() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "TIME123",
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "taken_at_timestamp": "   ",
+                "taken_at": 1_767_222_400
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/TIME123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].source_published_at.as_deref(),
+        Some("2025-12-31T23:06:40.000Z")
+    );
+}
+
+#[test]
+fn instagram_post_detail_normalizer_prefers_owner_metadata() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "IMG123",
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "owner": { "username": "detail_owner", "id": "owner_123" },
+                "edge_media_to_caption": { "edges": [{ "node": { "text": "Static detail fit" } }] }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "fallback_creator",
+        "https://www.instagram.com/p/IMG123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_handle, "detail_owner");
+    assert_eq!(
+        candidates[0].source_profile_id.as_deref(),
+        Some("owner_123")
+    );
+}
+
+#[test]
+fn instagram_post_detail_normalizer_keeps_owner_identity_pair_consistent() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "IMG123",
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "owner": { "username": "detail_owner" },
+                "user": { "username": "other_user", "id": "user_456" },
+                "edge_media_to_caption": { "edges": [{ "node": { "text": "Static detail fit" } }] }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "fallback_creator",
+        "https://www.instagram.com/p/IMG123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_handle, "detail_owner");
+    assert_eq!(candidates[0].source_profile_id, None);
+}
+
+#[test]
+fn instagram_post_detail_normalizer_filters_synthetic_caption_shapes() {
+    let caption_text_raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "IMG123",
+                "display_url": "https://cdn.example/static-detail.jpg",
+                "caption_text": "AI generated outfit reference"
+            }
+        }
+    });
+    let string_caption_raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_2",
+                "shortcode": "IMG456",
+                "display_url": "https://cdn.example/static-detail-2.jpg",
+                "caption": "Midjourney fashion render"
+            }
+        }
+    });
+
+    let caption_text_candidates = normalize_instagram_post_detail(
+        &caption_text_raw,
+        "creator",
+        "https://www.instagram.com/p/IMG123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+    let string_caption_candidates = normalize_instagram_post_detail(
+        &string_caption_raw,
+        "creator",
+        "https://www.instagram.com/p/IMG456/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert!(caption_text_candidates.is_empty());
+    assert!(string_caption_candidates.is_empty());
+}
+
+#[test]
+fn instagram_post_detail_normalizer_extracts_sidecar_children() {
+    let raw = json!({
+        "data": {
+            "xdt_shortcode_media": {
+                "id": "post_1",
+                "shortcode": "CAR123",
+                "edge_media_to_caption": { "edges": [{ "node": { "text": "Carousel fit" } }] },
+                "edge_sidecar_to_children": {
+                    "edges": [
+                        { "node": { "id": "child_1", "display_url": "https://cdn.example/child1.jpg", "dimensions": { "width": 1080, "height": 1350 } } },
+                        { "node": { "id": "child_2", "display_url": "https://cdn.example/child2.jpg", "dimensions": { "width": 1080, "height": 1350 } } }
+                    ]
+                }
+            }
+        }
+    });
+
+    let candidates = normalize_instagram_post_detail(
+        &raw,
+        "creator",
+        "https://www.instagram.com/p/CAR123/",
+        "mb_1",
+        "flash-editorial",
+        "configured_handle",
+        3,
+    );
+
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].source_image_index, 0);
+    assert_eq!(candidates[1].source_image_index, 1);
 }
 
 #[test]

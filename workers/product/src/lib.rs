@@ -9,6 +9,7 @@ mod queues;
 pub mod routes;
 pub mod services;
 
+pub use providers::instagram_references;
 pub use providers::scrapecreators;
 
 use serde_json::Value;

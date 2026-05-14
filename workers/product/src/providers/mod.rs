@@ -3,4 +3,5 @@ pub mod higgsfield_agent;
 pub mod higgsfield_auth;
 #[allow(dead_code)]
 pub mod higgsfield_mcp;
+pub mod instagram_references;
 pub mod scrapecreators;
