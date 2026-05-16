@@ -256,7 +256,9 @@ fn uploaded_media_from_confirm_response(
     }
 }
 
-fn extract_upload_slot(raw_json: &Value) -> Result<HiggsfieldAgentUploadSlot, HiggsfieldAgentError> {
+fn extract_upload_slot(
+    raw_json: &Value,
+) -> Result<HiggsfieldAgentUploadSlot, HiggsfieldAgentError> {
     for payload in upload_payloads(raw_json) {
         if let Some(slot) = upload_slot_from_value(&payload) {
             return Ok(slot);
@@ -400,10 +402,7 @@ mod tests {
 
         let uploaded = uploaded_media_from_confirm_response(&raw_json, &slot, "image/jpeg");
 
-        assert_eq!(
-            uploaded.media_id,
-            "22222222-2222-2222-2222-222222222222"
-        );
+        assert_eq!(uploaded.media_id, "22222222-2222-2222-2222-222222222222");
         assert_eq!(
             uploaded.url.as_deref(),
             Some("https://d2ol7oe51mr4n9.cloudfront.net/u/222.png")

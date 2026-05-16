@@ -543,63 +543,58 @@ async fn poll_clone_training_message(
             .await;
         }
     };
-    let result = match get_soul_reference(
-        &api_base_url,
-        &token.access_token,
-        provider_soul_id,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            if let Some(provider_error) = higgsfield_agent_provider_action_error(&error) {
-                let detail = agent_error_detail(&error, "clone_status");
-                mark_provider_action_required(
+    let result =
+        match get_soul_reference(&api_base_url, &token.access_token, provider_soul_id).await {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(provider_error) = higgsfield_agent_provider_action_error(&error) {
+                    let detail = agent_error_detail(&error, "clone_status");
+                    mark_provider_action_required(
+                        db,
+                        job_id,
+                        clone_id,
+                        user_id,
+                        idempotency_key,
+                        &provider_error,
+                        Some(&detail),
+                    )
+                    .await?;
+                    release_provider_lease(db, job_id).await?;
+                    return Ok(());
+                }
+                if let Some((error_code, error_message, raw_json)) =
+                    agent_terminal_failure(&error, "clone_status", "clone_training_poll_failed")
+                {
+                    fail_clone_training_job(
+                        db,
+                        job_id,
+                        clone_id,
+                        user_id,
+                        idempotency_key,
+                        error_code,
+                        &error_message,
+                        &raw_json,
+                    )
+                    .await?;
+                    release_provider_lease(db, job_id).await?;
+                    return Ok(());
+                }
+                return retry_clone_training_poll_after_error(
                     db,
+                    env,
                     job_id,
                     clone_id,
                     user_id,
                     idempotency_key,
-                    &provider_error,
-                    Some(&detail),
+                    provider_soul_id,
+                    attempt,
+                    max_attempts,
+                    "clone_training_poll_failed",
+                    &map_agent_error(error).to_string(),
                 )
-                .await?;
-                release_provider_lease(db, job_id).await?;
-                return Ok(());
+                .await;
             }
-            if let Some((error_code, error_message, raw_json)) =
-                agent_terminal_failure(&error, "clone_status", "clone_training_poll_failed")
-            {
-                fail_clone_training_job(
-                    db,
-                    job_id,
-                    clone_id,
-                    user_id,
-                    idempotency_key,
-                    error_code,
-                    &error_message,
-                    &raw_json,
-                )
-                .await?;
-                release_provider_lease(db, job_id).await?;
-                return Ok(());
-            }
-            return retry_clone_training_poll_after_error(
-                db,
-                env,
-                job_id,
-                clone_id,
-                user_id,
-                idempotency_key,
-                provider_soul_id,
-                attempt,
-                max_attempts,
-                "clone_training_poll_failed",
-                &map_agent_error(error).to_string(),
-            )
-            .await;
-        }
-    };
+        };
 
     if provider_training_ready(&result.raw_json) {
         let ready_soul_id = extract_provider_soul_id(&result.raw_json)
