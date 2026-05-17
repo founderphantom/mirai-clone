@@ -2640,6 +2640,17 @@ fn visual_reference_review_prompt_contains_guardrail_and_caption_rules() {
     assert!(prompt.contains("\"adultLikely\""));
     assert!(prompt.contains("\"visualFitScore\""));
     assert!(prompt.contains("visualFitScore must be a unit score from 0 to 1"));
+    assert!(prompt.contains(
+        "Do not reject solely because caption/source text includes"
+    ));
+    assert!(prompt.contains("discount code"));
+    assert!(prompt.contains("brand tag"));
+    assert!(prompt.contains("photographer credit"));
+    assert!(prompt.contains("Do not reject solely because the image uses"));
+    assert!(prompt.contains("dark lighting"));
+    assert!(prompt.contains("red gel lighting"));
+    assert!(prompt.contains("stylized editorial processing"));
+    assert!(prompt.contains("text-dominant"));
 }
 
 #[test]
