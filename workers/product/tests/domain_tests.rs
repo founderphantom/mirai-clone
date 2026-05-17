@@ -21,10 +21,11 @@ use mirai_product_worker::domain::visual_reference::{
     VisualReferenceReview,
 };
 use mirai_product_worker::instagram_references::{
-    build_instagram_post_url, build_instagram_profile_url, build_instagram_user_posts_url,
-    normalize_instagram_post_detail, normalize_instagram_post_detail_with_policy,
-    normalize_instagram_profile_related_handles, normalize_instagram_user_posts,
-    InstagramFallbackPolicy,
+    build_instagram_post_url, build_instagram_profile_url, build_instagram_reels_search_url,
+    build_instagram_user_posts_url, extract_instagram_reels_owner_handles,
+    instagram_candidate_meets_min_dimensions, normalize_instagram_post_detail,
+    normalize_instagram_post_detail_with_policy, normalize_instagram_profile_related_handles,
+    normalize_instagram_user_posts, InstagramFallbackPolicy,
 };
 use mirai_product_worker::routes::blitz::{
     map_blitz_service_error, parse_history_limit, read_required_query_param,
@@ -519,6 +520,67 @@ fn instagram_endpoint_builders_match_scrapecreators_contract() {
         .unwrap(),
         "https://api.scrapecreators.com/v1/instagram/post?url=https%3A%2F%2Fwww.instagram.com%2Fp%2FABC123%2F&region=US&trim=true"
     );
+}
+
+#[test]
+fn reels_search_url_uses_query_and_optional_page() {
+    assert_eq!(
+        build_instagram_reels_search_url("https://api.scrapecreators.com/", "flash fashion", None)
+            .unwrap(),
+        "https://api.scrapecreators.com/v2/instagram/reels/search?query=flash%20fashion&trim=true"
+    );
+    assert_eq!(
+        build_instagram_reels_search_url(
+            "https://api.scrapecreators.com",
+            "flash fashion",
+            Some(2)
+        )
+        .unwrap(),
+        "https://api.scrapecreators.com/v2/instagram/reels/search?query=flash%20fashion&page=2&trim=true"
+    );
+}
+
+#[test]
+fn reels_search_extracts_owner_handles_only() {
+    let raw = json!({
+        "items": [
+            { "user": { "username": "CreatorA" }, "thumbnail_url": "https://cdn.example/reel.jpg" },
+            { "owner": { "username": "@CreatorB" }, "display_url": "https://cdn.example/reel2.jpg" },
+            { "username": "creator_c" },
+            { "user": { "username": "CreatorA" } }
+        ]
+    });
+
+    assert_eq!(
+        extract_instagram_reels_owner_handles(&raw, 10),
+        vec![
+            "CreatorA".to_string(),
+            "CreatorB".to_string(),
+            "creator_c".to_string()
+        ]
+    );
+}
+
+#[test]
+fn instagram_candidate_dimension_gate_rejects_small_known_dimensions() {
+    let mut candidate = instagram_candidate_fixture();
+    candidate.image_width = Some(511);
+    candidate.image_height = Some(900);
+    assert!(!instagram_candidate_meets_min_dimensions(
+        &candidate, 512, 512
+    ));
+
+    candidate.image_width = Some(800);
+    candidate.image_height = Some(512);
+    assert!(instagram_candidate_meets_min_dimensions(
+        &candidate, 512, 512
+    ));
+
+    candidate.image_width = None;
+    candidate.image_height = None;
+    assert!(instagram_candidate_meets_min_dimensions(
+        &candidate, 512, 512
+    ));
 }
 
 #[test]
@@ -2672,6 +2734,32 @@ fn selected_moodboard_fixture() -> Vec<MoodboardBrief> {
         vibe_summary: "Direct flash portraits.".to_string(),
         search_queries: Vec::new(),
     }]
+}
+
+fn instagram_candidate_fixture(
+) -> mirai_product_worker::instagram_references::InstagramImageCandidate {
+    mirai_product_worker::instagram_references::InstagramImageCandidate {
+        platform: "instagram".to_string(),
+        source_handle: "creator".to_string(),
+        source_profile_id: Some("profile_1".to_string()),
+        source_post_id: "post_1".to_string(),
+        source_post_code: "ABC123".to_string(),
+        source_image_index: 0,
+        source_url: Some("https://www.instagram.com/p/ABC123/".to_string()),
+        source_published_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+        source_caption: Some("street style".to_string()),
+        media_type: 1,
+        image_url: "https://cdn.example.com/image.jpg".to_string(),
+        image_width: Some(1080),
+        image_height: Some(1350),
+        like_count: Some(10),
+        comment_count: Some(2),
+        play_count: None,
+        moodboard_id: "moodboard_1".to_string(),
+        moodboard_slug: "flash-editorial".to_string(),
+        discovered_via: "reels_owner".to_string(),
+        raw_json: json!({}),
+    }
 }
 
 #[test]

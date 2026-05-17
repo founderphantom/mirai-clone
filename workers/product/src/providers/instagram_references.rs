@@ -63,6 +63,28 @@ pub fn build_instagram_user_posts_url(
     Ok(url)
 }
 
+pub fn build_instagram_reels_search_url(
+    base_url: &str,
+    query: &str,
+    page: Option<u32>,
+) -> Result<String, &'static str> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("missing_instagram_reels_search_query");
+    }
+    let mut url = format!(
+        "{}/v2/instagram/reels/search?query={}",
+        base_url.trim_end_matches('/'),
+        url_encode(query)
+    );
+    if let Some(page) = page.filter(|page| *page > 1) {
+        url.push_str("&page=");
+        url.push_str(&page.to_string());
+    }
+    url.push_str("&trim=true");
+    Ok(url)
+}
+
 pub fn build_instagram_post_url(
     base_url: &str,
     post_url: &str,
@@ -100,6 +122,47 @@ pub fn normalize_instagram_profile_related_handles(raw: &Value, limit: usize) ->
         .filter(|handle| seen.insert(handle.to_ascii_lowercase()))
         .take(limit)
         .collect()
+}
+
+pub fn extract_instagram_reels_owner_handles(raw: &Value, limit: usize) -> Vec<String> {
+    let mut seen = HashSet::new();
+    instagram_reels_items(raw)
+        .into_iter()
+        .filter_map(instagram_reel_owner_handle)
+        .filter_map(|handle| clean_handle(&handle))
+        .filter(|handle| seen.insert(handle.to_ascii_lowercase()))
+        .take(limit)
+        .collect()
+}
+
+fn instagram_reels_items(raw: &Value) -> Vec<&Value> {
+    array_at(raw, &["items"])
+        .or_else(|| array_at(raw, &["reels"]))
+        .or_else(|| array_at(raw, &["data"]))
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn instagram_reel_owner_handle(reel: &Value) -> Option<String> {
+    text_at(reel, &["user", "username"])
+        .or_else(|| text_at(reel, &["owner", "username"]))
+        .or_else(|| text_at(reel, &["username"]))
+}
+
+pub fn instagram_candidate_meets_min_dimensions(
+    candidate: &InstagramImageCandidate,
+    min_width: u32,
+    min_height: u32,
+) -> bool {
+    candidate
+        .image_width
+        .map(|width| width >= min_width)
+        .unwrap_or(true)
+        && candidate
+            .image_height
+            .map(|height| height >= min_height)
+            .unwrap_or(true)
 }
 
 pub fn normalize_instagram_user_posts(
