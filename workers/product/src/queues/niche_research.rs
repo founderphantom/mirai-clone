@@ -6,9 +6,10 @@ use crate::domain::visual_reference::{
     VisualReferenceReview,
 };
 use crate::providers::instagram_references::{
-    build_instagram_post_url, build_instagram_profile_url, build_instagram_user_posts_url,
-    normalize_instagram_post_detail, normalize_instagram_profile_related_handles,
-    normalize_instagram_user_posts, InstagramFallbackPolicy, InstagramImageCandidate,
+    build_instagram_post_url, build_instagram_profile_url, build_instagram_reels_search_url,
+    build_instagram_user_posts_url, extract_instagram_reels_owner_handles,
+    normalize_instagram_post_detail, normalize_instagram_user_posts, InstagramFallbackPolicy,
+    InstagramImageCandidate,
 };
 use crate::providers::scrapecreators::{fetch_scrapecreators_json, ScrapeCreatorsError};
 use crate::services::blitz::create_next_batch;
@@ -657,85 +658,34 @@ async fn enqueue_moodboard_reference_research(
         .await;
     }
 
-    let configured = moodboard_handle_map(&config);
-    let profiles_per_moodboard =
-        config_u32(&config, "instagram_profiles_per_moodboard", 3) as usize;
-    let max_profiles_per_run = config_u32(&config, "instagram_max_profiles_per_run", 20) as usize;
-    let base_url = env_var(
-        env,
-        "SCRAPECREATORS_BASE_URL",
-        "scrapecreators_base_url_missing",
-    )?;
-    let now = now_iso_string();
-    let mut queued = count_instagram_profile_sources_for_run(db, clone_id, &run_id).await?;
+    let search_terms_per_moodboard =
+        config_u32(&config, "instagram_search_terms_per_moodboard", 2).max(1);
+    let reels_pages_per_term = config_u32(&config, "instagram_reels_pages_per_term", 1).max(1);
 
+    let mut queued = 0usize;
     for moodboard in moodboards {
-        if queued >= max_profiles_per_run {
-            break;
-        }
-
-        let mut handles = configured
-            .get(&moodboard.slug.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|handle| HandleSeed {
-                handle,
-                discovered_via: "configured_handle".to_string(),
-            })
-            .collect::<Vec<_>>();
-        handles.extend(
-            load_accepted_handles(db, clone_id, &moodboard.id, profiles_per_moodboard as u32)
-                .await?
-                .into_iter()
-                .map(|handle| HandleSeed {
-                    handle,
-                    discovered_via: "accepted_handle".to_string(),
-                }),
+        let terms = selected_search_terms(
+            &moodboard.search_queries_json,
+            &moodboard.slug,
+            &moodboard.title,
+            search_terms_per_moodboard,
         );
 
-        for seed in dedupe_handle_seeds(handles)
-            .into_iter()
-            .take(profiles_per_moodboard)
-        {
-            if queued >= max_profiles_per_run {
-                break;
+        for term in terms {
+            for page in 1..=reels_pages_per_term {
+                env.queue("NICHE_RESEARCH_QUEUE")?
+                    .send(NicheResearchMessage::DiscoverInstagramHandles {
+                        user_id: user_id.to_string(),
+                        clone_id: clone_id.to_string(),
+                        run_id: Some(run_id.to_string()),
+                        moodboard_id: moodboard.id.clone(),
+                        moodboard_slug: moodboard.slug.clone(),
+                        search_term: term.clone(),
+                        page,
+                    })
+                    .await?;
+                queued += 1;
             }
-            let reserved_profile = reserve_instagram_profile_source(
-                db,
-                &base_url,
-                user_id,
-                clone_id,
-                run_id,
-                &moodboard.id,
-                &moodboard.slug,
-                &seed.handle,
-                &seed.discovered_via,
-                0,
-                max_profiles_per_run,
-                &now,
-            )
-            .await?;
-            if !reserved_profile {
-                queued = count_instagram_profile_sources_for_run(db, clone_id, run_id).await?;
-                if queued >= max_profiles_per_run {
-                    break;
-                }
-                continue;
-            }
-            env.queue("NICHE_RESEARCH_QUEUE")?
-                .send(NicheResearchMessage::FetchInstagramProfile {
-                    user_id: user_id.to_string(),
-                    clone_id: clone_id.to_string(),
-                    run_id: Some(run_id.to_string()),
-                    moodboard_id: moodboard.id.clone(),
-                    moodboard_slug: moodboard.slug.clone(),
-                    handle: seed.handle,
-                    discovered_via: seed.discovered_via,
-                    related_depth: 0,
-                })
-                .await?;
-            queued += 1;
         }
     }
 
@@ -745,7 +695,7 @@ async fn enqueue_moodboard_reference_research(
             user_id,
             clone_id,
             research_status_for_phase(ResearchPhase::InsufficientRefs),
-            "no instagram handles configured or previously accepted for selected moodboards",
+            "no moodboard search terms available for selected moodboards",
             Some(run_id),
             Some(run_id),
         )
@@ -757,21 +707,150 @@ async fn enqueue_moodboard_reference_research(
 
 async fn discover_instagram_handles_message(
     db: &D1Database,
-    _env: &Env,
+    env: &Env,
     user_id: &str,
     clone_id: &str,
     run_id: Option<&str>,
-    _moodboard_id: &str,
-    _moodboard_slug: &str,
-    _search_term: &str,
-    _page: u32,
+    moodboard_id: &str,
+    moodboard_slug: &str,
+    search_term: &str,
+    page: u32,
 ) -> WorkerResult<()> {
-    let Some(_run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
+    let Some(run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
         return Ok(());
     };
-    Err(Error::RustError(
-        "discover_instagram_handles_not_implemented".to_string(),
-    ))
+    let status_write = set_clone_research_status_with_run_result(
+        db,
+        user_id,
+        clone_id,
+        research_status_for_phase(ResearchPhase::Scraping),
+        &format!(
+            "discovering instagram handles moodboard={moodboard_slug} term={search_term} page={page}"
+        ),
+        Some(&run_id),
+        Some(&run_id),
+    )
+    .await?;
+    if !status_write_allows_side_effects(status_write) {
+        return Ok(());
+    }
+
+    let config = load_config_map(db).await?;
+    let base_url = env_var(
+        env,
+        "SCRAPECREATORS_BASE_URL",
+        "scrapecreators_base_url_missing",
+    )?;
+    let api_key = env_var(
+        env,
+        "SCRAPECREATORS_API_KEY",
+        "scrapecreators_api_key_missing",
+    )?;
+    let request_url = build_instagram_reels_search_url(&base_url, search_term, Some(page))
+        .map_err(|error| Error::RustError(error.to_string()))?;
+    let now = now_iso_string();
+    let params = instagram_reels_search_source_params(
+        user_id,
+        clone_id,
+        &run_id,
+        moodboard_id,
+        moodboard_slug,
+        search_term,
+        page,
+    );
+    let source_id = upsert_discovery_source(db, &request_url, &params, &now).await?;
+    let raw = match fetch_scrapecreators_json(&request_url, &api_key).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            return handle_scrapecreators_source_failure(
+                db,
+                env,
+                user_id,
+                clone_id,
+                &run_id,
+                &source_id,
+                &params,
+                &error,
+                &now,
+                "instagram_reels_search_source_failed",
+            )
+            .await;
+        }
+    };
+
+    mark_discovery_source_fresh(db, &source_id, &params, &now).await?;
+    let max_handles = config_u32(&config, "instagram_max_handles_per_moodboard", 20).max(1);
+    let max_profiles_per_run = config_u32(&config, "instagram_max_profiles_per_run", 20) as usize;
+    let mut handles = extract_instagram_reels_owner_handles(&raw, max_handles as usize)
+        .into_iter()
+        .map(|handle| HandleSeed {
+            handle,
+            discovered_via: "reels_owner".to_string(),
+        })
+        .collect::<Vec<_>>();
+
+    if page == 1 {
+        handles.extend(
+            load_accepted_handles(db, clone_id, moodboard_id, max_handles)
+                .await?
+                .into_iter()
+                .map(|handle| HandleSeed {
+                    handle,
+                    discovered_via: "learned_related".to_string(),
+                }),
+        );
+    }
+
+    let mut reserved = count_instagram_profile_sources_for_run(db, clone_id, &run_id).await?;
+    for seed in dedupe_handle_seeds(handles)
+        .into_iter()
+        .take(max_handles as usize)
+    {
+        if reserved >= max_profiles_per_run {
+            break;
+        }
+        let reserved_profile = reserve_instagram_profile_source(
+            db,
+            &base_url,
+            user_id,
+            clone_id,
+            &run_id,
+            moodboard_id,
+            moodboard_slug,
+            &seed.handle,
+            &seed.discovered_via,
+            0,
+            max_profiles_per_run,
+            &now,
+        )
+        .await?;
+        if !reserved_profile {
+            reserved = count_instagram_profile_sources_for_run(db, clone_id, &run_id).await?;
+            continue;
+        }
+        env.queue("NICHE_RESEARCH_QUEUE")?
+            .send(NicheResearchMessage::FetchInstagramProfile {
+                user_id: user_id.to_string(),
+                clone_id: clone_id.to_string(),
+                run_id: Some(run_id.clone()),
+                moodboard_id: moodboard_id.to_string(),
+                moodboard_slug: moodboard_slug.to_string(),
+                handle: seed.handle,
+                discovered_via: seed.discovered_via,
+                related_depth: 0,
+            })
+            .await?;
+        reserved += 1;
+    }
+
+    enqueue_delayed_finalize_reference_pool(
+        env,
+        user_id,
+        clone_id,
+        &run_id,
+        "instagram_handle_discovery_completed",
+    )
+    .await
 }
 
 async fn fetch_instagram_profile_message(
@@ -784,7 +863,7 @@ async fn fetch_instagram_profile_message(
     moodboard_slug: &str,
     handle: &str,
     discovered_via: &str,
-    related_depth: u8,
+    _related_depth: u8,
 ) -> WorkerResult<()> {
     let Some(run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
         return Ok(());
@@ -803,7 +882,6 @@ async fn fetch_instagram_profile_message(
         return Ok(());
     }
 
-    let config = load_config_map(db).await?;
     let base_url = env_var(
         env,
         "SCRAPECREATORS_BASE_URL",
@@ -825,7 +903,7 @@ async fn fetch_instagram_profile_message(
         moodboard_slug,
         handle,
         discovered_via,
-        related_depth,
+        _related_depth,
     );
     if current_message_run_id(db, user_id, clone_id, Some(&run_id))
         .await?
@@ -834,8 +912,8 @@ async fn fetch_instagram_profile_message(
         return Ok(());
     }
     let source_id = upsert_discovery_source(db, &request_url, &params, &now).await?;
-    let raw = match fetch_scrapecreators_json(&request_url, &api_key).await {
-        Ok(raw) => raw,
+    match fetch_scrapecreators_json(&request_url, &api_key).await {
+        Ok(_) => {}
         Err(error) => {
             if current_message_run_id(db, user_id, clone_id, Some(&run_id))
                 .await?
@@ -896,57 +974,6 @@ async fn fetch_instagram_profile_message(
             page: 0,
         })
         .await?;
-
-    if related_depth == 0 {
-        let related_limit = config_u32(&config, "instagram_related_profiles_per_seed", 2) as usize;
-        let max_profiles_per_run =
-            config_u32(&config, "instagram_max_profiles_per_run", 20) as usize;
-        let mut reserved = count_instagram_profile_sources_for_run(db, clone_id, &run_id).await?;
-        let seed_handle_key = handle.trim().trim_start_matches('@').to_ascii_lowercase();
-        for related_handle in normalize_instagram_profile_related_handles(&raw, related_limit)
-            .into_iter()
-            .filter(|related| related.to_ascii_lowercase() != seed_handle_key)
-        {
-            if reserved >= max_profiles_per_run {
-                break;
-            }
-            let reserved_profile = reserve_instagram_profile_source(
-                db,
-                &base_url,
-                user_id,
-                clone_id,
-                &run_id,
-                moodboard_id,
-                moodboard_slug,
-                &related_handle,
-                "related_profile",
-                1,
-                max_profiles_per_run,
-                &now,
-            )
-            .await?;
-            if !reserved_profile {
-                reserved = count_instagram_profile_sources_for_run(db, clone_id, &run_id).await?;
-                if reserved >= max_profiles_per_run {
-                    break;
-                }
-                continue;
-            }
-            env.queue("NICHE_RESEARCH_QUEUE")?
-                .send(NicheResearchMessage::FetchInstagramProfile {
-                    user_id: user_id.to_string(),
-                    clone_id: clone_id.to_string(),
-                    run_id: Some(run_id.clone()),
-                    moodboard_id: moodboard_id.to_string(),
-                    moodboard_slug: moodboard_slug.to_string(),
-                    handle: related_handle,
-                    discovered_via: "related_profile".to_string(),
-                    related_depth: 1,
-                })
-                .await?;
-            reserved += 1;
-        }
-    }
 
     Ok(())
 }
@@ -2712,7 +2739,7 @@ fn finalize_pending_discovery_work_sql() -> &'static str {
             AND CAST(json_extract(ds.params_json, '$.cloneId') AS TEXT) = ?
             AND CAST(json_extract(ds.params_json, '$.runId') AS TEXT) = ?
             AND CAST(json_extract(ds.params_json, '$.requestType') AS TEXT)
-              IN ('instagram_profile', 'instagram_user_posts', 'instagram_post_detail')
+              IN ('instagram_reels_search', 'instagram_profile', 'instagram_user_posts', 'instagram_post_detail')
           UNION ALL
           SELECT profile.id
           FROM discovery_sources profile
@@ -2954,6 +2981,28 @@ fn instagram_profile_source_params(
         "discoveredVia": discovered_via,
         "relatedDepth": related_depth,
         "requestType": "instagram_profile",
+    })
+}
+
+fn instagram_reels_search_source_params(
+    user_id: &str,
+    clone_id: &str,
+    run_id: &str,
+    moodboard_id: &str,
+    moodboard_slug: &str,
+    search_term: &str,
+    page: u32,
+) -> Value {
+    json!({
+        "cloneId": clone_id,
+        "userId": user_id,
+        "runId": run_id,
+        "platform": "instagram",
+        "moodboardId": moodboard_id,
+        "moodboardSlug": moodboard_slug,
+        "searchTerm": search_term.trim(),
+        "page": page,
+        "requestType": "instagram_reels_search",
     })
 }
 
@@ -4397,23 +4446,36 @@ async fn current_message_run_id(
     Ok(Some(run_id.to_string()))
 }
 
-fn moodboard_handle_map(config: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
-    config
-        .get("moodboard_instagram_handles_json")
-        .and_then(|value| serde_json::from_str::<HashMap<String, Vec<String>>>(value).ok())
+fn selected_search_terms(
+    search_queries_json: &str,
+    moodboard_slug: &str,
+    moodboard_title: &str,
+    limit: u32,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut terms = serde_json::from_str::<Vec<String>>(search_queries_json)
         .unwrap_or_default()
         .into_iter()
-        .map(|(slug, handles)| (slug.trim().to_ascii_lowercase(), dedupe_handles(handles)))
-        .collect()
-}
+        .filter_map(|term| {
+            let trimmed = term.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .filter(|term| seen.insert(term.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
 
-fn dedupe_handles(handles: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    handles
+    if terms.is_empty() {
+        for fallback in [moodboard_title, moodboard_slug] {
+            let trimmed = fallback.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_ascii_lowercase()) {
+                terms.push(trimmed.to_string());
+            }
+        }
+    }
+
+    terms
         .into_iter()
-        .filter_map(|handle| normalize_instagram_handle(&handle))
-        .filter(|handle| seen.insert(handle.to_ascii_lowercase()))
-        .collect()
+        .take(limit.max(1) as usize)
+        .collect::<Vec<_>>()
 }
 
 fn dedupe_handle_seeds(handles: Vec<HandleSeed>) -> Vec<HandleSeed> {
@@ -5169,12 +5231,29 @@ mod tests {
         assert!(handle_message.contains("research_moodboard_references("));
         assert!(research_kickoff.contains("start_visual_reference_research_run("));
         assert!(research_kickoff.contains("enqueue_moodboard_reference_research("));
-        assert!(enqueue_research.contains("reserve_instagram_profile_source("));
-        assert!(enqueue_research.contains("NicheResearchMessage::FetchInstagramProfile"));
+        assert!(enqueue_research.contains("NicheResearchMessage::DiscoverInstagramHandles"));
+        assert!(enqueue_research.contains("selected_search_terms("));
+        assert!(!enqueue_research.contains("moodboard_handle_map("));
+        assert!(!enqueue_research.contains("configured_handle"));
 
         assert_no_old_text_research_or_reels_search(handle_message);
         assert_no_old_text_research_or_reels_search(research_kickoff);
         assert_no_old_text_research_or_reels_search(enqueue_research);
+    }
+
+    #[test]
+    fn search_term_selection_is_trimmed_deduped_and_bounded() {
+        let terms = selected_search_terms(
+            r#"[" flash fashion ", "Flash Fashion", "", "street creator"]"#,
+            "flash-editorial",
+            "Flash Editorial",
+            2,
+        );
+
+        assert_eq!(
+            terms,
+            vec!["flash fashion".to_string(), "street creator".to_string()]
+        );
     }
 
     #[test]
@@ -5701,9 +5780,9 @@ mod tests {
         let sql = finalize_pending_discovery_work_sql();
 
         assert!(sql.contains("ds.status = 'refreshing'"));
-        assert!(
-            sql.contains("'instagram_profile', 'instagram_user_posts', 'instagram_post_detail'")
-        );
+        assert!(sql.contains(
+            "'instagram_reels_search', 'instagram_profile', 'instagram_user_posts', 'instagram_post_detail'"
+        ));
         assert!(sql.contains("profile.status = 'fresh'"));
         assert!(sql.contains("NOT EXISTS"));
         assert!(sql.contains("= 'instagram_user_posts'"));
