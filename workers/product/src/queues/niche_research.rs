@@ -37,6 +37,16 @@ pub enum NicheResearchMessage {
         moodboard_ids: Vec<String>,
         reason: String,
     },
+    DiscoverInstagramHandles {
+        user_id: String,
+        clone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        moodboard_id: String,
+        moodboard_slug: String,
+        search_term: String,
+        page: u32,
+    },
     FetchInstagramProfile {
         user_id: String,
         clone_id: String,
@@ -77,6 +87,20 @@ pub enum NicheResearchMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_id: Option<String>,
         limit: u32,
+    },
+    CleanupApprovedReference {
+        user_id: String,
+        clone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        candidate_id: String,
+    },
+    ValidateCloneCompatibility {
+        user_id: String,
+        clone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        candidate_id: String,
     },
     CacheApprovedReference {
         user_id: String,
@@ -242,6 +266,17 @@ fn message_failure_context(
             run_id: kickoff_run_id.map(str::to_string),
             message_type: "research_moodboard_references",
         },
+        NicheResearchMessage::DiscoverInstagramHandles {
+            user_id,
+            clone_id,
+            run_id,
+            ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: run_id.clone(),
+            message_type: "discover_instagram_handles",
+        },
         NicheResearchMessage::FetchInstagramProfile {
             user_id,
             clone_id,
@@ -285,6 +320,28 @@ fn message_failure_context(
             clone_id: clone_id.clone(),
             run_id: run_id.clone(),
             message_type: "review_visual_candidates",
+        },
+        NicheResearchMessage::CleanupApprovedReference {
+            user_id,
+            clone_id,
+            run_id,
+            ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: run_id.clone(),
+            message_type: "cleanup_approved_reference",
+        },
+        NicheResearchMessage::ValidateCloneCompatibility {
+            user_id,
+            clone_id,
+            run_id,
+            ..
+        } => MessageFailureContext {
+            user_id: user_id.clone(),
+            clone_id: clone_id.clone(),
+            run_id: run_id.clone(),
+            message_type: "validate_clone_compatibility",
         },
         NicheResearchMessage::CacheApprovedReference {
             user_id,
@@ -340,6 +397,28 @@ async fn handle_message(
                 &moodboard_ids,
                 &reason,
                 kickoff_run_id,
+            )
+            .await
+        }
+        NicheResearchMessage::DiscoverInstagramHandles {
+            user_id,
+            clone_id,
+            run_id,
+            moodboard_id,
+            moodboard_slug,
+            search_term,
+            page,
+        } => {
+            discover_instagram_handles_message(
+                &db,
+                env,
+                &user_id,
+                &clone_id,
+                run_id.as_deref(),
+                &moodboard_id,
+                &moodboard_slug,
+                &search_term,
+                page,
             )
             .await
         }
@@ -430,6 +509,38 @@ async fn handle_message(
                 &clone_id,
                 run_id.as_deref(),
                 limit,
+            )
+            .await
+        }
+        NicheResearchMessage::CleanupApprovedReference {
+            user_id,
+            clone_id,
+            run_id,
+            candidate_id,
+        } => {
+            cleanup_approved_reference_message(
+                &db,
+                env,
+                &user_id,
+                &clone_id,
+                run_id.as_deref(),
+                &candidate_id,
+            )
+            .await
+        }
+        NicheResearchMessage::ValidateCloneCompatibility {
+            user_id,
+            clone_id,
+            run_id,
+            candidate_id,
+        } => {
+            validate_clone_compatibility_message(
+                &db,
+                env,
+                &user_id,
+                &clone_id,
+                run_id.as_deref(),
+                &candidate_id,
             )
             .await
         }
@@ -642,6 +753,25 @@ async fn enqueue_moodboard_reference_research(
     }
 
     Ok(())
+}
+
+async fn discover_instagram_handles_message(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    run_id: Option<&str>,
+    _moodboard_id: &str,
+    _moodboard_slug: &str,
+    _search_term: &str,
+    _page: u32,
+) -> WorkerResult<()> {
+    let Some(_run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
+        return Ok(());
+    };
+    Err(Error::RustError(
+        "discover_instagram_handles_not_implemented".to_string(),
+    ))
 }
 
 async fn fetch_instagram_profile_message(
@@ -1440,6 +1570,38 @@ async fn review_visual_candidates_message(
     }
 
     Ok(())
+}
+
+async fn cleanup_approved_reference_message(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    run_id: Option<&str>,
+    _candidate_id: &str,
+) -> WorkerResult<()> {
+    let Some(_run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
+        return Ok(());
+    };
+    Err(Error::RustError(
+        "cleanup_approved_reference_not_implemented".to_string(),
+    ))
+}
+
+async fn validate_clone_compatibility_message(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    run_id: Option<&str>,
+    _candidate_id: &str,
+) -> WorkerResult<()> {
+    let Some(_run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
+        return Ok(());
+    };
+    Err(Error::RustError(
+        "validate_clone_compatibility_not_implemented".to_string(),
+    ))
 }
 
 async fn cache_approved_reference_message(
@@ -5055,6 +5217,66 @@ mod tests {
                 && moodboard_ids == vec!["moodboard_1".to_string(), "moodboard_2".to_string()]
                 && reason == "onboarding_selection"
         ));
+    }
+
+    #[test]
+    fn pipeline_v2_messages_serialize_as_queue_contract() {
+        let discover = NicheResearchMessage::DiscoverInstagramHandles {
+            user_id: "user_1".to_string(),
+            clone_id: "clone_1".to_string(),
+            run_id: Some("run_1".to_string()),
+            moodboard_id: "moodboard_1".to_string(),
+            moodboard_slug: "flash-editorial".to_string(),
+            search_term: "flash fashion".to_string(),
+            page: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(&discover).unwrap(),
+            json!({
+                "type": "discover_instagram_handles",
+                "userId": "user_1",
+                "cloneId": "clone_1",
+                "runId": "run_1",
+                "moodboardId": "moodboard_1",
+                "moodboardSlug": "flash-editorial",
+                "searchTerm": "flash fashion",
+                "page": 1
+            })
+        );
+
+        let cleanup = NicheResearchMessage::CleanupApprovedReference {
+            user_id: "user_1".to_string(),
+            clone_id: "clone_1".to_string(),
+            run_id: Some("run_1".to_string()),
+            candidate_id: "candidate_1".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&cleanup).unwrap(),
+            json!({
+                "type": "cleanup_approved_reference",
+                "userId": "user_1",
+                "cloneId": "clone_1",
+                "runId": "run_1",
+                "candidateId": "candidate_1"
+            })
+        );
+
+        let compatibility = NicheResearchMessage::ValidateCloneCompatibility {
+            user_id: "user_1".to_string(),
+            clone_id: "clone_1".to_string(),
+            run_id: Some("run_1".to_string()),
+            candidate_id: "candidate_1".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&compatibility).unwrap(),
+            json!({
+                "type": "validate_clone_compatibility",
+                "userId": "user_1",
+                "cloneId": "clone_1",
+                "runId": "run_1",
+                "candidateId": "candidate_1"
+            })
+        );
     }
 
     #[test]
