@@ -11,6 +11,7 @@ pub mod services;
 
 pub use providers::instagram_references;
 pub use providers::scrapecreators;
+pub use providers::seedream;
 
 use serde_json::Value;
 use worker::{

@@ -25,6 +25,8 @@
     "DISCOVERY_DEFAULT_REGION": "US",
     "HIGGSFIELD_API_URL": "https://fnf.higgsfield.ai",
     "HIGGSFIELD_MCP_GENERATION_TOOL": "generate_image",
+    "HIGGSFIELD_MCP_CLEANUP_TOOL": "generate_image",
+    "HIGGSFIELD_MCP_CLEANUP_MODEL": "seedream_5_lite",
     "BLITZ_BATCH_STALE_MINUTES": "45"
   },
   "services": [

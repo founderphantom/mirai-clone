@@ -5,3 +5,4 @@ pub mod higgsfield_auth;
 pub mod higgsfield_mcp;
 pub mod instagram_references;
 pub mod scrapecreators;
+pub mod seedream;

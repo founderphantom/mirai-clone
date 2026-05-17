@@ -35,6 +35,10 @@ use mirai_product_worker::scrapecreators::{
     build_scrape_request, normalize_instagram_reels_search, normalize_tiktok_keyword_search,
     scrape_platform_from_str, ScrapePlatform,
 };
+use mirai_product_worker::seedream::{
+    cleanup_prompt, extract_seedream_cleaned_image_url, seedream_cleanup_arguments,
+    SEEDREAM_CLEANUP_MODEL,
+};
 use mirai_product_worker::services::accounts::{
     account_checkout_enabled, account_entitlement_snapshot, account_portal_enabled,
     account_usage_limits, VerifiedIdentity,
@@ -144,6 +148,54 @@ fn visual_reference_pipeline_schema_has_required_columns_and_config() {
     assert!(migration.contains("visual_reference_cleanup_retry_limit"));
     assert!(migration.contains("visual_reference_compatibility_retry_limit"));
     assert!(migration.contains("clone_compatibility_reference_limit"));
+}
+
+#[test]
+fn seedream_cleanup_prompt_is_exact_text_only_instruction() {
+    assert_eq!(
+        cleanup_prompt(),
+        "Remove only the visible text from this image. Keep every non-text part of the image exactly the same."
+    );
+    let lower = cleanup_prompt().to_ascii_lowercase();
+    for forbidden in [
+        "identity",
+        "style",
+        "clothing",
+        "background",
+        "generate",
+        "face",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "{forbidden} must not appear in cleanup prompt"
+        );
+    }
+}
+
+#[test]
+fn seedream_cleanup_arguments_use_lite_model_and_uploaded_reference() {
+    let args = seedream_cleanup_arguments("uploaded_media_1");
+
+    assert_eq!(args["params"]["model"], SEEDREAM_CLEANUP_MODEL);
+    assert_eq!(args["params"]["prompt"], cleanup_prompt());
+    assert_eq!(args["params"]["medias"][0]["role"], "image");
+    assert_eq!(args["params"]["medias"][0]["value"], "uploaded_media_1");
+}
+
+#[test]
+fn seedream_response_extracts_cleaned_image_url() {
+    let wrapped = json!({
+        "result": {
+            "content": [{
+                "text": "{\"result\":{\"images\":[{\"url\":\"https://cdn.example.com/cleaned.webp\"}],\"id\":\"job_1\"}}"
+            }]
+        }
+    });
+
+    assert_eq!(
+        extract_seedream_cleaned_image_url(&wrapped).as_deref(),
+        Some("https://cdn.example.com/cleaned.webp")
+    );
 }
 
 #[test]
