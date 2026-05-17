@@ -661,8 +661,14 @@ async fn enqueue_moodboard_reference_research(
     let search_terms_per_moodboard =
         config_u32(&config, "instagram_search_terms_per_moodboard", 2).max(1);
     let reels_pages_per_term = config_u32(&config, "instagram_reels_pages_per_term", 1).max(1);
+    let base_url = env_var(
+        env,
+        "SCRAPECREATORS_BASE_URL",
+        "scrapecreators_base_url_missing",
+    )?;
+    let now = now_iso_string();
 
-    let mut queued = 0usize;
+    let mut available_searches = 0usize;
     for moodboard in moodboards {
         let terms = selected_search_terms(
             &moodboard.search_queries_json,
@@ -673,6 +679,23 @@ async fn enqueue_moodboard_reference_research(
 
         for term in terms {
             for page in 1..=reels_pages_per_term {
+                available_searches += 1;
+                let reserved_search = reserve_instagram_reels_search_source(
+                    db,
+                    &base_url,
+                    user_id,
+                    clone_id,
+                    run_id,
+                    &moodboard.id,
+                    &moodboard.slug,
+                    &term,
+                    page,
+                    &now,
+                )
+                .await?;
+                if !reserved_search {
+                    continue;
+                }
                 env.queue("NICHE_RESEARCH_QUEUE")?
                     .send(NicheResearchMessage::DiscoverInstagramHandles {
                         user_id: user_id.to_string(),
@@ -684,12 +707,11 @@ async fn enqueue_moodboard_reference_research(
                         page,
                     })
                     .await?;
-                queued += 1;
             }
         }
     }
 
-    if queued == 0 {
+    if available_searches == 0 {
         set_clone_research_status_with_run(
             db,
             user_id,
@@ -762,6 +784,12 @@ async fn discover_instagram_handles_message(
     let raw = match fetch_scrapecreators_json(&request_url, &api_key).await {
         Ok(raw) => raw,
         Err(error) => {
+            if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
             return handle_scrapecreators_source_failure(
                 db,
                 env,
@@ -777,6 +805,12 @@ async fn discover_instagram_handles_message(
             .await;
         }
     };
+    if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
 
     mark_discovery_source_fresh(db, &source_id, &params, &now).await?;
     let max_handles = config_u32(&config, "instagram_max_handles_per_moodboard", 20).max(1);
@@ -3125,6 +3159,32 @@ async fn reserve_instagram_profile_source(
     .await
 }
 
+async fn reserve_instagram_reels_search_source(
+    db: &D1Database,
+    base_url: &str,
+    user_id: &str,
+    clone_id: &str,
+    run_id: &str,
+    moodboard_id: &str,
+    moodboard_slug: &str,
+    search_term: &str,
+    page: u32,
+    now: &str,
+) -> WorkerResult<bool> {
+    let request_url = build_instagram_reels_search_url(base_url, search_term, Some(page))
+        .map_err(|error| Error::RustError(error.to_string()))?;
+    let params = instagram_reels_search_source_params(
+        user_id,
+        clone_id,
+        run_id,
+        moodboard_id,
+        moodboard_slug,
+        search_term,
+        page,
+    );
+    reserve_discovery_source_if_missing(db, &request_url, &params, now).await
+}
+
 async fn reserve_instagram_posts_source(
     db: &D1Database,
     base_url: &str,
@@ -5263,6 +5323,47 @@ mod tests {
         );
         assert!(discover.contains("load_accepted_handles(db, clone_id, moodboard_id, max_handles)"));
         assert!(!discover.contains(".take(max_handles as usize)"));
+    }
+
+    #[test]
+    fn kickoff_reserves_reels_search_source_before_queue_send() {
+        let source = include_str!("niche_research.rs");
+        let enqueue_research =
+            function_body(source, "async fn enqueue_moodboard_reference_research");
+
+        let reserve_pos = enqueue_research
+            .find("reserve_instagram_reels_search_source(")
+            .expect("kickoff should reserve reels search discovery source");
+        let send_pos = enqueue_research
+            .find(".send(NicheResearchMessage::DiscoverInstagramHandles")
+            .expect("kickoff should send reels discovery message");
+
+        assert!(reserve_pos < send_pos);
+        assert!(enqueue_research.contains("if !reserved_search {"));
+    }
+
+    #[test]
+    fn handle_discovery_rechecks_run_after_reels_fetch_before_side_effects() {
+        let source = include_str!("niche_research.rs");
+        let discover = function_body(source, "async fn discover_instagram_handles_message");
+
+        let fetch_pos = discover
+            .find("fetch_scrapecreators_json(&request_url, &api_key)")
+            .expect("reels handler should fetch scrapecreators json");
+        let stale_guard_pos = discover[fetch_pos..]
+            .find("current_message_run_id(db, user_id, clone_id, Some(&run_id))")
+            .map(|offset| fetch_pos + offset)
+            .expect("reels handler should recheck current run after fetch");
+        let mark_fresh_pos = discover
+            .find("mark_discovery_source_fresh(")
+            .expect("reels handler should mark source fresh");
+        let reserve_profile_pos = discover
+            .find("reserve_instagram_profile_source(")
+            .expect("reels handler should reserve profile sources");
+
+        assert!(fetch_pos < stale_guard_pos);
+        assert!(stale_guard_pos < mark_fresh_pos);
+        assert!(stale_guard_pos < reserve_profile_pos);
     }
 
     #[test]
