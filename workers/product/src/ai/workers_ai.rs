@@ -70,6 +70,18 @@ pub struct WorkersAiChoiceMessage {
     pub content: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneCompatibilityReview {
+    pub compatible: bool,
+    pub body_proportions_compatible: bool,
+    pub hair_length_compatible: bool,
+    pub facial_hair_compatible: bool,
+    pub rejection_reason: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
 pub async fn run_text_json<T: DeserializeOwned>(ai: &Ai, prompt: &str) -> WorkerResult<T> {
     let input = text_json_input(prompt);
 
@@ -86,6 +98,18 @@ pub async fn run_vision_json<T: DeserializeOwned>(
 ) -> WorkerResult<T> {
     let input = vision_json_input(prompt, image_url);
 
+    let response = ai
+        .run::<_, WorkersAiTextResponse>(KIMI_K2_6_MODEL, input)
+        .await?;
+    decode_structured_response(response)
+}
+
+pub async fn run_multi_vision_json<T: DeserializeOwned>(
+    ai: &Ai,
+    prompt: &str,
+    image_urls: &[String],
+) -> WorkerResult<T> {
+    let input = multi_vision_json_input(prompt, image_urls);
     let response = ai
         .run::<_, WorkersAiTextResponse>(KIMI_K2_6_MODEL, input)
         .await?;
@@ -121,6 +145,34 @@ pub fn vision_json_input<'a>(prompt: &'a str, image_url: &'a str) -> WorkersAiIn
                     image_url: Some(WorkersAiImageUrl { url: image_url }),
                 },
             ]),
+        }],
+        response_format: WorkersAiResponseFormat {
+            kind: "json_object",
+        },
+        temperature: 0.1,
+    }
+}
+
+pub fn multi_vision_json_input<'a>(
+    prompt: &'a str,
+    image_urls: &'a [String],
+) -> WorkersAiInput<'a> {
+    let mut content = vec![WorkersAiContentPart {
+        kind: "text",
+        text: Some(prompt),
+        image_url: None,
+    }];
+    for url in image_urls {
+        content.push(WorkersAiContentPart {
+            kind: "image_url",
+            text: None,
+            image_url: Some(WorkersAiImageUrl { url }),
+        });
+    }
+    WorkersAiInput {
+        messages: vec![WorkersAiMessage {
+            role: "user",
+            content: WorkersAiMessageContent::Parts(content),
         }],
         response_format: WorkersAiResponseFormat {
             kind: "json_object",
@@ -385,6 +437,31 @@ Routing: If the source moodboard is not the best fit but another selected moodbo
 
 Generation safety: Do not copy identity, face, likeness, exact clothing, exact outfit, exact background, unique marks, source handle, source caption, or source post text. Extract only pose, framing, lighting, scene type, camera feel, styling energy, and art direction."#,
         input_json = input_json
+    )
+}
+
+pub fn clone_compatibility_prompt(clone_reference_count: usize) -> String {
+    format!(
+        r#"Compare the first image to the following {clone_reference_count} clone reference image(s).
+
+The first image is a cleaned visual reference candidate. The remaining image(s) are the clone's own training references.
+
+Return exactly one strict JSON object:
+{{
+  "compatible": boolean,
+  "bodyProportionsCompatible": boolean,
+  "hairLengthCompatible": boolean,
+  "facialHairCompatible": boolean,
+  "rejectionReason": string | null,
+  "reason": string
+}}
+
+Accept only if the cleaned candidate is physically compatible enough for Soul-based generation:
+- similar body proportions
+- similar hair length
+- matching facial-hair presence or absence when facial hair is relevant
+
+Do not require the same face, identity, clothing, outfit, background, pose, lighting, camera, or scene. The clone identity comes from the Soul. This review is only a pre-generation compatibility gate for body proportions, hair length, and facial hair."#
     )
 }
 

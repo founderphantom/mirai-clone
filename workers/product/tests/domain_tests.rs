@@ -1,8 +1,9 @@
 use mirai_product_worker::ai::model_router::{choose_model, clamp_moderation_level, ModelConfig};
 use mirai_product_worker::ai::tasks::AiTask;
 use mirai_product_worker::ai::workers_ai::{
-    human_presence_prompt, is_workers_ai_upstream_timeout, knowledge_extraction_prompt,
-    seed_extraction_prompt, visual_reference_review_prompt, KIMI_K2_6_MODEL,
+    clone_compatibility_prompt, human_presence_prompt, is_workers_ai_upstream_timeout,
+    knowledge_extraction_prompt, multi_vision_json_input, seed_extraction_prompt,
+    visual_reference_review_prompt, CloneCompatibilityReview, KIMI_K2_6_MODEL,
 };
 use mirai_product_worker::domain::blitz::{
     accumulate_influence, can_accept_human_presence, classify_freshness, daily_generation_limit,
@@ -16,9 +17,9 @@ use mirai_product_worker::domain::media_validation::{
 };
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
 use mirai_product_worker::domain::visual_reference::{
-    accept_visual_review, rank_candidates_for_review, selected_moodboard_count_is_valid,
-    visual_review_tags, CandidateDiversityCaps, MoodboardBrief, VisualCandidateForRanking,
-    VisualReferenceReview,
+    accept_clone_compatibility, accept_visual_review, rank_candidates_for_review,
+    selected_moodboard_count_is_valid, visual_review_tags, CandidateDiversityCaps, MoodboardBrief,
+    VisualCandidateForRanking, VisualReferenceReview,
 };
 use mirai_product_worker::instagram_references::{
     build_instagram_post_url, build_instagram_profile_url, build_instagram_reels_search_url,
@@ -2507,6 +2508,65 @@ fn visual_review_accepts_one_likely_adult_editorial_portrait() {
     assert_eq!(accepted.moodboard_slug, "flash-editorial");
     assert_eq!(accepted.niche_cluster, "flash-editorial");
     assert!(visual_review_tags(&review).contains(&"direct flash".to_string()));
+}
+
+#[test]
+fn clone_compatibility_prompt_checks_only_body_hair_and_facial_hair() {
+    let prompt = clone_compatibility_prompt(3);
+    let lower = prompt.to_ascii_lowercase();
+
+    assert!(lower.contains("body proportions"));
+    assert!(lower.contains("hair length"));
+    assert!(lower.contains("facial hair"));
+    assert!(!lower.contains("gender"));
+    assert!(!lower.contains("same clothing"));
+    assert!(!lower.contains("same background"));
+}
+
+#[test]
+fn multi_vision_payload_contains_candidate_and_clone_images() {
+    let image_urls = vec![
+        "https://cdn.example.com/cleaned.webp".to_string(),
+        "data:image/jpeg;base64,abc".to_string(),
+    ];
+    let input = multi_vision_json_input("Compare these", &image_urls);
+    let value = serde_json::to_value(input).unwrap();
+
+    assert_eq!(value["messages"][0]["content"][0]["type"], "text");
+    assert_eq!(
+        value["messages"][0]["content"][1]["image_url"]["url"],
+        "https://cdn.example.com/cleaned.webp"
+    );
+    assert_eq!(
+        value["messages"][0]["content"][2]["image_url"]["url"],
+        "data:image/jpeg;base64,abc"
+    );
+}
+
+#[test]
+fn clone_compatibility_acceptance_requires_all_v1_signals() {
+    let accepted = CloneCompatibilityReview {
+        compatible: true,
+        body_proportions_compatible: true,
+        hair_length_compatible: true,
+        facial_hair_compatible: true,
+        rejection_reason: None,
+        reason: "compatible".to_string(),
+    };
+    assert_eq!(accept_clone_compatibility(&accepted), Ok(()));
+
+    let mismatch = CloneCompatibilityReview {
+        facial_hair_compatible: false,
+        compatible: true,
+        body_proportions_compatible: true,
+        hair_length_compatible: true,
+        rejection_reason: Some("facial hair mismatch".to_string()),
+        reason: "facial hair mismatch".to_string(),
+    };
+    assert_eq!(
+        accept_clone_compatibility(&mismatch),
+        Err("facial_hair_mismatch")
+    );
 }
 
 #[test]

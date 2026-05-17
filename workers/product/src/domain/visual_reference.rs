@@ -130,6 +130,24 @@ pub fn accept_visual_review(
     })
 }
 
+pub fn accept_clone_compatibility(
+    review: &crate::ai::workers_ai::CloneCompatibilityReview,
+) -> Result<(), &'static str> {
+    if !review.compatible {
+        return Err("clone_mismatch");
+    }
+    if !review.body_proportions_compatible {
+        return Err("body_proportions_mismatch");
+    }
+    if !review.hair_length_compatible {
+        return Err("hair_length_mismatch");
+    }
+    if !review.facial_hair_compatible {
+        return Err("facial_hair_mismatch");
+    }
+    Ok(())
+}
+
 pub fn visual_review_tags(review: &VisualReferenceReview) -> Vec<String> {
     let mut tags = Vec::new();
 
