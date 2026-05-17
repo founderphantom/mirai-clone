@@ -2545,28 +2545,55 @@ fn multi_vision_payload_contains_candidate_and_clone_images() {
 
 #[test]
 fn clone_compatibility_acceptance_requires_all_v1_signals() {
-    let accepted = CloneCompatibilityReview {
+    let accepted = compatible_clone_review();
+    assert_eq!(accept_clone_compatibility(&accepted), Ok(()));
+
+    let mut clone_mismatch = compatible_clone_review();
+    clone_mismatch.compatible = false;
+    clone_mismatch.rejection_reason = Some("clone mismatch".to_string());
+    clone_mismatch.reason = "clone mismatch".to_string();
+    assert_eq!(
+        accept_clone_compatibility(&clone_mismatch),
+        Err("clone_mismatch")
+    );
+
+    let mut body_mismatch = compatible_clone_review();
+    body_mismatch.body_proportions_compatible = false;
+    body_mismatch.rejection_reason = Some("body proportions mismatch".to_string());
+    body_mismatch.reason = "body proportions mismatch".to_string();
+    assert_eq!(
+        accept_clone_compatibility(&body_mismatch),
+        Err("body_proportions_mismatch")
+    );
+
+    let mut hair_length_mismatch = compatible_clone_review();
+    hair_length_mismatch.hair_length_compatible = false;
+    hair_length_mismatch.rejection_reason = Some("hair length mismatch".to_string());
+    hair_length_mismatch.reason = "hair length mismatch".to_string();
+    assert_eq!(
+        accept_clone_compatibility(&hair_length_mismatch),
+        Err("hair_length_mismatch")
+    );
+
+    let mut facial_hair_mismatch = compatible_clone_review();
+    facial_hair_mismatch.facial_hair_compatible = false;
+    facial_hair_mismatch.rejection_reason = Some("facial hair mismatch".to_string());
+    facial_hair_mismatch.reason = "facial hair mismatch".to_string();
+    assert_eq!(
+        accept_clone_compatibility(&facial_hair_mismatch),
+        Err("facial_hair_mismatch")
+    );
+}
+
+fn compatible_clone_review() -> CloneCompatibilityReview {
+    CloneCompatibilityReview {
         compatible: true,
         body_proportions_compatible: true,
         hair_length_compatible: true,
         facial_hair_compatible: true,
         rejection_reason: None,
         reason: "compatible".to_string(),
-    };
-    assert_eq!(accept_clone_compatibility(&accepted), Ok(()));
-
-    let mismatch = CloneCompatibilityReview {
-        facial_hair_compatible: false,
-        compatible: true,
-        body_proportions_compatible: true,
-        hair_length_compatible: true,
-        rejection_reason: Some("facial hair mismatch".to_string()),
-        reason: "facial hair mismatch".to_string(),
-    };
-    assert_eq!(
-        accept_clone_compatibility(&mismatch),
-        Err("facial_hair_mismatch")
-    );
+    }
 }
 
 #[test]
