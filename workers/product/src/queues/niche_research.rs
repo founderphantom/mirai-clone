@@ -8,8 +8,8 @@ use crate::domain::visual_reference::{
 use crate::providers::instagram_references::{
     build_instagram_post_url, build_instagram_profile_url, build_instagram_reels_search_url,
     build_instagram_user_posts_url, extract_instagram_reels_owner_handles,
-    normalize_instagram_post_detail, normalize_instagram_user_posts, InstagramFallbackPolicy,
-    InstagramImageCandidate,
+    instagram_candidate_meets_min_dimensions, normalize_instagram_post_detail,
+    normalize_instagram_user_posts, InstagramFallbackPolicy, InstagramImageCandidate,
 };
 use crate::providers::scrapecreators::{fetch_scrapecreators_json, ScrapeCreatorsError};
 use crate::services::blitz::create_next_batch;
@@ -1103,6 +1103,8 @@ async fn fetch_instagram_posts_message(
     }
 
     let images_per_post = config_u32(&config, "instagram_images_per_post", 3) as usize;
+    let min_width = config_u32(&config, "instagram_min_image_width", 512);
+    let min_height = config_u32(&config, "instagram_min_image_height", 512);
     let posts_per_profile = config_u32(&config, "instagram_posts_per_profile", 12) as usize;
     let candidate_cap = posts_per_profile
         .saturating_mul(images_per_post)
@@ -1118,7 +1120,13 @@ async fn fetch_instagram_posts_message(
     );
     let post_detail_targets =
         instagram_post_detail_targets(&raw, &candidates, images_per_post, posts_per_profile);
-    for candidate in candidates.into_iter().take(candidate_cap) {
+    for candidate in candidates
+        .into_iter()
+        .filter(|candidate| {
+            instagram_candidate_meets_min_dimensions(candidate, min_width, min_height)
+        })
+        .take(candidate_cap)
+    {
         insert_instagram_candidate(db, user_id, clone_id, &run_id, &source_id, &candidate, &now)
             .await?;
     }
@@ -1299,6 +1307,8 @@ async fn fetch_instagram_post_detail_message(
     }
 
     let images_per_post = config_u32(&config, "instagram_images_per_post", 3) as usize;
+    let min_width = config_u32(&config, "instagram_min_image_width", 512);
+    let min_height = config_u32(&config, "instagram_min_image_height", 512);
     let candidates = normalize_instagram_post_detail(
         &raw,
         handle,
@@ -1308,7 +1318,9 @@ async fn fetch_instagram_post_detail_message(
         discovered_via,
         images_per_post,
     );
-    for candidate in candidates {
+    for candidate in candidates.into_iter().filter(|candidate| {
+        instagram_candidate_meets_min_dimensions(candidate, min_width, min_height)
+    }) {
         insert_instagram_candidate(db, user_id, clone_id, &run_id, &source_id, &candidate, &now)
             .await?;
     }
@@ -5379,6 +5391,16 @@ mod tests {
             .expect("reels handler should mark source fresh");
 
         assert!(reserve_profile_pos < mark_fresh_pos);
+    }
+
+    #[test]
+    fn posts_message_applies_min_dimension_gate_before_insert() {
+        let source = include_str!("niche_research.rs");
+        let body = function_body(source, "async fn fetch_instagram_posts_message");
+
+        assert!(body.contains("instagram_min_image_width"));
+        assert!(body.contains("instagram_min_image_height"));
+        assert!(body.contains("instagram_candidate_meets_min_dimensions"));
     }
 
     #[test]

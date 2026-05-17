@@ -178,8 +178,8 @@ fn candidate_ranking_prefers_static_configured_recent_engaged_images() {
             "2026-01-01T00:00:00.000Z",
         ),
         ranking_candidate(
-            "configured_static",
-            "configured_handle",
+            "reels_static",
+            "reels_owner",
             "warm-ambient",
             "handle_a",
             1,
@@ -187,8 +187,8 @@ fn candidate_ranking_prefers_static_configured_recent_engaged_images() {
             "2026-01-02T00:00:00.000Z",
         ),
         ranking_candidate(
-            "carousel",
-            "configured_handle",
+            "learned_carousel",
+            "learned_related",
             "flash-editorial",
             "handle_c",
             8,
@@ -204,8 +204,8 @@ fn candidate_ranking_prefers_static_configured_recent_engaged_images() {
 
     let ranked = rank_candidates_for_review(candidates, &caps);
 
-    assert_eq!(ranked[0].id, "configured_static");
-    assert_eq!(ranked[1].id, "carousel");
+    assert_eq!(ranked[0].id, "reels_static");
+    assert_eq!(ranked[1].id, "learned_carousel");
     assert_eq!(ranked[2].id, "related_video");
 }
 

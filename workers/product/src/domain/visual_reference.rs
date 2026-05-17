@@ -228,8 +228,11 @@ fn media_type_score(media_type: u8) -> u16 {
 
 fn discovered_via_score(discovered_via: &str) -> u16 {
     match discovered_via.trim().to_ascii_lowercase().as_str() {
-        "configured_handle" | "accepted_handle" => 200,
-        "related_profile" => 100,
+        "reels_owner" => 220,
+        "learned_related" => 210,
+        "accepted_handle" => 200,
+        "configured_handle" => 150,
+        "related_profile" => 50,
         _ => 0,
     }
 }
