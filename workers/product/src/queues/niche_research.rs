@@ -802,10 +802,7 @@ async fn discover_instagram_handles_message(
     }
 
     let mut reserved = count_instagram_profile_sources_for_run(db, clone_id, &run_id).await?;
-    for seed in dedupe_handle_seeds(handles)
-        .into_iter()
-        .take(max_handles as usize)
-    {
+    for seed in dedupe_handle_seeds(handles) {
         if reserved >= max_profiles_per_run {
             break;
         }
@@ -5254,6 +5251,18 @@ mod tests {
             terms,
             vec!["flash fashion".to_string(), "street creator".to_string()]
         );
+    }
+
+    #[test]
+    fn handle_discovery_does_not_recap_combined_reels_and_learned_handles() {
+        let source = include_str!("niche_research.rs");
+        let discover = function_body(source, "async fn discover_instagram_handles_message");
+
+        assert!(
+            discover.contains("extract_instagram_reels_owner_handles(&raw, max_handles as usize)")
+        );
+        assert!(discover.contains("load_accepted_handles(db, clone_id, moodboard_id, max_handles)"));
+        assert!(!discover.contains(".take(max_handles as usize)"));
     }
 
     #[test]
