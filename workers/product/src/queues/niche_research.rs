@@ -812,7 +812,6 @@ async fn discover_instagram_handles_message(
         return Ok(());
     }
 
-    mark_discovery_source_fresh(db, &source_id, &params, &now).await?;
     let max_handles = config_u32(&config, "instagram_max_handles_per_moodboard", 20).max(1);
     let max_profiles_per_run = config_u32(&config, "instagram_max_profiles_per_run", 20) as usize;
     let mut handles = extract_instagram_reels_owner_handles(&raw, max_handles as usize)
@@ -874,6 +873,7 @@ async fn discover_instagram_handles_message(
         reserved += 1;
     }
 
+    mark_discovery_source_fresh(db, &source_id, &params, &now).await?;
     enqueue_delayed_finalize_reference_pool(
         env,
         user_id,
@@ -5364,6 +5364,21 @@ mod tests {
         assert!(fetch_pos < stale_guard_pos);
         assert!(stale_guard_pos < mark_fresh_pos);
         assert!(stale_guard_pos < reserve_profile_pos);
+    }
+
+    #[test]
+    fn handle_discovery_marks_reels_source_fresh_after_profile_reservations() {
+        let source = include_str!("niche_research.rs");
+        let discover = function_body(source, "async fn discover_instagram_handles_message");
+
+        let reserve_profile_pos = discover
+            .find("reserve_instagram_profile_source(")
+            .expect("reels handler should reserve profile sources");
+        let mark_fresh_pos = discover
+            .find("mark_discovery_source_fresh(")
+            .expect("reels handler should mark source fresh");
+
+        assert!(reserve_profile_pos < mark_fresh_pos);
     }
 
     #[test]
