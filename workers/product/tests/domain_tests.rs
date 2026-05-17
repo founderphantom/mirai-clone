@@ -127,11 +127,22 @@ fn visual_reference_pipeline_schema_has_required_columns_and_config() {
     assert!(migration.contains("source_image_index INTEGER"));
     assert!(migration.contains("review_json TEXT NOT NULL DEFAULT '{}'"));
     assert!(migration.contains("review_status TEXT NOT NULL DEFAULT 'unreviewed'"));
+    assert!(migration.contains("cleanup_json TEXT NOT NULL DEFAULT '{}'"));
+    assert!(migration.contains("cleaned_image_url TEXT"));
+    assert!(migration.contains("compatibility_json TEXT NOT NULL DEFAULT '{}'"));
     assert!(migration.contains("CREATE TABLE IF NOT EXISTS visual_references"));
     assert!(migration.contains("source_caption_removed INTEGER NOT NULL DEFAULT 1"));
     assert!(migration.contains("media_asset_id TEXT"));
     assert!(migration.contains("moodboard_instagram_handles_json"));
     assert!(migration.contains("instagram_candidate_review_limit"));
+    assert!(migration.contains("instagram_search_terms_per_moodboard"));
+    assert!(migration.contains("instagram_reels_pages_per_term"));
+    assert!(migration.contains("instagram_max_handles_per_moodboard"));
+    assert!(migration.contains("instagram_min_image_width"));
+    assert!(migration.contains("instagram_min_image_height"));
+    assert!(migration.contains("visual_reference_cleanup_retry_limit"));
+    assert!(migration.contains("visual_reference_compatibility_retry_limit"));
+    assert!(migration.contains("clone_compatibility_reference_limit"));
 }
 
 #[test]

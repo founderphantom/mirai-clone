@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS visual_reference_candidates (
   freshness_status TEXT NOT NULL DEFAULT 'unreviewed',
   review_status TEXT NOT NULL DEFAULT 'unreviewed',
   review_json TEXT NOT NULL DEFAULT '{}',
+  cleanup_json TEXT NOT NULL DEFAULT '{}',
+  cleaned_image_url TEXT,
+  compatibility_json TEXT NOT NULL DEFAULT '{}',
   rejection_reason TEXT,
   raw_json TEXT NOT NULL DEFAULT '{}',
   metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -275,7 +278,15 @@ INSERT INTO blitz_config (key, value, updated_at) VALUES
   ('accepted_refs_per_profile_cap', '3', '2026-05-14T00:00:00.000Z'),
   ('accepted_refs_per_moodboard_target', '5', '2026-05-14T00:00:00.000Z'),
   ('max_accepted_refs_per_run', '40', '2026-05-14T00:00:00.000Z'),
-  ('moodboard_instagram_handles_json', '{}', '2026-05-14T00:00:00.000Z');
+  ('moodboard_instagram_handles_json', '{}', '2026-05-14T00:00:00.000Z'),
+  ('instagram_search_terms_per_moodboard', '2', '2026-05-17T00:00:00.000Z'),
+  ('instagram_reels_pages_per_term', '1', '2026-05-17T00:00:00.000Z'),
+  ('instagram_max_handles_per_moodboard', '20', '2026-05-17T00:00:00.000Z'),
+  ('instagram_min_image_width', '512', '2026-05-17T00:00:00.000Z'),
+  ('instagram_min_image_height', '512', '2026-05-17T00:00:00.000Z'),
+  ('visual_reference_cleanup_retry_limit', '3', '2026-05-17T00:00:00.000Z'),
+  ('visual_reference_compatibility_retry_limit', '2', '2026-05-17T00:00:00.000Z'),
+  ('clone_compatibility_reference_limit', '4', '2026-05-17T00:00:00.000Z');
 
 CREATE INDEX IF NOT EXISTS idx_moodboards_user_clone ON moodboards(user_id, clone_id, sort_order);
 CREATE INDEX IF NOT EXISTS idx_discovery_items_source ON discovery_items(source_id, discovered_at DESC);
