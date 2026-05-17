@@ -199,6 +199,18 @@ fn seedream_response_extracts_cleaned_image_url() {
 }
 
 #[test]
+fn seedream_response_recursively_extracts_nested_text_payload_url() {
+    let wrapped = json!({
+        "text": "{\"result\":{\"content\":[{\"text\":\"{\\\"result\\\":{\\\"images\\\":[{\\\"url\\\":\\\"https://cdn.example.com/deep-cleaned.webp\\\"}]}}\"}]}}"
+    });
+
+    assert_eq!(
+        extract_seedream_cleaned_image_url(&wrapped).as_deref(),
+        Some("https://cdn.example.com/deep-cleaned.webp")
+    );
+}
+
+#[test]
 fn visual_reference_storage_key_uses_expected_shape() {
     assert_eq!(
         visual_reference_storage_key("user/1", "clone:1", "vref_1", "image/webp"),

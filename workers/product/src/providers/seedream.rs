@@ -69,6 +69,7 @@ fn collect_text_payloads(value: &Value, payloads: &mut Vec<Value>) {
         Value::Object(map) => {
             if let Some(text) = map.get("text").and_then(Value::as_str) {
                 if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    collect_text_payloads(&parsed, payloads);
                     payloads.push(parsed);
                 }
             }
