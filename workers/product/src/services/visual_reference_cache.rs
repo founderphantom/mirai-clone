@@ -128,7 +128,7 @@ pub async fn cache_approved_visual_reference(
     })
 }
 
-async fn fetch_visual_reference_image(image_url: &str) -> WorkerResult<(Vec<u8>, String)> {
+pub async fn fetch_visual_reference_image(image_url: &str) -> WorkerResult<(Vec<u8>, String)> {
     let request = Request::new(image_url, Method::Get)?;
     let response = Fetch::Request(request).send().await?;
     let status = response.status_code();

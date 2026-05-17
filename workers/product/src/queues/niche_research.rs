@@ -5,6 +5,8 @@ use crate::domain::visual_reference::{
     visual_review_tags, CandidateDiversityCaps, MoodboardBrief, VisualCandidateForRanking,
     VisualReferenceReview,
 };
+use crate::providers::higgsfield_auth::provider_account_access_token;
+use crate::providers::higgsfield_mcp::{call_tool, upload_media_files, HiggsfieldMcpMediaFile};
 use crate::providers::instagram_references::{
     build_instagram_post_url, build_instagram_profile_url, build_instagram_reels_search_url,
     build_instagram_user_posts_url, extract_instagram_reels_owner_handles,
@@ -12,6 +14,10 @@ use crate::providers::instagram_references::{
     normalize_instagram_user_posts, InstagramFallbackPolicy, InstagramImageCandidate,
 };
 use crate::providers::scrapecreators::{fetch_scrapecreators_json, ScrapeCreatorsError};
+use crate::providers::seedream::{
+    extract_seedream_cleaned_image_url, seedream_cleanup_arguments_with_model,
+    SEEDREAM_CLEANUP_MODEL,
+};
 use crate::services::blitz::create_next_batch;
 use crate::services::visual_reference_cache::cache_approved_visual_reference;
 use serde::{Deserialize, Serialize};
@@ -24,6 +30,10 @@ use worker::{
 
 const NICHE_RESEARCH_STATUS_CAS_MISS: &str = "niche_research_status_cas_miss";
 const VISUAL_REFERENCE_DRAIN_RETRY_DELAY_SECONDS: u32 = 30;
+const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER";
+const HIGGSFIELD_PROVIDER_ACCOUNT_ID: &str = "pa_higgsfield_founder";
+const HIGGSFIELD_CLEANUP_TOOL_VAR: &str = "HIGGSFIELD_MCP_CLEANUP_TOOL";
+const HIGGSFIELD_CLEANUP_MODEL_VAR: &str = "HIGGSFIELD_MCP_CLEANUP_MODEL";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
@@ -1441,7 +1451,7 @@ async fn review_visual_candidates_message(
         .iter()
         .any(|candidate_id| !ranked_ids.contains(candidate_id));
     let ai = env.ai("AI")?;
-    let mut cache_messages_enqueued = 0usize;
+    let mut pipeline_messages_enqueued = 0usize;
     let mut retryable_follow_up_needed = retryable_candidates_remaining;
     let mut stale_review_write_seen = false;
 
@@ -1539,14 +1549,14 @@ async fn review_visual_candidates_message(
                 {
                     GuardedCandidateApproval::Approved => {
                         env.queue("NICHE_RESEARCH_QUEUE")?
-                            .send(NicheResearchMessage::CacheApprovedReference {
+                            .send(NicheResearchMessage::CleanupApprovedReference {
                                 user_id: user_id.to_string(),
                                 clone_id: clone_id.to_string(),
                                 run_id: Some(run_id.clone()),
                                 candidate_id: candidate.id.clone(),
                             })
                             .await?;
-                        cache_messages_enqueued += 1;
+                        pipeline_messages_enqueued += 1;
                     }
                     GuardedCandidateApproval::RunCapReached => {
                         let rejected = mark_candidate_rejected_with_review(
@@ -1601,11 +1611,11 @@ async fn review_visual_candidates_message(
                 .await?;
     }
 
-    if stale_review_write_seen && cache_messages_enqueued == 0 && !retryable_follow_up_needed {
+    if stale_review_write_seen && pipeline_messages_enqueued == 0 && !retryable_follow_up_needed {
         return Ok(());
     }
 
-    match review_completion_action(cache_messages_enqueued, retryable_follow_up_needed) {
+    match review_completion_action(pipeline_messages_enqueued, retryable_follow_up_needed) {
         action @ ReviewCompletionAction::WaitForCache => {
             debug_assert!(review_completion_schedules_finalize_nudge(action));
             enqueue_delayed_finalize_reference_pool(
@@ -1644,18 +1654,220 @@ async fn review_visual_candidates_message(
 
 async fn cleanup_approved_reference_message(
     db: &D1Database,
-    _env: &Env,
+    env: &Env,
     user_id: &str,
     clone_id: &str,
     run_id: Option<&str>,
-    _candidate_id: &str,
+    candidate_id: &str,
 ) -> WorkerResult<()> {
-    let Some(_run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
+    let Some(run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
         return Ok(());
     };
-    Err(Error::RustError(
-        "cleanup_approved_reference_not_implemented".to_string(),
-    ))
+    let status_write = set_clone_research_status_with_run_result(
+        db,
+        user_id,
+        clone_id,
+        research_status_for_phase(ResearchPhase::Reviewing),
+        &format!("cleaning approved visual reference candidate={candidate_id}"),
+        Some(&run_id),
+        Some(&run_id),
+    )
+    .await?;
+    if !status_write_allows_side_effects(status_write) {
+        return Ok(());
+    }
+
+    let config = load_config_map(db).await?;
+    let cleanup_retry_limit = config_u32(&config, "visual_reference_cleanup_retry_limit", 3).max(1);
+    let review_limit = config_u32(&config, "instagram_candidate_review_limit", 60).max(1);
+    let Some(candidate) = load_candidate_for_cleanup(db, clone_id, &run_id, candidate_id).await?
+    else {
+        return Ok(());
+    };
+    let observed_attempts = attempts_from_json(&candidate.cleanup_json);
+    let claimed = claim_visual_candidate_for_cleanup(
+        db,
+        clone_id,
+        &run_id,
+        &candidate.id,
+        observed_attempts,
+        cleanup_retry_limit,
+    )
+    .await?;
+    if !claimed {
+        enqueue_delayed_finalize_reference_pool(
+            env,
+            user_id,
+            clone_id,
+            &run_id,
+            "approved_visual_reference_cleanup_claim_pending",
+        )
+        .await?;
+        return Ok(());
+    }
+    if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let cleanup_result =
+        cleanup_reference_with_seedream(env, &candidate.id, &candidate.image_url).await;
+    if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    match cleanup_result {
+        Ok((cleaned_image_url, provider_job_id, _raw_json)) => {
+            mark_candidate_cleanup_succeeded(
+                db,
+                clone_id,
+                &run_id,
+                &candidate.id,
+                &cleaned_image_url,
+                &provider_job_id,
+            )
+            .await?;
+            if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
+            env.queue("NICHE_RESEARCH_QUEUE")?
+                .send(NicheResearchMessage::ValidateCloneCompatibility {
+                    user_id: user_id.to_string(),
+                    clone_id: clone_id.to_string(),
+                    run_id: Some(run_id),
+                    candidate_id: candidate.id,
+                })
+                .await?;
+        }
+        Err(error) => {
+            let code = queue_error_code(&error.to_string());
+            mark_candidate_cleanup_failed(
+                db,
+                clone_id,
+                &run_id,
+                &candidate.id,
+                cleanup_retry_limit,
+                code,
+                &error.to_string(),
+            )
+            .await?;
+            if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
+            if observed_attempts.saturating_add(1) < cleanup_retry_limit {
+                env.queue("NICHE_RESEARCH_QUEUE")?
+                    .send(NicheResearchMessage::CleanupApprovedReference {
+                        user_id: user_id.to_string(),
+                        clone_id: clone_id.to_string(),
+                        run_id: Some(run_id.clone()),
+                        candidate_id: candidate.id.clone(),
+                    })
+                    .await?;
+            }
+            env.queue("NICHE_RESEARCH_QUEUE")?
+                .send(NicheResearchMessage::ReviewVisualCandidates {
+                    user_id: user_id.to_string(),
+                    clone_id: clone_id.to_string(),
+                    run_id: Some(run_id.clone()),
+                    limit: review_limit,
+                })
+                .await?;
+            enqueue_delayed_finalize_reference_pool(
+                env,
+                user_id,
+                clone_id,
+                &run_id,
+                "approved_visual_reference_cleanup_failed",
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn cleanup_reference_with_seedream(
+    env: &Env,
+    candidate_id: &str,
+    image_url: &str,
+) -> WorkerResult<(String, String, Value)> {
+    let token = provider_account_access_token(
+        env,
+        HIGGSFIELD_PROVIDER_ACCOUNT_ID,
+        HIGGSFIELD_REFRESH_SECRET_NAME,
+    )
+    .await
+    .map_err(|error| Error::RustError(format!("seedream_cleanup_auth_failed:{error}")))?;
+    let (bytes, content_type) = fetch_reference_cleanup_image(image_url).await?;
+    let uploaded = upload_media_files(
+        &token.access_token,
+        &[HiggsfieldMcpMediaFile {
+            filename: format!("{candidate_id}.{}", cleanup_extension(&content_type)),
+            content_type,
+            bytes,
+        }],
+    )
+    .await
+    .map_err(|error| Error::RustError(format!("seedream_cleanup_upload_failed:{error}")))?;
+    let Some(reference) = uploaded.first() else {
+        return Err(Error::RustError(
+            "seedream_cleanup_upload_missing".to_string(),
+        ));
+    };
+    let tool_name = env
+        .var(HIGGSFIELD_CLEANUP_TOOL_VAR)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "generate_image".to_string());
+    let model = env
+        .var(HIGGSFIELD_CLEANUP_MODEL_VAR)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| SEEDREAM_CLEANUP_MODEL.to_string());
+    let response = call_tool(
+        &token.access_token,
+        json!(format!("seedream-cleanup:{candidate_id}")),
+        &tool_name,
+        seedream_cleanup_arguments_with_model(&reference.reference_value, &model),
+    )
+    .await
+    .map_err(|error| Error::RustError(format!("seedream_cleanup_failed:{error}")))?;
+    let cleaned_url = extract_seedream_cleaned_image_url(&response.raw_json)
+        .ok_or_else(|| Error::RustError("seedream_cleanup_missing_output_url".to_string()))?;
+    let provider_job_id =
+        crate::providers::higgsfield_mcp::extract_provider_job_id(&response.raw_json)
+            .unwrap_or_default();
+    Ok((cleaned_url, provider_job_id, response.raw_json))
+}
+
+async fn fetch_reference_cleanup_image(image_url: &str) -> WorkerResult<(Vec<u8>, String)> {
+    crate::services::visual_reference_cache::fetch_visual_reference_image(image_url).await
+}
+
+fn cleanup_extension(content_type: &str) -> &'static str {
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        _ => "jpg",
+    }
 }
 
 async fn validate_clone_compatibility_message(
@@ -1899,10 +2111,39 @@ async fn finalize_reference_pool_message(
     let review_limit = config_u32(&config, "instagram_candidate_review_limit", 60).max(1);
     let review_retry_limit =
         config_u32(&config, "instagram_candidate_review_retry_limit", 2).max(1);
-    let drain_state =
-        load_finalize_drain_state(db, clone_id, &run_id, review_retry_limit, review_limit).await?;
+    let cleanup_retry_limit = config_u32(&config, "visual_reference_cleanup_retry_limit", 3).max(1);
+    let drain_state = load_finalize_drain_state(
+        db,
+        clone_id,
+        &run_id,
+        review_retry_limit,
+        cleanup_retry_limit,
+        review_limit,
+    )
+    .await?;
     match finalize_drain_action(&drain_state) {
         FinalizeDrainAction::Proceed => {}
+        FinalizeDrainAction::EnqueueCleanup => {
+            for candidate_id in drain_state.cleanup_candidate_ids {
+                env.queue("NICHE_RESEARCH_QUEUE")?
+                    .send(NicheResearchMessage::CleanupApprovedReference {
+                        user_id: user_id.to_string(),
+                        clone_id: clone_id.to_string(),
+                        run_id: Some(run_id.clone()),
+                        candidate_id,
+                    })
+                    .await?;
+            }
+            env.queue("NICHE_RESEARCH_QUEUE")?
+                .send(NicheResearchMessage::FinalizeReferencePool {
+                    user_id: user_id.to_string(),
+                    clone_id: clone_id.to_string(),
+                    run_id: Some(run_id),
+                    reason: format!("{reason}:cleanup_work_pending"),
+                })
+                .await?;
+            return Ok(());
+        }
         FinalizeDrainAction::EnqueueCache => {
             for candidate_id in drain_state.approved_uncached_candidate_ids {
                 env.queue("NICHE_RESEARCH_QUEUE")?
@@ -2513,7 +2754,7 @@ fn approved_candidate_count_for_run_sql() -> &'static str {
         SELECT COUNT(*) AS count
         FROM visual_reference_candidates
         WHERE clone_id = ?
-          AND review_status IN ('approved', 'caching')
+          AND review_status IN ('cleanup_pending', 'cleanup_retryable', 'compatibility_pending', 'compatibility_retryable', 'cache_pending', 'caching', 'cached')
           AND json_valid(metadata_json)
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
@@ -2525,7 +2766,7 @@ fn approved_candidate_count_for_run_and_handle_sql() -> &'static str {
         SELECT COUNT(*) AS count
         FROM visual_reference_candidates
         WHERE clone_id = ?
-          AND review_status IN ('approved', 'caching')
+          AND review_status IN ('cleanup_pending', 'cleanup_retryable', 'compatibility_pending', 'compatibility_retryable', 'cache_pending', 'caching', 'cached')
           AND json_valid(metadata_json)
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
@@ -2536,7 +2777,7 @@ fn approved_candidate_count_for_run_and_handle_sql() -> &'static str {
 fn approve_visual_candidate_with_cap_guards_sql() -> &'static str {
     r#"
         UPDATE visual_reference_candidates
-        SET review_status = 'approved',
+        SET review_status = 'cleanup_pending',
             review_json = ?,
             moodboard_id = ?,
             moodboard_slug = ?,
@@ -2558,7 +2799,7 @@ fn approve_visual_candidate_with_cap_guards_sql() -> &'static str {
             SELECT COUNT(*)
             FROM visual_reference_candidates approved
             WHERE approved.clone_id = visual_reference_candidates.clone_id
-              AND approved.review_status IN ('approved', 'caching')
+              AND approved.review_status IN ('cleanup_pending', 'cleanup_retryable', 'compatibility_pending', 'compatibility_retryable', 'cache_pending', 'caching', 'cached')
               AND json_valid(approved.metadata_json)
               AND CAST(json_extract(approved.metadata_json, '$.runId') AS TEXT) = ?
               AND CAST(json_extract(approved.metadata_json, '$.approvedRunId') AS TEXT) = ?
@@ -2571,7 +2812,7 @@ fn approve_visual_candidate_with_cap_guards_sql() -> &'static str {
                 SELECT COUNT(*)
                 FROM visual_reference_candidates approved_handle
                 WHERE approved_handle.clone_id = visual_reference_candidates.clone_id
-                  AND approved_handle.review_status IN ('approved', 'caching')
+                  AND approved_handle.review_status IN ('cleanup_pending', 'cleanup_retryable', 'compatibility_pending', 'compatibility_retryable', 'cache_pending', 'caching', 'cached')
                   AND json_valid(approved_handle.metadata_json)
                   AND CAST(json_extract(approved_handle.metadata_json, '$.runId') AS TEXT) = ?
                   AND CAST(json_extract(approved_handle.metadata_json, '$.approvedRunId') AS TEXT) = ?
@@ -2591,6 +2832,97 @@ fn approve_visual_candidate_with_cap_guards_sql() -> &'static str {
               )
             ) < ?
           )
+        "#
+}
+
+fn claim_visual_candidate_for_cleanup_sql() -> &'static str {
+    r#"
+        UPDATE visual_reference_candidates
+        SET cleanup_json = json_set(
+              CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+              '$.claimStatus',
+              'cleanup_pending',
+              '$.claimStartedAt',
+              ?,
+              '$.attempts',
+              COALESCE(CAST(json_extract(
+                CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+                '$.attempts'
+              ) AS INTEGER), 0) + 1
+            ),
+            reviewed_at = ?
+        WHERE id = ?
+          AND clone_id = ?
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND review_status IN ('cleanup_pending', 'cleanup_retryable')
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) = ?
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) < ?
+          AND image_url IS NOT NULL
+          AND TRIM(image_url) <> ''
+        "#
+}
+
+fn mark_candidate_cleanup_succeeded_sql() -> &'static str {
+    r#"
+        UPDATE visual_reference_candidates
+        SET review_status = 'compatibility_pending',
+            cleaned_image_url = ?,
+            cleanup_json = json_set(
+              CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+              '$.cleanedImageUrl',
+              ?,
+              '$.providerJobId',
+              ?,
+              '$.completedAt',
+              ?
+            ),
+            rejection_reason = NULL,
+            reviewed_at = ?
+        WHERE id = ?
+          AND clone_id = ?
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND review_status IN ('cleanup_pending', 'cleanup_retryable')
+        "#
+}
+
+fn mark_candidate_cleanup_failed_sql() -> &'static str {
+    r#"
+        UPDATE visual_reference_candidates
+        SET review_status = CASE
+              WHEN COALESCE(CAST(json_extract(
+                CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+                '$.attempts'
+              ) AS INTEGER), 0) < ?
+              THEN 'cleanup_retryable'
+              ELSE 'cleanup_failed'
+            END,
+            cleanup_json = json_set(
+              CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+              '$.errorCode',
+              ?,
+              '$.error',
+              ?,
+              '$.failedAt',
+              ?
+            ),
+            rejection_reason = ?,
+            reviewed_at = ?
+        WHERE id = ?
+          AND clone_id = ?
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND review_status IN ('cleanup_pending', 'cleanup_retryable')
         "#
 }
 
@@ -2875,7 +3207,7 @@ fn finalize_in_progress_visual_work_sql() -> &'static str {
         WHERE vc.clone_id = ?
           AND json_valid(vc.metadata_json)
           AND CAST(json_extract(vc.metadata_json, '$.runId') AS TEXT) = ?
-          AND vc.review_status IN ('reviewing', 'caching')
+          AND vc.review_status IN ('reviewing', 'cleanup_pending', 'cleanup_retryable', 'caching')
           AND (
             vc.reviewed_at IS NULL
             OR vc.reviewed_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
@@ -2900,6 +3232,30 @@ fn finalize_in_progress_visual_work_sql() -> &'static str {
               LIMIT 1
             )
           )
+        "#
+}
+
+fn finalize_cleanup_candidates_sql() -> &'static str {
+    r#"
+        SELECT vc.id
+        FROM visual_reference_candidates vc
+        WHERE vc.clone_id = ?
+          AND vc.review_status IN ('cleanup_pending', 'cleanup_retryable')
+          AND json_valid(vc.metadata_json)
+          AND CAST(json_extract(vc.metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(vc.metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) < ?
+          AND (
+            vc.reviewed_at IS NULL
+            OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+          )
+          AND vc.image_url IS NOT NULL
+          AND TRIM(vc.image_url) <> ''
+        ORDER BY vc.reviewed_at ASC, vc.created_at ASC
+        LIMIT ?
         "#
 }
 
@@ -3529,12 +3885,14 @@ struct FinalizeDrainState {
     pending_discovery: u32,
     pending_visual_work: u32,
     in_progress_visual_work: u32,
+    cleanup_candidate_ids: Vec<String>,
     approved_uncached_candidate_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FinalizeDrainAction {
     Proceed,
+    EnqueueCleanup,
     EnqueueCache,
     EnqueueReview,
     EnqueueFinalize,
@@ -3542,7 +3900,9 @@ enum FinalizeDrainAction {
 }
 
 fn finalize_drain_action(state: &FinalizeDrainState) -> FinalizeDrainAction {
-    if !state.approved_uncached_candidate_ids.is_empty() {
+    if !state.cleanup_candidate_ids.is_empty() {
+        FinalizeDrainAction::EnqueueCleanup
+    } else if !state.approved_uncached_candidate_ids.is_empty() {
         FinalizeDrainAction::EnqueueCache
     } else if state.pending_visual_work > 0 {
         FinalizeDrainAction::EnqueueReview
@@ -3600,6 +3960,7 @@ async fn load_finalize_drain_state(
     clone_id: &str,
     run_id: &str,
     review_retry_limit: u32,
+    cleanup_retry_limit: u32,
     cache_limit: u32,
 ) -> WorkerResult<FinalizeDrainState> {
     let pending_discovery = db::first::<CountRow>(
@@ -3636,6 +3997,21 @@ async fn load_finalize_drain_state(
     .await?
     .map(|row| row.count)
     .unwrap_or_default();
+    let cleanup_candidate_ids = db::all::<IdRow>(
+        db,
+        finalize_cleanup_candidates_sql(),
+        vec![
+            json!(clone_id),
+            json!(run_id),
+            json!(run_id),
+            json!(cleanup_retry_limit),
+            json!(cache_limit),
+        ],
+    )
+    .await?
+    .into_iter()
+    .map(|row| row.id)
+    .collect();
     let approved_uncached_candidate_ids = db::all::<IdRow>(
         db,
         finalize_approved_uncached_candidates_sql(),
@@ -3655,6 +4031,7 @@ async fn load_finalize_drain_state(
         pending_discovery,
         pending_visual_work,
         in_progress_visual_work,
+        cleanup_candidate_ids,
         approved_uncached_candidate_ids,
     })
 }
@@ -3729,6 +4106,14 @@ fn review_attempts_from_json(review_json: &str) -> u32 {
         .unwrap_or_default()
 }
 
+fn attempts_from_json(value: &str) -> u32 {
+    serde_json::from_str::<Value>(value)
+        .ok()
+        .and_then(|value| value.get("attempts").and_then(Value::as_u64))
+        .and_then(|attempts| u32::try_from(attempts).ok())
+        .unwrap_or_default()
+}
+
 async fn mark_candidate_review_failed(
     db: &D1Database,
     candidate_id: &str,
@@ -3752,6 +4137,123 @@ async fn mark_candidate_review_failed(
             json!(candidate_id),
             json!(run_id),
             json!(observed_attempts),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+async fn load_candidate_for_cleanup(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+) -> WorkerResult<Option<CleanupCandidateRow>> {
+    db::first(
+        db,
+        r#"
+        SELECT id, image_url, cleanup_json
+        FROM visual_reference_candidates
+        WHERE clone_id = ?
+          AND id = ?
+          AND review_status IN ('cleanup_pending', 'cleanup_retryable')
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND image_url IS NOT NULL
+          AND TRIM(image_url) <> ''
+        LIMIT 1
+        "#,
+        vec![
+            json!(clone_id),
+            json!(candidate_id),
+            json!(run_id),
+            json!(run_id),
+        ],
+    )
+    .await
+}
+
+async fn claim_visual_candidate_for_cleanup(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+    observed_attempts: u32,
+    cleanup_retry_limit: u32,
+) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    let result = db::run(
+        db,
+        claim_visual_candidate_for_cleanup_sql(),
+        vec![
+            json!(now),
+            json!(now),
+            json!(candidate_id),
+            json!(clone_id),
+            json!(run_id),
+            json!(run_id),
+            json!(observed_attempts),
+            json!(cleanup_retry_limit),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+async fn mark_candidate_cleanup_succeeded(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+    cleaned_image_url: &str,
+    provider_job_id: &str,
+) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    let result = db::run(
+        db,
+        mark_candidate_cleanup_succeeded_sql(),
+        vec![
+            json!(cleaned_image_url),
+            json!(cleaned_image_url),
+            json!(provider_job_id),
+            json!(now),
+            json!(now),
+            json!(candidate_id),
+            json!(clone_id),
+            json!(run_id),
+            json!(run_id),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+async fn mark_candidate_cleanup_failed(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+    cleanup_retry_limit: u32,
+    code: &str,
+    error: &str,
+) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    let compact_error = compact_error_detail(error);
+    let result = db::run(
+        db,
+        mark_candidate_cleanup_failed_sql(),
+        vec![
+            json!(cleanup_retry_limit),
+            json!(code),
+            json!(compact_error),
+            json!(now),
+            json!(format!("visual_reference_cleanup_failed:{compact_error}")),
+            json!(now),
+            json!(candidate_id),
+            json!(clone_id),
+            json!(run_id),
+            json!(run_id),
         ],
     )
     .await?;
@@ -5250,6 +5752,13 @@ struct ApprovedVisualCandidateRow {
     review_json: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct CleanupCandidateRow {
+    id: String,
+    image_url: String,
+    cleanup_json: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5796,7 +6305,7 @@ mod tests {
             "CAST(json_extract(visual_reference_candidates.metadata_json, '$.runId') AS TEXT) = ?"
         ));
         assert!(sql.contains("review_status = 'reviewing'"));
-        assert!(sql.contains("approved.review_status IN ('approved', 'caching')"));
+        assert!(sql.contains("approved.review_status IN ('cleanup_pending', 'cleanup_retryable', 'compatibility_pending', 'compatibility_retryable', 'cache_pending', 'caching', 'cached')"));
         assert!(sql.contains("$.runId"));
         assert!(sql.contains(") < ?"));
         assert!(sql.contains(
@@ -5812,16 +6321,42 @@ mod tests {
         let handle_sql = approved_candidate_count_for_run_and_handle_sql();
 
         assert!(run_sql.contains("CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?"));
-        assert!(run_sql.contains("review_status IN ('approved', 'caching')"));
+        assert!(run_sql.contains("review_status IN ('cleanup_pending', 'cleanup_retryable', 'compatibility_pending', 'compatibility_retryable', 'cache_pending', 'caching', 'cached')"));
         assert!(
             run_sql.contains("CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?")
         );
         assert!(handle_sql.contains("CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?"));
-        assert!(handle_sql.contains("review_status IN ('approved', 'caching')"));
+        assert!(handle_sql.contains("review_status IN ('cleanup_pending', 'cleanup_retryable', 'compatibility_pending', 'compatibility_retryable', 'cache_pending', 'caching', 'cached')"));
         assert!(
             handle_sql.contains("CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?")
         );
         assert!(handle_sql.contains("lower(source_handle) = lower(?)"));
+    }
+
+    #[test]
+    fn approved_review_enqueues_cleanup_instead_of_cache() {
+        let source = include_str!("niche_research.rs");
+        let body = function_body(source, "async fn review_visual_candidates_message");
+
+        assert!(body.contains("NicheResearchMessage::CleanupApprovedReference"));
+        assert!(!body.contains("NicheResearchMessage::CacheApprovedReference"));
+    }
+
+    #[test]
+    fn cleanup_sql_uses_single_review_status_lifecycle() {
+        for sql in [
+            claim_visual_candidate_for_cleanup_sql(),
+            mark_candidate_cleanup_succeeded_sql(),
+            mark_candidate_cleanup_failed_sql(),
+        ] {
+            assert!(sql.contains("review_status"));
+            assert!(!sql.contains("cleanup_status"));
+        }
+        assert!(mark_candidate_cleanup_succeeded_sql().contains("cleaned_image_url = ?"));
+        assert!(mark_candidate_cleanup_succeeded_sql()
+            .contains("review_status = 'compatibility_pending'"));
+        assert!(mark_candidate_cleanup_failed_sql().contains("THEN 'cleanup_retryable'"));
+        assert!(mark_candidate_cleanup_failed_sql().contains("ELSE 'cleanup_failed'"));
     }
 
     #[test]
@@ -5961,7 +6496,9 @@ mod tests {
     fn finalize_in_progress_visual_work_sql_detects_reviewing_and_caching_claims() {
         let sql = finalize_in_progress_visual_work_sql();
 
-        assert!(sql.contains("vc.review_status IN ('reviewing', 'caching')"));
+        assert!(sql.contains(
+            "vc.review_status IN ('reviewing', 'cleanup_pending', 'cleanup_retryable', 'caching')"
+        ));
         assert!(sql.contains("vc.reviewed_at > strftime"));
         assert!(sql.contains("vc.review_status = 'reviewing'"));
         assert!(sql.contains("NOT EXISTS"));
@@ -5982,6 +6519,21 @@ mod tests {
         assert!(sql.contains("CAST(json_extract(vc.metadata_json, '$.approvedRunId') AS TEXT) = ?"));
         assert!(sql.contains("NOT EXISTS"));
         assert!(sql.contains("INNER JOIN user_inspiration_pool uip"));
+        assert!(sql.contains("LIMIT ?"));
+    }
+
+    #[test]
+    fn finalize_cleanup_candidates_sql_loads_retryable_cleanup_for_run() {
+        let sql = finalize_cleanup_candidates_sql();
+
+        assert!(sql.contains("SELECT vc.id"));
+        assert!(sql.contains("vc.review_status IN ('cleanup_pending', 'cleanup_retryable')"));
+        assert!(sql.contains("CAST(json_extract(vc.metadata_json, '$.runId') AS TEXT) = ?"));
+        assert!(sql.contains("CAST(json_extract(vc.metadata_json, '$.approvedRunId') AS TEXT) = ?"));
+        assert!(sql.contains("vc.cleanup_json"));
+        assert!(sql.contains("$.attempts"));
+        assert!(sql.contains(") < ?"));
+        assert!(sql.contains("vc.reviewed_at <= strftime"));
         assert!(sql.contains("LIMIT ?"));
     }
 
@@ -6228,6 +6780,15 @@ mod tests {
                 ..FinalizeDrainState::default()
             }),
             FinalizeDrainAction::EnqueueDelayedFinalize
+        );
+        assert_eq!(
+            finalize_drain_action(&FinalizeDrainState {
+                cleanup_candidate_ids: vec!["candidate_1".to_string()],
+                approved_uncached_candidate_ids: vec!["candidate_2".to_string()],
+                pending_visual_work: 1,
+                ..FinalizeDrainState::default()
+            }),
+            FinalizeDrainAction::EnqueueCleanup
         );
         assert_eq!(
             finalize_drain_action(&FinalizeDrainState {
