@@ -2558,6 +2558,7 @@ fn clone_compatibility_acceptance_requires_all_v1_signals() {
     );
 
     let mut body_mismatch = compatible_clone_review();
+    body_mismatch.compatible = false;
     body_mismatch.body_proportions_compatible = false;
     body_mismatch.rejection_reason = Some("body proportions mismatch".to_string());
     body_mismatch.reason = "body proportions mismatch".to_string();
@@ -2567,6 +2568,7 @@ fn clone_compatibility_acceptance_requires_all_v1_signals() {
     );
 
     let mut hair_length_mismatch = compatible_clone_review();
+    hair_length_mismatch.compatible = false;
     hair_length_mismatch.hair_length_compatible = false;
     hair_length_mismatch.rejection_reason = Some("hair length mismatch".to_string());
     hair_length_mismatch.reason = "hair length mismatch".to_string();
@@ -2576,6 +2578,7 @@ fn clone_compatibility_acceptance_requires_all_v1_signals() {
     );
 
     let mut facial_hair_mismatch = compatible_clone_review();
+    facial_hair_mismatch.compatible = false;
     facial_hair_mismatch.facial_hair_compatible = false;
     facial_hair_mismatch.rejection_reason = Some("facial hair mismatch".to_string());
     facial_hair_mismatch.reason = "facial hair mismatch".to_string();

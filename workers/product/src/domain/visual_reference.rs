@@ -133,9 +133,6 @@ pub fn accept_visual_review(
 pub fn accept_clone_compatibility(
     review: &crate::ai::workers_ai::CloneCompatibilityReview,
 ) -> Result<(), &'static str> {
-    if !review.compatible {
-        return Err("clone_mismatch");
-    }
     if !review.body_proportions_compatible {
         return Err("body_proportions_mismatch");
     }
@@ -144,6 +141,9 @@ pub fn accept_clone_compatibility(
     }
     if !review.facial_hair_compatible {
         return Err("facial_hair_mismatch");
+    }
+    if !review.compatible {
+        return Err("clone_mismatch");
     }
     Ok(())
 }
