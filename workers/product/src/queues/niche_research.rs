@@ -1705,6 +1705,7 @@ async fn cleanup_approved_reference_message(
         .await?;
         return Ok(());
     }
+    let expected_cleanup_attempt = observed_attempts.saturating_add(1);
     if current_message_run_id(db, user_id, clone_id, Some(&run_id))
         .await?
         .is_none()
@@ -1712,8 +1713,17 @@ async fn cleanup_approved_reference_message(
         return Ok(());
     }
 
-    let cleanup_result =
-        cleanup_reference_with_seedream(env, &candidate.id, &candidate.image_url).await;
+    let cleanup_request = prepare_seedream_cleanup(env, &candidate.id, &candidate.image_url).await;
+    if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let cleanup_result = match cleanup_request {
+        Ok(cleanup_request) => call_seedream_cleanup(&candidate.id, &cleanup_request).await,
+        Err(error) => Err(error),
+    };
     if current_message_run_id(db, user_id, clone_id, Some(&run_id))
         .await?
         .is_none()
@@ -1723,15 +1733,19 @@ async fn cleanup_approved_reference_message(
 
     match cleanup_result {
         Ok((cleaned_image_url, provider_job_id, _raw_json)) => {
-            mark_candidate_cleanup_succeeded(
+            let marked = mark_candidate_cleanup_succeeded(
                 db,
                 clone_id,
                 &run_id,
                 &candidate.id,
                 &cleaned_image_url,
                 &provider_job_id,
+                expected_cleanup_attempt,
             )
             .await?;
+            if !marked {
+                return Ok(());
+            }
             if current_message_run_id(db, user_id, clone_id, Some(&run_id))
                 .await?
                 .is_none()
@@ -1749,16 +1763,20 @@ async fn cleanup_approved_reference_message(
         }
         Err(error) => {
             let code = queue_error_code(&error.to_string());
-            mark_candidate_cleanup_failed(
+            let marked = mark_candidate_cleanup_failed(
                 db,
                 clone_id,
                 &run_id,
                 &candidate.id,
                 cleanup_retry_limit,
+                expected_cleanup_attempt,
                 code,
                 &error.to_string(),
             )
             .await?;
+            if !marked {
+                return Ok(());
+            }
             if current_message_run_id(db, user_id, clone_id, Some(&run_id))
                 .await?
                 .is_none()
@@ -1797,11 +1815,11 @@ async fn cleanup_approved_reference_message(
     Ok(())
 }
 
-async fn cleanup_reference_with_seedream(
+async fn prepare_seedream_cleanup(
     env: &Env,
     candidate_id: &str,
     image_url: &str,
-) -> WorkerResult<(String, String, Value)> {
+) -> WorkerResult<SeedreamCleanupRequest> {
     let token = provider_account_access_token(
         env,
         HIGGSFIELD_PROVIDER_ACCOUNT_ID,
@@ -1833,11 +1851,23 @@ async fn cleanup_reference_with_seedream(
         .var(HIGGSFIELD_CLEANUP_MODEL_VAR)
         .map(|value| value.to_string())
         .unwrap_or_else(|_| SEEDREAM_CLEANUP_MODEL.to_string());
+    Ok(SeedreamCleanupRequest {
+        access_token: token.access_token,
+        reference_value: reference.reference_value.clone(),
+        tool_name,
+        model,
+    })
+}
+
+async fn call_seedream_cleanup(
+    candidate_id: &str,
+    request: &SeedreamCleanupRequest,
+) -> WorkerResult<(String, String, Value)> {
     let response = call_tool(
-        &token.access_token,
+        &request.access_token,
         json!(format!("seedream-cleanup:{candidate_id}")),
-        &tool_name,
-        seedream_cleanup_arguments_with_model(&reference.reference_value, &model),
+        &request.tool_name,
+        seedream_cleanup_arguments_with_model(&request.reference_value, &request.model),
     )
     .await
     .map_err(|error| Error::RustError(format!("seedream_cleanup_failed:{error}")))?;
@@ -2892,6 +2922,10 @@ fn mark_candidate_cleanup_succeeded_sql() -> &'static str {
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
           AND review_status IN ('cleanup_pending', 'cleanup_retryable')
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) = ?
         "#
 }
 
@@ -2923,6 +2957,10 @@ fn mark_candidate_cleanup_failed_sql() -> &'static str {
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
           AND review_status IN ('cleanup_pending', 'cleanup_retryable')
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) = ?
         "#
 }
 
@@ -4208,6 +4246,7 @@ async fn mark_candidate_cleanup_succeeded(
     candidate_id: &str,
     cleaned_image_url: &str,
     provider_job_id: &str,
+    expected_attempts: u32,
 ) -> WorkerResult<bool> {
     let now = now_iso_string();
     let result = db::run(
@@ -4223,6 +4262,7 @@ async fn mark_candidate_cleanup_succeeded(
             json!(clone_id),
             json!(run_id),
             json!(run_id),
+            json!(expected_attempts),
         ],
     )
     .await?;
@@ -4235,6 +4275,7 @@ async fn mark_candidate_cleanup_failed(
     run_id: &str,
     candidate_id: &str,
     cleanup_retry_limit: u32,
+    expected_attempts: u32,
     code: &str,
     error: &str,
 ) -> WorkerResult<bool> {
@@ -4254,6 +4295,7 @@ async fn mark_candidate_cleanup_failed(
             json!(clone_id),
             json!(run_id),
             json!(run_id),
+            json!(expected_attempts),
         ],
     )
     .await?;
@@ -5759,6 +5801,14 @@ struct CleanupCandidateRow {
     cleanup_json: String,
 }
 
+#[derive(Clone, Debug)]
+struct SeedreamCleanupRequest {
+    access_token: String,
+    reference_value: String,
+    tool_name: String,
+    model: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6357,6 +6407,64 @@ mod tests {
             .contains("review_status = 'compatibility_pending'"));
         assert!(mark_candidate_cleanup_failed_sql().contains("THEN 'cleanup_retryable'"));
         assert!(mark_candidate_cleanup_failed_sql().contains("ELSE 'cleanup_failed'"));
+    }
+
+    #[test]
+    fn cleanup_completion_sql_guards_claimed_attempt() {
+        for sql in [
+            mark_candidate_cleanup_succeeded_sql(),
+            mark_candidate_cleanup_failed_sql(),
+        ] {
+            let where_clause = sql.split("WHERE id = ?").nth(1).expect("where clause");
+
+            assert!(where_clause.contains("cleanup_json"));
+            assert!(where_clause.contains("$.attempts"));
+            assert!(where_clause.contains(") = ?"));
+        }
+    }
+
+    #[test]
+    fn cleanup_message_gates_followup_side_effects_on_mark_result() {
+        let source = include_str!("niche_research.rs");
+        let body = function_body(source, "async fn cleanup_approved_reference_message");
+
+        let success_mark = body
+            .find("let marked = mark_candidate_cleanup_succeeded(")
+            .expect("success mark result should be captured");
+        let compatibility_enqueue = body
+            .find("NicheResearchMessage::ValidateCloneCompatibility")
+            .expect("compatibility enqueue");
+        assert!(success_mark < compatibility_enqueue);
+        assert!(body[success_mark..compatibility_enqueue].contains("if !marked {"));
+
+        let failure_mark = body
+            .find("let marked = mark_candidate_cleanup_failed(")
+            .expect("failure mark result should be captured");
+        let review_enqueue = body
+            .find("NicheResearchMessage::ReviewVisualCandidates")
+            .expect("review enqueue");
+        assert!(failure_mark < review_enqueue);
+        assert!(body[failure_mark..review_enqueue].contains("if !marked {"));
+    }
+
+    #[test]
+    fn cleanup_message_rechecks_current_run_after_upload_before_seedream_call() {
+        let source = include_str!("niche_research.rs");
+        let body = function_body(source, "async fn cleanup_approved_reference_message");
+
+        let prepare_pos = body
+            .find("prepare_seedream_cleanup(")
+            .expect("cleanup upload prepare helper");
+        let seedream_call_pos = body
+            .find("call_seedream_cleanup(")
+            .expect("seedream cleanup call helper");
+        let stale_guard_pos = body[prepare_pos..seedream_call_pos]
+            .find("current_message_run_id(db, user_id, clone_id, Some(&run_id))")
+            .map(|offset| prepare_pos + offset)
+            .expect("run guard between upload and seedream call");
+
+        assert!(prepare_pos < stale_guard_pos);
+        assert!(stale_guard_pos < seedream_call_pos);
     }
 
     #[test]
