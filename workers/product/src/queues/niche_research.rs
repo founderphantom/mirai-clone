@@ -2355,12 +2355,15 @@ async fn finalize_reference_pool_message(
     let review_retry_limit =
         config_u32(&config, "instagram_candidate_review_retry_limit", 2).max(1);
     let cleanup_retry_limit = config_u32(&config, "visual_reference_cleanup_retry_limit", 3).max(1);
+    let compatibility_retry_limit =
+        config_u32(&config, "visual_reference_compatibility_retry_limit", 3).max(1);
     let drain_state = load_finalize_drain_state(
         db,
         clone_id,
         &run_id,
         review_retry_limit,
         cleanup_retry_limit,
+        compatibility_retry_limit,
         review_limit,
     )
     .await?;
@@ -2383,6 +2386,27 @@ async fn finalize_reference_pool_message(
                     clone_id: clone_id.to_string(),
                     run_id: Some(run_id),
                     reason: format!("{reason}:cleanup_work_pending"),
+                })
+                .await?;
+            return Ok(());
+        }
+        FinalizeDrainAction::EnqueueCompatibility => {
+            for candidate_id in drain_state.compatibility_candidate_ids {
+                env.queue("NICHE_RESEARCH_QUEUE")?
+                    .send(NicheResearchMessage::ValidateCloneCompatibility {
+                        user_id: user_id.to_string(),
+                        clone_id: clone_id.to_string(),
+                        run_id: Some(run_id.clone()),
+                        candidate_id,
+                    })
+                    .await?;
+            }
+            env.queue("NICHE_RESEARCH_QUEUE")?
+                .send(NicheResearchMessage::FinalizeReferencePool {
+                    user_id: user_id.to_string(),
+                    clone_id: clone_id.to_string(),
+                    run_id: Some(run_id),
+                    reason: format!("{reason}:compatibility_work_pending"),
                 })
                 .await?;
             return Ok(());
@@ -2472,6 +2496,7 @@ async fn finalize_reference_pool_message(
         .iter()
         .map(|id| counts_by_moodboard.get(id).copied().unwrap_or_default())
         .sum::<u32>();
+    let failures = load_candidate_failure_counts(db, clone_id, &run_id).await?;
     let phase =
         reference_pool_readiness_phase(total_refs, ready_count, selected_moodboard_ids.len());
     let batch_provider_soul_id = if phase != ResearchPhase::InsufficientRefs {
@@ -2515,8 +2540,12 @@ async fn finalize_reference_pool_message(
         clone_id,
         research_status_for_phase(phase),
         &format!(
-            "{reason}: accepted_refs={total_refs}, ready_moodboards={ready_count}, selected_moodboards={}, target_refs_per_moodboard={target}",
+            "{reason}: accepted_refs={total_refs}, ready_moodboards={ready_count}, selected_moodboards={}, target_refs_per_moodboard={target}, cleanup_failed={}, compatibility_failed={}, clone_mismatch={}, cache_failed={}",
             selected_moodboard_ids.len(),
+            failures.cleanup_failed,
+            failures.compatibility_failed,
+            failures.clone_mismatch,
+            failures.cache_failed,
         ),
         Some(&run_id),
         Some(&run_id),
@@ -3594,9 +3623,25 @@ fn finalize_pending_visual_work_sql() -> &'static str {
               AND vc.reviewed_at IS NOT NULL
               AND vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
             )
+            OR vc.review_status = 'cleanup_pending'
+            OR (
+              vc.review_status = 'cleanup_retryable'
+              AND COALESCE(CAST(json_extract(
+                CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
+                '$.attempts'
+              ) AS INTEGER), 0) < ?
+            )
+            OR vc.review_status = 'compatibility_pending'
+            OR (
+              vc.review_status = 'compatibility_retryable'
+              AND COALESCE(CAST(json_extract(
+                CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
+                '$.attempts'
+              ) AS INTEGER), 0) < ?
+            )
             OR (
               (
-                vc.review_status = 'approved'
+                vc.review_status = 'cache_pending'
                 OR (
                   vc.review_status = 'caching'
                   AND vc.reviewed_at IS NOT NULL
@@ -3633,13 +3678,29 @@ fn finalize_in_progress_visual_work_sql() -> &'static str {
         WHERE vc.clone_id = ?
           AND json_valid(vc.metadata_json)
           AND CAST(json_extract(vc.metadata_json, '$.runId') AS TEXT) = ?
-          AND vc.review_status IN ('reviewing', 'cleanup_pending', 'cleanup_retryable', 'caching')
           AND (
             vc.reviewed_at IS NULL
             OR vc.reviewed_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
           )
           AND (
-            vc.review_status = 'reviewing'
+            vc.review_status IN ('reviewing', 'caching')
+            OR (
+              vc.review_status IN ('cleanup_pending', 'cleanup_retryable')
+              AND json_extract(
+                CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
+                '$.claimStartedAt'
+              ) IS NOT NULL
+            )
+            OR (
+              vc.review_status IN ('compatibility_pending', 'compatibility_retryable')
+              AND json_extract(
+                CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
+                '$.claimStartedAt'
+              ) IS NOT NULL
+            )
+          )
+          AND (
+            vc.review_status <> 'caching'
             OR NOT EXISTS (
               SELECT 1
               FROM visual_references vr
@@ -3675,11 +3736,43 @@ fn finalize_cleanup_candidates_sql() -> &'static str {
             '$.attempts'
           ) AS INTEGER), 0) < ?
           AND (
-            vc.reviewed_at IS NULL
+            json_extract(
+              CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
+              '$.claimStartedAt'
+            ) IS NULL
+            OR vc.reviewed_at IS NULL
             OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
           )
           AND vc.image_url IS NOT NULL
           AND TRIM(vc.image_url) <> ''
+        ORDER BY vc.reviewed_at ASC, vc.created_at ASC
+        LIMIT ?
+        "#
+}
+
+fn finalize_compatibility_candidates_sql() -> &'static str {
+    r#"
+        SELECT vc.id
+        FROM visual_reference_candidates vc
+        WHERE vc.clone_id = ?
+          AND vc.review_status IN ('compatibility_pending', 'compatibility_retryable')
+          AND json_valid(vc.metadata_json)
+          AND CAST(json_extract(vc.metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(vc.metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) < ?
+          AND (
+            json_extract(
+              CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
+              '$.claimStartedAt'
+            ) IS NULL
+            OR vc.reviewed_at IS NULL
+            OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+          )
+          AND vc.cleaned_image_url IS NOT NULL
+          AND TRIM(vc.cleaned_image_url) <> ''
         ORDER BY vc.reviewed_at ASC, vc.created_at ASC
         LIMIT ?
         "#
@@ -3691,7 +3784,7 @@ fn finalize_approved_uncached_candidates_sql() -> &'static str {
         FROM visual_reference_candidates vc
         WHERE vc.clone_id = ?
           AND (
-            vc.review_status = 'approved'
+            vc.review_status = 'cache_pending'
             OR (
               vc.review_status = 'caching'
               AND vc.reviewed_at IS NOT NULL
@@ -4312,6 +4405,7 @@ struct FinalizeDrainState {
     pending_visual_work: u32,
     in_progress_visual_work: u32,
     cleanup_candidate_ids: Vec<String>,
+    compatibility_candidate_ids: Vec<String>,
     approved_uncached_candidate_ids: Vec<String>,
 }
 
@@ -4319,6 +4413,7 @@ struct FinalizeDrainState {
 enum FinalizeDrainAction {
     Proceed,
     EnqueueCleanup,
+    EnqueueCompatibility,
     EnqueueCache,
     EnqueueReview,
     EnqueueFinalize,
@@ -4328,6 +4423,8 @@ enum FinalizeDrainAction {
 fn finalize_drain_action(state: &FinalizeDrainState) -> FinalizeDrainAction {
     if !state.cleanup_candidate_ids.is_empty() {
         FinalizeDrainAction::EnqueueCleanup
+    } else if !state.compatibility_candidate_ids.is_empty() {
+        FinalizeDrainAction::EnqueueCompatibility
     } else if !state.approved_uncached_candidate_ids.is_empty() {
         FinalizeDrainAction::EnqueueCache
     } else if state.pending_visual_work > 0 {
@@ -4387,6 +4484,7 @@ async fn load_finalize_drain_state(
     run_id: &str,
     review_retry_limit: u32,
     cleanup_retry_limit: u32,
+    compatibility_retry_limit: u32,
     cache_limit: u32,
 ) -> WorkerResult<FinalizeDrainState> {
     let pending_discovery = db::first::<CountRow>(
@@ -4409,6 +4507,8 @@ async fn load_finalize_drain_state(
             json!(clone_id),
             json!(run_id),
             json!(review_retry_limit),
+            json!(cleanup_retry_limit),
+            json!(compatibility_retry_limit),
             json!(run_id),
         ],
     )
@@ -4438,6 +4538,21 @@ async fn load_finalize_drain_state(
     .into_iter()
     .map(|row| row.id)
     .collect();
+    let compatibility_candidate_ids = db::all::<IdRow>(
+        db,
+        finalize_compatibility_candidates_sql(),
+        vec![
+            json!(clone_id),
+            json!(run_id),
+            json!(run_id),
+            json!(compatibility_retry_limit),
+            json!(cache_limit),
+        ],
+    )
+    .await?
+    .into_iter()
+    .map(|row| row.id)
+    .collect();
     let approved_uncached_candidate_ids = db::all::<IdRow>(
         db,
         finalize_approved_uncached_candidates_sql(),
@@ -4458,8 +4573,33 @@ async fn load_finalize_drain_state(
         pending_visual_work,
         in_progress_visual_work,
         cleanup_candidate_ids,
+        compatibility_candidate_ids,
         approved_uncached_candidate_ids,
     })
+}
+
+async fn load_candidate_failure_counts(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+) -> WorkerResult<CandidateFailureCountsRow> {
+    Ok(db::first(
+        db,
+        r#"
+        SELECT
+          COALESCE(SUM(CASE WHEN review_status = 'cleanup_failed' THEN 1 ELSE 0 END), 0) AS cleanup_failed,
+          COALESCE(SUM(CASE WHEN review_status = 'compatibility_failed' THEN 1 ELSE 0 END), 0) AS compatibility_failed,
+          COALESCE(SUM(CASE WHEN review_status = 'clone_mismatch' THEN 1 ELSE 0 END), 0) AS clone_mismatch,
+          COALESCE(SUM(CASE WHEN review_status = 'cache_failed' THEN 1 ELSE 0 END), 0) AS cache_failed
+        FROM visual_reference_candidates
+        WHERE clone_id = ?
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+        "#,
+        vec![json!(clone_id), json!(run_id)],
+    )
+    .await?
+    .unwrap_or_default())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6288,6 +6428,14 @@ struct CountRow {
     count: u32,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct CandidateFailureCountsRow {
+    cleanup_failed: u32,
+    compatibility_failed: u32,
+    clone_mismatch: u32,
+    cache_failed: u32,
+}
+
 #[derive(Debug, Deserialize)]
 struct MoodboardCountRow {
     moodboard_id: String,
@@ -7316,9 +7464,13 @@ mod tests {
         assert!(sql.contains("vc.review_status = 'unreviewed'"));
         assert!(sql.contains("vc.review_status = 'review_retryable'"));
         assert!(sql.contains("vc.review_status = 'reviewing'"));
+        assert!(sql.contains("vc.review_status = 'cleanup_pending'"));
+        assert!(sql.contains("vc.review_status = 'cleanup_retryable'"));
+        assert!(sql.contains("vc.review_status = 'compatibility_pending'"));
+        assert!(sql.contains("vc.review_status = 'compatibility_retryable'"));
+        assert!(sql.contains("vc.review_status = 'cache_pending'"));
         assert!(sql.contains("vc.review_status = 'caching'"));
         assert!(sql.contains("$.attempts"));
-        assert!(sql.contains("vc.review_status = 'approved'"));
         assert!(sql.contains("$.approvedRunId"));
         assert!(sql.contains("NOT EXISTS"));
         assert!(sql.contains("INNER JOIN media_assets ma"));
@@ -7328,14 +7480,28 @@ mod tests {
     }
 
     #[test]
+    fn final_status_detail_counts_cleanup_and_compatibility_failures() {
+        let source = include_str!("niche_research.rs");
+        let body = function_body(source, "async fn finalize_reference_pool_message");
+
+        assert!(body.contains("cleanup_failed"));
+        assert!(body.contains("compatibility_failed"));
+        assert!(body.contains("clone_mismatch"));
+        assert!(body.contains("cache_failed"));
+    }
+
+    #[test]
     fn finalize_in_progress_visual_work_sql_detects_reviewing_and_caching_claims() {
         let sql = finalize_in_progress_visual_work_sql();
 
-        assert!(sql.contains(
-            "vc.review_status IN ('reviewing', 'cleanup_pending', 'cleanup_retryable', 'caching')"
-        ));
+        assert!(sql.contains("vc.review_status IN ('reviewing', 'caching')"));
+        assert!(sql.contains("vc.review_status IN ('cleanup_pending', 'cleanup_retryable')"));
+        assert!(sql
+            .contains("vc.review_status IN ('compatibility_pending', 'compatibility_retryable')"));
+        assert!(sql.contains("vc.cleanup_json"));
+        assert!(sql.contains("vc.compatibility_json"));
+        assert!(sql.contains("$.claimStartedAt"));
         assert!(sql.contains("vc.reviewed_at > strftime"));
-        assert!(sql.contains("vc.review_status = 'reviewing'"));
         assert!(sql.contains("NOT EXISTS"));
         assert!(sql.contains("INNER JOIN media_assets ma"));
         assert!(sql.contains("INNER JOIN user_inspiration_pool uip"));
@@ -7347,7 +7513,7 @@ mod tests {
         let sql = finalize_approved_uncached_candidates_sql();
 
         assert!(sql.contains("SELECT vc.id"));
-        assert!(sql.contains("vc.review_status = 'approved'"));
+        assert!(sql.contains("vc.review_status = 'cache_pending'"));
         assert!(sql.contains("vc.review_status = 'caching'"));
         assert!(sql.contains("strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')"));
         assert!(sql.contains("CAST(json_extract(vc.metadata_json, '$.runId') AS TEXT) = ?"));
@@ -7368,6 +7534,22 @@ mod tests {
         assert!(sql.contains("vc.cleanup_json"));
         assert!(sql.contains("$.attempts"));
         assert!(sql.contains(") < ?"));
+        assert!(sql.contains("vc.reviewed_at <= strftime"));
+        assert!(sql.contains("LIMIT ?"));
+    }
+
+    #[test]
+    fn finalize_compatibility_candidates_sql_loads_retryable_compatibility_for_run() {
+        let sql = finalize_compatibility_candidates_sql();
+
+        assert!(sql.contains("SELECT vc.id"));
+        assert!(sql
+            .contains("vc.review_status IN ('compatibility_pending', 'compatibility_retryable')"));
+        assert!(sql.contains("CAST(json_extract(vc.metadata_json, '$.runId') AS TEXT) = ?"));
+        assert!(sql.contains("CAST(json_extract(vc.metadata_json, '$.approvedRunId') AS TEXT) = ?"));
+        assert!(sql.contains("vc.compatibility_json"));
+        assert!(sql.contains("$.attempts"));
+        assert!(sql.contains("$.claimStartedAt"));
         assert!(sql.contains("vc.reviewed_at <= strftime"));
         assert!(sql.contains("LIMIT ?"));
     }
@@ -7619,11 +7801,21 @@ mod tests {
         assert_eq!(
             finalize_drain_action(&FinalizeDrainState {
                 cleanup_candidate_ids: vec!["candidate_1".to_string()],
-                approved_uncached_candidate_ids: vec!["candidate_2".to_string()],
+                compatibility_candidate_ids: vec!["candidate_2".to_string()],
+                approved_uncached_candidate_ids: vec!["candidate_3".to_string()],
                 pending_visual_work: 1,
                 ..FinalizeDrainState::default()
             }),
             FinalizeDrainAction::EnqueueCleanup
+        );
+        assert_eq!(
+            finalize_drain_action(&FinalizeDrainState {
+                compatibility_candidate_ids: vec!["candidate_1".to_string()],
+                approved_uncached_candidate_ids: vec!["candidate_2".to_string()],
+                pending_visual_work: 1,
+                ..FinalizeDrainState::default()
+            }),
+            FinalizeDrainAction::EnqueueCompatibility
         );
         assert_eq!(
             finalize_drain_action(&FinalizeDrainState {
