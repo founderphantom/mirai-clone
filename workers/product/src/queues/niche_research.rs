@@ -3183,7 +3183,7 @@ fn claim_visual_candidate_for_compatibility_sql() -> &'static str {
         SET compatibility_json = json_set(
               CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
               '$.claimStatus',
-              'compatibility_pending',
+              'compatibility_in_progress',
               '$.claimStartedAt',
               ?,
               '$.attempts',
@@ -3203,6 +3203,10 @@ fn claim_visual_candidate_for_compatibility_sql() -> &'static str {
           AND TRIM(cleaned_image_url) <> ''
           AND COALESCE(CAST(json_extract(
             CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+            '$.claimStatus'
+          ) AS TEXT), '') <> 'compatibility_in_progress'
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
             '$.attempts'
           ) AS INTEGER), 0) = ?
           AND COALESCE(CAST(json_extract(
@@ -3218,6 +3222,8 @@ fn mark_candidate_compatibility_succeeded_sql() -> &'static str {
         SET review_status = 'cache_pending',
             compatibility_json = json_set(
               CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+              '$.claimStatus',
+              'compatibility_completed',
               '$.review',
               json(?),
               '$.completedAt',
@@ -3231,6 +3237,10 @@ fn mark_candidate_compatibility_succeeded_sql() -> &'static str {
           AND json_valid(metadata_json)
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND CAST(json_extract(
+            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+            '$.claimStatus'
+          ) AS TEXT) = 'compatibility_in_progress'
           AND COALESCE(CAST(json_extract(
             CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
             '$.attempts'
@@ -3244,6 +3254,8 @@ fn mark_candidate_clone_mismatch_sql() -> &'static str {
         SET review_status = 'clone_mismatch',
             compatibility_json = json_set(
               CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+              '$.claimStatus',
+              'compatibility_mismatched',
               '$.review',
               json(?),
               '$.mismatchedAt',
@@ -3257,6 +3269,10 @@ fn mark_candidate_clone_mismatch_sql() -> &'static str {
           AND json_valid(metadata_json)
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND CAST(json_extract(
+            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+            '$.claimStatus'
+          ) AS TEXT) = 'compatibility_in_progress'
           AND COALESCE(CAST(json_extract(
             CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
             '$.attempts'
@@ -3277,6 +3293,8 @@ fn mark_candidate_compatibility_failed_sql() -> &'static str {
             END,
             compatibility_json = json_set(
               CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+              '$.claimStatus',
+              'compatibility_failed',
               '$.errorCode',
               ?,
               '$.error',
@@ -3292,6 +3310,10 @@ fn mark_candidate_compatibility_failed_sql() -> &'static str {
           AND json_valid(metadata_json)
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND CAST(json_extract(
+            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+            '$.claimStatus'
+          ) AS TEXT) = 'compatibility_in_progress'
           AND COALESCE(CAST(json_extract(
             CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
             '$.attempts'
@@ -7049,6 +7071,16 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_claim_sql_uses_in_progress_json_lease() {
+        let sql = claim_visual_candidate_for_compatibility_sql();
+
+        assert!(sql.contains("'$.claimStatus'"));
+        assert!(sql.contains("'compatibility_in_progress'"));
+        assert!(sql.contains("$.claimStartedAt"));
+        assert!(sql.contains("<> 'compatibility_in_progress'"));
+    }
+
+    #[test]
     fn compatibility_completion_sql_guards_claimed_attempt() {
         for sql in [
             mark_candidate_compatibility_succeeded_sql(),
@@ -7080,6 +7112,14 @@ mod tests {
             assert!(where_clause.contains("$.attempts"));
             assert!(where_clause.contains(") = ?"));
         }
+    }
+
+    #[test]
+    fn compatibility_completion_sql_moves_claim_out_of_in_progress() {
+        assert!(mark_candidate_compatibility_succeeded_sql()
+            .contains("'compatibility_completed'"));
+        assert!(mark_candidate_clone_mismatch_sql().contains("'compatibility_mismatched'"));
+        assert!(mark_candidate_compatibility_failed_sql().contains("'compatibility_failed'"));
     }
 
     #[test]
