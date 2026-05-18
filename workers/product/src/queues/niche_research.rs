@@ -3451,8 +3451,11 @@ fn load_approved_candidate_for_cache_sql() -> &'static str {
           AND id = ?
           AND review_status IN ('cache_pending', 'caching')
           AND json_valid(metadata_json)
+          AND json_valid(compatibility_json)
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND CAST(json_extract(compatibility_json, '$.claimStatus') AS TEXT) = 'compatibility_completed'
+          AND COALESCE(CAST(json_extract(compatibility_json, '$.review.compatible') AS INTEGER), 0) = 1
           AND cleaned_image_url IS NOT NULL
           AND TRIM(cleaned_image_url) <> ''
         LIMIT 1
@@ -7184,6 +7187,10 @@ mod tests {
         assert!(sql.contains("review_status IN ('cache_pending', 'caching')"));
         assert!(sql.contains("cleaned_image_url"));
         assert!(sql.contains("compatibility_json"));
+        assert!(sql.contains("json_valid(compatibility_json)"));
+        assert!(sql.contains("json_extract(compatibility_json, '$.claimStatus')"));
+        assert!(sql.contains("'compatibility_completed'"));
+        assert!(sql.contains("json_extract(compatibility_json, '$.review.compatible')"));
         assert!(!sql.contains("review_status IN ('approved', 'caching')"));
     }
 
