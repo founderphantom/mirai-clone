@@ -3665,12 +3665,14 @@ fn finalize_pending_visual_work_sql() -> &'static str {
                 '$.attempts'
               ) AS INTEGER), 0) < ?
               AND (
-                json_extract(
+                COALESCE(CAST(json_extract(
                   CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
-                  '$.claimStartedAt'
-                ) IS NULL
-                OR vc.reviewed_at IS NULL
-                OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+                  '$.claimStatus'
+                ) AS TEXT), '') <> 'cleanup_in_progress'
+                OR (
+                  vc.reviewed_at IS NOT NULL
+                  AND vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+                )
               )
             )
             OR (
@@ -3680,12 +3682,14 @@ fn finalize_pending_visual_work_sql() -> &'static str {
                 '$.attempts'
               ) AS INTEGER), 0) < ?
               AND (
-                json_extract(
+                COALESCE(CAST(json_extract(
                   CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
-                  '$.claimStartedAt'
-                ) IS NULL
-                OR vc.reviewed_at IS NULL
-                OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+                  '$.claimStatus'
+                ) AS TEXT), '') <> 'cleanup_in_progress'
+                OR (
+                  vc.reviewed_at IS NOT NULL
+                  AND vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+                )
               )
             )
             OR (
@@ -3695,12 +3699,14 @@ fn finalize_pending_visual_work_sql() -> &'static str {
                 '$.attempts'
               ) AS INTEGER), 0) < ?
               AND (
-                json_extract(
+                COALESCE(CAST(json_extract(
                   CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
-                  '$.claimStartedAt'
-                ) IS NULL
-                OR vc.reviewed_at IS NULL
-                OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+                  '$.claimStatus'
+                ) AS TEXT), '') <> 'compatibility_in_progress'
+                OR (
+                  vc.reviewed_at IS NOT NULL
+                  AND vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+                )
               )
             )
             OR (
@@ -3710,12 +3716,14 @@ fn finalize_pending_visual_work_sql() -> &'static str {
                 '$.attempts'
               ) AS INTEGER), 0) < ?
               AND (
-                json_extract(
+                COALESCE(CAST(json_extract(
                   CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
-                  '$.claimStartedAt'
-                ) IS NULL
-                OR vc.reviewed_at IS NULL
-                OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+                  '$.claimStatus'
+                ) AS TEXT), '') <> 'compatibility_in_progress'
+                OR (
+                  vc.reviewed_at IS NOT NULL
+                  AND vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+                )
               )
             )
             OR (
@@ -3765,17 +3773,17 @@ fn finalize_in_progress_visual_work_sql() -> &'static str {
             vc.review_status IN ('reviewing', 'caching')
             OR (
               vc.review_status IN ('cleanup_pending', 'cleanup_retryable')
-              AND json_extract(
+              AND CAST(json_extract(
                 CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
-                '$.claimStartedAt'
-              ) IS NOT NULL
+                '$.claimStatus'
+              ) AS TEXT) = 'cleanup_in_progress'
             )
             OR (
               vc.review_status IN ('compatibility_pending', 'compatibility_retryable')
-              AND json_extract(
+              AND CAST(json_extract(
                 CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
-                '$.claimStartedAt'
-              ) IS NOT NULL
+                '$.claimStatus'
+              ) AS TEXT) = 'compatibility_in_progress'
             )
           )
           AND (
@@ -3815,12 +3823,14 @@ fn finalize_cleanup_candidates_sql() -> &'static str {
             '$.attempts'
           ) AS INTEGER), 0) < ?
           AND (
-            json_extract(
+            COALESCE(CAST(json_extract(
               CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
-              '$.claimStartedAt'
-            ) IS NULL
-            OR vc.reviewed_at IS NULL
-            OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+              '$.claimStatus'
+            ) AS TEXT), '') <> 'cleanup_in_progress'
+            OR (
+              vc.reviewed_at IS NOT NULL
+              AND vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+            )
           )
           AND vc.image_url IS NOT NULL
           AND TRIM(vc.image_url) <> ''
@@ -3843,12 +3853,14 @@ fn finalize_compatibility_candidates_sql() -> &'static str {
             '$.attempts'
           ) AS INTEGER), 0) < ?
           AND (
-            json_extract(
+            COALESCE(CAST(json_extract(
               CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
-              '$.claimStartedAt'
-            ) IS NULL
-            OR vc.reviewed_at IS NULL
-            OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+              '$.claimStatus'
+            ) AS TEXT), '') <> 'compatibility_in_progress'
+            OR (
+              vc.reviewed_at IS NOT NULL
+              AND vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+            )
           )
           AND vc.cleaned_image_url IS NOT NULL
           AND TRIM(vc.cleaned_image_url) <> ''
@@ -7602,8 +7614,12 @@ mod tests {
             assert!(branch.contains("vc.cleanup_json"));
             assert!(branch.contains("$.attempts"));
             assert!(branch.contains(") < ?"));
-            assert!(branch.contains("$.claimStartedAt"));
+            assert!(branch.contains("$.claimStatus"));
+            assert!(branch.contains("<> 'cleanup_in_progress'"));
+            assert!(branch.contains("vc.reviewed_at IS NOT NULL"));
             assert!(branch.contains("vc.reviewed_at <= strftime"));
+            assert!(!branch.contains("$.claimStartedAt"));
+            assert!(!branch.contains("OR vc.reviewed_at IS NULL"));
         }
 
         for branch in [
@@ -7613,8 +7629,12 @@ mod tests {
             assert!(branch.contains("vc.compatibility_json"));
             assert!(branch.contains("$.attempts"));
             assert!(branch.contains(") < ?"));
-            assert!(branch.contains("$.claimStartedAt"));
+            assert!(branch.contains("$.claimStatus"));
+            assert!(branch.contains("<> 'compatibility_in_progress'"));
+            assert!(branch.contains("vc.reviewed_at IS NOT NULL"));
             assert!(branch.contains("vc.reviewed_at <= strftime"));
+            assert!(!branch.contains("$.claimStartedAt"));
+            assert!(!branch.contains("OR vc.reviewed_at IS NULL"));
         }
     }
 
@@ -7639,7 +7659,10 @@ mod tests {
             .contains("vc.review_status IN ('compatibility_pending', 'compatibility_retryable')"));
         assert!(sql.contains("vc.cleanup_json"));
         assert!(sql.contains("vc.compatibility_json"));
-        assert!(sql.contains("$.claimStartedAt"));
+        assert!(sql.contains("$.claimStatus"));
+        assert!(sql.contains("'cleanup_in_progress'"));
+        assert!(sql.contains("'compatibility_in_progress'"));
+        assert!(!sql.contains("$.claimStartedAt"));
         assert!(sql.contains("vc.reviewed_at > strftime"));
         assert!(sql.contains("NOT EXISTS"));
         assert!(sql.contains("INNER JOIN media_assets ma"));
@@ -7673,7 +7696,12 @@ mod tests {
         assert!(sql.contains("vc.cleanup_json"));
         assert!(sql.contains("$.attempts"));
         assert!(sql.contains(") < ?"));
+        assert!(sql.contains("$.claimStatus"));
+        assert!(sql.contains("<> 'cleanup_in_progress'"));
+        assert!(sql.contains("vc.reviewed_at IS NOT NULL"));
         assert!(sql.contains("vc.reviewed_at <= strftime"));
+        assert!(!sql.contains("$.claimStartedAt"));
+        assert!(!sql.contains("OR vc.reviewed_at IS NULL"));
         assert!(sql.contains("LIMIT ?"));
     }
 
@@ -7688,8 +7716,12 @@ mod tests {
         assert!(sql.contains("CAST(json_extract(vc.metadata_json, '$.approvedRunId') AS TEXT) = ?"));
         assert!(sql.contains("vc.compatibility_json"));
         assert!(sql.contains("$.attempts"));
-        assert!(sql.contains("$.claimStartedAt"));
+        assert!(sql.contains("$.claimStatus"));
+        assert!(sql.contains("<> 'compatibility_in_progress'"));
+        assert!(sql.contains("vc.reviewed_at IS NOT NULL"));
         assert!(sql.contains("vc.reviewed_at <= strftime"));
+        assert!(!sql.contains("$.claimStartedAt"));
+        assert!(!sql.contains("OR vc.reviewed_at IS NULL"));
         assert!(sql.contains("LIMIT ?"));
     }
 
