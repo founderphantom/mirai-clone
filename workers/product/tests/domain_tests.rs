@@ -231,6 +231,15 @@ fn visual_reference_cache_accepts_static_image_content_types() {
 }
 
 #[test]
+fn visual_reference_cache_metadata_uses_cleaned_remote_url_label() {
+    let source = include_str!("../src/services/visual_reference_cache.rs");
+
+    assert!(source.contains("cleaned_image_url"));
+    assert!(source.contains("\"cleanedImageUrl\""));
+    assert!(!source.contains("original_image_url"));
+}
+
+#[test]
 fn candidate_ranking_prefers_static_configured_recent_engaged_images() {
     let candidates = vec![
         ranking_candidate(
@@ -2794,9 +2803,7 @@ fn visual_reference_review_prompt_contains_guardrail_and_caption_rules() {
     assert!(prompt.contains("\"adultLikely\""));
     assert!(prompt.contains("\"visualFitScore\""));
     assert!(prompt.contains("visualFitScore must be a unit score from 0 to 1"));
-    assert!(prompt.contains(
-        "Do not reject solely because caption/source text includes"
-    ));
+    assert!(prompt.contains("Do not reject solely because caption/source text includes"));
     assert!(prompt.contains("discount code"));
     assert!(prompt.contains("brand tag"));
     assert!(prompt.contains("photographer credit"));

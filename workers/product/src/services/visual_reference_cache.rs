@@ -56,11 +56,11 @@ pub async fn cache_approved_visual_reference(
     user_id: &str,
     clone_id: &str,
     visual_reference_id: &str,
-    original_image_url: &str,
+    cleaned_image_url: &str,
     width: Option<u32>,
     height: Option<u32>,
 ) -> WorkerResult<CachedVisualReference> {
-    let (bytes, content_type) = fetch_visual_reference_image(original_image_url).await?;
+    let (bytes, content_type) = fetch_visual_reference_image(cleaned_image_url).await?;
     let byte_size = bytes.len();
     let sha256_hex = sha256_hex(&bytes);
     let media_asset_id = visual_reference_media_asset_id(user_id, clone_id, visual_reference_id);
@@ -111,9 +111,13 @@ pub async fn cache_approved_visual_reference(
             json!(byte_size),
             json!(width),
             json!(height),
-            json!(original_image_url),
+            json!(cleaned_image_url),
             json!(sha256_hex.clone()),
-            json!(json!({ "visualReferenceId": visual_reference_id }).to_string()),
+            json!(json!({
+                "visualReferenceId": visual_reference_id,
+                "cleanedImageUrl": cleaned_image_url
+            })
+            .to_string()),
             json!(now),
         ],
     )

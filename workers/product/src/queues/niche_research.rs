@@ -2217,7 +2217,7 @@ async fn cache_approved_reference_message(
         user_id,
         clone_id,
         &visual_reference_id,
-        &candidate.image_url,
+        &candidate.cleaned_image_url,
         candidate.image_width,
         candidate.image_height,
     )
@@ -3407,7 +3407,7 @@ fn claim_visual_candidate_for_cache_sql() -> &'static str {
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
           AND (
-            review_status = 'approved'
+            review_status = 'cache_pending'
             OR (
               review_status = 'caching'
               AND reviewed_at IS NOT NULL
@@ -3439,21 +3439,22 @@ fn load_approved_candidate_for_cache_sql() -> &'static str {
           source_post_code,
           source_url,
           source_published_at,
-          image_url,
+          cleaned_image_url,
           image_width,
           image_height,
           moodboard_id,
           moodboard_slug,
-          review_json
+          review_json,
+          compatibility_json
         FROM visual_reference_candidates
         WHERE clone_id = ?
           AND id = ?
-          AND review_status IN ('approved', 'caching')
+          AND review_status IN ('cache_pending', 'caching')
           AND json_valid(metadata_json)
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
-          AND image_url IS NOT NULL
-          AND TRIM(image_url) <> ''
+          AND cleaned_image_url IS NOT NULL
+          AND TRIM(cleaned_image_url) <> ''
         LIMIT 1
         "#
 }
@@ -3491,7 +3492,7 @@ fn mark_candidate_cache_failed_sql() -> &'static str {
 fn mark_candidate_cache_succeeded_sql() -> &'static str {
     r#"
         UPDATE visual_reference_candidates
-        SET review_status = 'approved',
+        SET review_status = 'cached',
             reviewed_at = ?,
             metadata_json = json_set(
               CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,
@@ -6363,12 +6364,13 @@ struct ApprovedVisualCandidateRow {
     source_post_code: Option<String>,
     source_url: Option<String>,
     source_published_at: Option<String>,
-    image_url: String,
+    cleaned_image_url: String,
     image_width: Option<u32>,
     image_height: Option<u32>,
     moodboard_id: Option<String>,
     moodboard_slug: Option<String>,
     review_json: String,
+    compatibility_json: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -7116,8 +7118,7 @@ mod tests {
 
     #[test]
     fn compatibility_completion_sql_moves_claim_out_of_in_progress() {
-        assert!(mark_candidate_compatibility_succeeded_sql()
-            .contains("'compatibility_completed'"));
+        assert!(mark_candidate_compatibility_succeeded_sql().contains("'compatibility_completed'"));
         assert!(mark_candidate_clone_mismatch_sql().contains("'compatibility_mismatched'"));
         assert!(mark_candidate_compatibility_failed_sql().contains("'compatibility_failed'"));
     }
@@ -7176,10 +7177,7 @@ mod tests {
         assert!(stale_guard_pos < ai_call_pos);
     }
 
-    // Task 11 owns the cleaned-image cache contract. Keep this test ignored here so
-    // Task 10 can land compatibility state without changing cache consumption.
     #[test]
-    #[ignore = "Task 11 updates cache load to require cleaned compatible candidates"]
     fn cache_load_requires_cleaned_compatible_candidate() {
         let sql = load_approved_candidate_for_cache_sql();
 
@@ -7228,7 +7226,7 @@ mod tests {
         let sql = claim_visual_candidate_for_cache_sql();
 
         assert!(sql.contains("SET review_status = 'caching'"));
-        assert!(sql.contains("review_status = 'approved'"));
+        assert!(sql.contains("review_status = 'cache_pending'"));
         assert!(sql.contains("review_status = 'caching'"));
         assert!(sql.contains("strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')"));
         assert!(sql.contains("CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?"));
