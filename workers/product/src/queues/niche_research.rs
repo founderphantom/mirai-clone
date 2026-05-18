@@ -3113,7 +3113,7 @@ fn claim_visual_candidate_for_cleanup_sql() -> &'static str {
         SET cleanup_json = json_set(
               CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
               '$.claimStatus',
-              'cleanup_pending',
+              'cleanup_in_progress',
               '$.claimStartedAt',
               ?,
               '$.attempts',
@@ -3137,6 +3137,16 @@ fn claim_visual_candidate_for_cleanup_sql() -> &'static str {
             CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
             '$.attempts'
           ) AS INTEGER), 0) < ?
+          AND (
+            COALESCE(CAST(json_extract(
+              CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+              '$.claimStatus'
+            ) AS TEXT), '') <> 'cleanup_in_progress'
+            OR (
+              reviewed_at IS NOT NULL
+              AND reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+            )
+          )
           AND image_url IS NOT NULL
           AND TRIM(image_url) <> ''
         "#
@@ -3149,6 +3159,8 @@ fn mark_candidate_cleanup_succeeded_sql() -> &'static str {
             cleaned_image_url = ?,
             cleanup_json = json_set(
               CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+              '$.claimStatus',
+              'cleanup_completed',
               '$.cleanedImageUrl',
               ?,
               '$.providerJobId',
@@ -3164,6 +3176,10 @@ fn mark_candidate_cleanup_succeeded_sql() -> &'static str {
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
           AND review_status IN ('cleanup_pending', 'cleanup_retryable')
+          AND CAST(json_extract(
+            CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+            '$.claimStatus'
+          ) AS TEXT) = 'cleanup_in_progress'
           AND COALESCE(CAST(json_extract(
             CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
             '$.attempts'
@@ -3184,6 +3200,15 @@ fn mark_candidate_cleanup_failed_sql() -> &'static str {
             END,
             cleanup_json = json_set(
               CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+              '$.claimStatus',
+              CASE
+                WHEN COALESCE(CAST(json_extract(
+                  CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+                  '$.attempts'
+                ) AS INTEGER), 0) < ?
+                THEN 'cleanup_retryable'
+                ELSE 'cleanup_failed'
+              END,
               '$.errorCode',
               ?,
               '$.error',
@@ -3199,6 +3224,10 @@ fn mark_candidate_cleanup_failed_sql() -> &'static str {
           AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
           AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
           AND review_status IN ('cleanup_pending', 'cleanup_retryable')
+          AND CAST(json_extract(
+            CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
+            '$.claimStatus'
+          ) AS TEXT) = 'cleanup_in_progress'
           AND COALESCE(CAST(json_extract(
             CASE WHEN json_valid(cleanup_json) THEN cleanup_json ELSE '{}' END,
             '$.attempts'
@@ -3230,10 +3259,16 @@ fn claim_visual_candidate_for_compatibility_sql() -> &'static str {
           AND review_status IN ('compatibility_pending', 'compatibility_retryable')
           AND cleaned_image_url IS NOT NULL
           AND TRIM(cleaned_image_url) <> ''
-          AND COALESCE(CAST(json_extract(
-            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
-            '$.claimStatus'
-          ) AS TEXT), '') <> 'compatibility_in_progress'
+          AND (
+            COALESCE(CAST(json_extract(
+              CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+              '$.claimStatus'
+            ) AS TEXT), '') <> 'compatibility_in_progress'
+            OR (
+              reviewed_at IS NOT NULL
+              AND reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+            )
+          )
           AND COALESCE(CAST(json_extract(
             CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
             '$.attempts'
@@ -3623,21 +3658,65 @@ fn finalize_pending_visual_work_sql() -> &'static str {
               AND vc.reviewed_at IS NOT NULL
               AND vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
             )
-            OR vc.review_status = 'cleanup_pending'
+            OR (
+              vc.review_status = 'cleanup_pending'
+              AND COALESCE(CAST(json_extract(
+                CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
+                '$.attempts'
+              ) AS INTEGER), 0) < ?
+              AND (
+                json_extract(
+                  CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
+                  '$.claimStartedAt'
+                ) IS NULL
+                OR vc.reviewed_at IS NULL
+                OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+              )
+            )
             OR (
               vc.review_status = 'cleanup_retryable'
               AND COALESCE(CAST(json_extract(
                 CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
                 '$.attempts'
               ) AS INTEGER), 0) < ?
+              AND (
+                json_extract(
+                  CASE WHEN json_valid(vc.cleanup_json) THEN vc.cleanup_json ELSE '{}' END,
+                  '$.claimStartedAt'
+                ) IS NULL
+                OR vc.reviewed_at IS NULL
+                OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+              )
             )
-            OR vc.review_status = 'compatibility_pending'
+            OR (
+              vc.review_status = 'compatibility_pending'
+              AND COALESCE(CAST(json_extract(
+                CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
+                '$.attempts'
+              ) AS INTEGER), 0) < ?
+              AND (
+                json_extract(
+                  CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
+                  '$.claimStartedAt'
+                ) IS NULL
+                OR vc.reviewed_at IS NULL
+                OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+              )
+            )
             OR (
               vc.review_status = 'compatibility_retryable'
               AND COALESCE(CAST(json_extract(
                 CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
                 '$.attempts'
               ) AS INTEGER), 0) < ?
+              AND (
+                json_extract(
+                  CASE WHEN json_valid(vc.compatibility_json) THEN vc.compatibility_json ELSE '{}' END,
+                  '$.claimStartedAt'
+                ) IS NULL
+                OR vc.reviewed_at IS NULL
+                OR vc.reviewed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')
+              )
             )
             OR (
               (
@@ -4508,6 +4587,8 @@ async fn load_finalize_drain_state(
             json!(run_id),
             json!(review_retry_limit),
             json!(cleanup_retry_limit),
+            json!(cleanup_retry_limit),
+            json!(compatibility_retry_limit),
             json!(compatibility_retry_limit),
             json!(run_id),
         ],
@@ -4813,6 +4894,7 @@ async fn mark_candidate_cleanup_failed(
         db,
         mark_candidate_cleanup_failed_sql(),
         vec![
+            json!(cleanup_retry_limit),
             json!(cleanup_retry_limit),
             json!(code),
             json!(compact_error),
@@ -7153,6 +7235,17 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_claim_sql_uses_reclaimable_in_progress_json_lease() {
+        let sql = claim_visual_candidate_for_cleanup_sql();
+
+        assert!(sql.contains("'$.claimStatus'"));
+        assert!(sql.contains("'cleanup_in_progress'"));
+        assert!(sql.contains("$.claimStartedAt"));
+        assert!(sql.contains("<> 'cleanup_in_progress'"));
+        assert!(sql.contains("reviewed_at <= strftime"));
+    }
+
+    #[test]
     fn cleanup_completion_sql_guards_claimed_attempt() {
         for sql in [
             mark_candidate_cleanup_succeeded_sql(),
@@ -7161,6 +7254,8 @@ mod tests {
             let where_clause = sql.split("WHERE id = ?").nth(1).expect("where clause");
 
             assert!(where_clause.contains("cleanup_json"));
+            assert!(where_clause.contains("$.claimStatus"));
+            assert!(where_clause.contains("'cleanup_in_progress'"));
             assert!(where_clause.contains("$.attempts"));
             assert!(where_clause.contains(") = ?"));
         }
@@ -7231,6 +7326,7 @@ mod tests {
         assert!(sql.contains("'compatibility_in_progress'"));
         assert!(sql.contains("$.claimStartedAt"));
         assert!(sql.contains("<> 'compatibility_in_progress'"));
+        assert!(sql.contains("reviewed_at <= strftime"));
     }
 
     #[test]
@@ -7477,6 +7573,49 @@ mod tests {
         assert!(sql.contains("INNER JOIN user_inspiration_pool uip"));
         assert!(sql.contains("vr.candidate_id = vc.id"));
         assert!(sql.contains("ma.storage_key IS NOT NULL"));
+    }
+
+    #[test]
+    fn finalize_visual_drain_sql_counts_only_actionable_cleanup_and_compatibility_work() {
+        let sql = finalize_pending_visual_work_sql();
+
+        let cleanup_pending = sql
+            .find("vc.review_status = 'cleanup_pending'")
+            .expect("cleanup pending branch");
+        let cleanup_retryable = sql
+            .find("vc.review_status = 'cleanup_retryable'")
+            .expect("cleanup retryable branch");
+        let compatibility_pending = sql
+            .find("vc.review_status = 'compatibility_pending'")
+            .expect("compatibility pending branch");
+        let compatibility_retryable = sql
+            .find("vc.review_status = 'compatibility_retryable'")
+            .expect("compatibility retryable branch");
+        let cache_pending = sql
+            .find("vc.review_status = 'cache_pending'")
+            .expect("cache pending branch");
+
+        for branch in [
+            &sql[cleanup_pending..cleanup_retryable],
+            &sql[cleanup_retryable..compatibility_pending],
+        ] {
+            assert!(branch.contains("vc.cleanup_json"));
+            assert!(branch.contains("$.attempts"));
+            assert!(branch.contains(") < ?"));
+            assert!(branch.contains("$.claimStartedAt"));
+            assert!(branch.contains("vc.reviewed_at <= strftime"));
+        }
+
+        for branch in [
+            &sql[compatibility_pending..compatibility_retryable],
+            &sql[compatibility_retryable..cache_pending],
+        ] {
+            assert!(branch.contains("vc.compatibility_json"));
+            assert!(branch.contains("$.attempts"));
+            assert!(branch.contains(") < ?"));
+            assert!(branch.contains("$.claimStartedAt"));
+            assert!(branch.contains("vc.reviewed_at <= strftime"));
+        }
     }
 
     #[test]
