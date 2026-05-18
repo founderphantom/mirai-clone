@@ -3216,7 +3216,13 @@ fn mark_candidate_compatibility_succeeded_sql() -> &'static str {
     r#"
         UPDATE visual_reference_candidates
         SET review_status = 'cache_pending',
-            compatibility_json = ?,
+            compatibility_json = json_set(
+              CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+              '$.review',
+              json(?),
+              '$.completedAt',
+              ?
+            ),
             rejection_reason = NULL,
             reviewed_at = ?
         WHERE id = ?
@@ -3236,7 +3242,13 @@ fn mark_candidate_clone_mismatch_sql() -> &'static str {
     r#"
         UPDATE visual_reference_candidates
         SET review_status = 'clone_mismatch',
-            compatibility_json = ?,
+            compatibility_json = json_set(
+              CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+              '$.review',
+              json(?),
+              '$.mismatchedAt',
+              ?
+            ),
             rejection_reason = ?,
             reviewed_at = ?
         WHERE id = ?
@@ -4784,6 +4796,7 @@ async fn mark_candidate_compatibility_succeeded(
         vec![
             json!(compatibility_json),
             json!(now),
+            json!(now),
             json!(candidate_id),
             json!(clone_id),
             json!(run_id),
@@ -4810,6 +4823,7 @@ async fn mark_candidate_clone_mismatch(
         mark_candidate_clone_mismatch_sql(),
         vec![
             json!(compatibility_json),
+            json!(now),
             json!(reason),
             json!(now),
             json!(candidate_id),
@@ -7043,6 +7057,25 @@ mod tests {
         ] {
             let where_clause = sql.split("WHERE id = ?").nth(1).expect("where clause");
 
+            assert!(where_clause.contains("compatibility_json"));
+            assert!(where_clause.contains("$.attempts"));
+            assert!(where_clause.contains(") = ?"));
+        }
+    }
+
+    #[test]
+    fn compatibility_success_and_mismatch_preserve_attempt_audit_metadata() {
+        for sql in [
+            mark_candidate_compatibility_succeeded_sql(),
+            mark_candidate_clone_mismatch_sql(),
+        ] {
+            assert!(sql.contains(
+                "compatibility_json = json_set(\n              CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END"
+            ));
+            assert!(sql.contains("'$.review'"));
+            assert!(sql.contains("$.attempts"));
+
+            let where_clause = sql.split("WHERE id = ?").nth(1).expect("where clause");
             assert!(where_clause.contains("compatibility_json"));
             assert!(where_clause.contains("$.attempts"));
             assert!(where_clause.contains(") = ?"));
