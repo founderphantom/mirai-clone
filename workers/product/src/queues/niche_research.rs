@@ -1,9 +1,12 @@
-use crate::ai::workers_ai::{run_vision_json, visual_reference_review_prompt};
+use crate::ai::workers_ai::{
+    clone_compatibility_prompt, run_multi_vision_json, run_vision_json,
+    visual_reference_review_prompt, CloneCompatibilityReview,
+};
 use crate::db;
 use crate::domain::visual_reference::{
-    accept_visual_review, rank_candidates_for_review, selected_moodboard_count_is_valid,
-    visual_review_tags, CandidateDiversityCaps, MoodboardBrief, VisualCandidateForRanking,
-    VisualReferenceReview,
+    accept_clone_compatibility, accept_visual_review, rank_candidates_for_review,
+    selected_moodboard_count_is_valid, visual_review_tags, CandidateDiversityCaps, MoodboardBrief,
+    VisualCandidateForRanking, VisualReferenceReview,
 };
 use crate::providers::higgsfield_auth::provider_account_access_token;
 use crate::providers::higgsfield_mcp::{call_tool, upload_media_files, HiggsfieldMcpMediaFile};
@@ -20,6 +23,7 @@ use crate::providers::seedream::{
 };
 use crate::services::blitz::create_next_batch;
 use crate::services::visual_reference_cache::cache_approved_visual_reference;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1902,18 +1906,227 @@ fn cleanup_extension(content_type: &str) -> &'static str {
 
 async fn validate_clone_compatibility_message(
     db: &D1Database,
-    _env: &Env,
+    env: &Env,
     user_id: &str,
     clone_id: &str,
     run_id: Option<&str>,
-    _candidate_id: &str,
+    candidate_id: &str,
 ) -> WorkerResult<()> {
-    let Some(_run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
+    let Some(run_id) = current_message_run_id(db, user_id, clone_id, run_id).await? else {
         return Ok(());
     };
-    Err(Error::RustError(
-        "validate_clone_compatibility_not_implemented".to_string(),
-    ))
+    let status_write = set_clone_research_status_with_run_result(
+        db,
+        user_id,
+        clone_id,
+        research_status_for_phase(ResearchPhase::Reviewing),
+        &format!("validating clone compatibility candidate={candidate_id}"),
+        Some(&run_id),
+        Some(&run_id),
+    )
+    .await?;
+    if !status_write_allows_side_effects(status_write) {
+        return Ok(());
+    }
+
+    let config = load_config_map(db).await?;
+    let compatibility_retry_limit =
+        config_u32(&config, "visual_reference_compatibility_retry_limit", 3).max(1);
+    let clone_reference_limit =
+        config_u32(&config, "clone_compatibility_reference_limit", 6).max(1);
+    let review_limit = config_u32(&config, "instagram_candidate_review_limit", 60).max(1);
+    let Some(candidate) =
+        load_candidate_for_compatibility(db, clone_id, &run_id, candidate_id).await?
+    else {
+        return Ok(());
+    };
+    let observed_attempts = attempts_from_json(&candidate.compatibility_json);
+    let claimed = claim_visual_candidate_for_compatibility(
+        db,
+        clone_id,
+        &run_id,
+        &candidate.id,
+        observed_attempts,
+        compatibility_retry_limit,
+    )
+    .await?;
+    if !claimed {
+        enqueue_delayed_finalize_reference_pool(
+            env,
+            user_id,
+            clone_id,
+            &run_id,
+            "clone_compatibility_claim_pending",
+        )
+        .await?;
+        return Ok(());
+    }
+    let expected_compatibility_attempt = observed_attempts.saturating_add(1);
+    if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let clone_reference_urls_result =
+        load_clone_reference_image_urls(db, env, user_id, clone_id, clone_reference_limit).await;
+    if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let compatibility_result = match clone_reference_urls_result {
+        Ok(clone_reference_urls) if clone_reference_urls.is_empty() => Err(Error::RustError(
+            "clone_compatibility_reference_missing".to_string(),
+        )),
+        Ok(clone_reference_urls) => {
+            let mut image_urls = vec![candidate.cleaned_image_url.clone()];
+            image_urls.extend(clone_reference_urls);
+            let prompt = clone_compatibility_prompt(image_urls.len().saturating_sub(1));
+            match env.ai("AI") {
+                Ok(ai) => {
+                    run_multi_vision_json::<CloneCompatibilityReview>(&ai, &prompt, &image_urls)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    match compatibility_result {
+        Ok(review) => {
+            let compatibility_json =
+                serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string());
+            match accept_clone_compatibility(&review) {
+                Ok(()) => {
+                    let marked = mark_candidate_compatibility_succeeded(
+                        db,
+                        clone_id,
+                        &run_id,
+                        &candidate.id,
+                        &compatibility_json,
+                        expected_compatibility_attempt,
+                    )
+                    .await?;
+                    if !marked {
+                        return Ok(());
+                    }
+                    if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+                        .await?
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
+                    env.queue("NICHE_RESEARCH_QUEUE")?
+                        .send(NicheResearchMessage::CacheApprovedReference {
+                            user_id: user_id.to_string(),
+                            clone_id: clone_id.to_string(),
+                            run_id: Some(run_id),
+                            candidate_id: candidate.id,
+                        })
+                        .await?;
+                }
+                Err(reason) => {
+                    let marked = mark_candidate_clone_mismatch(
+                        db,
+                        clone_id,
+                        &run_id,
+                        &candidate.id,
+                        &compatibility_json,
+                        reason,
+                        expected_compatibility_attempt,
+                    )
+                    .await?;
+                    if !marked {
+                        return Ok(());
+                    }
+                    if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+                        .await?
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
+                    env.queue("NICHE_RESEARCH_QUEUE")?
+                        .send(NicheResearchMessage::ReviewVisualCandidates {
+                            user_id: user_id.to_string(),
+                            clone_id: clone_id.to_string(),
+                            run_id: Some(run_id.clone()),
+                            limit: review_limit,
+                        })
+                        .await?;
+                    enqueue_delayed_finalize_reference_pool(
+                        env,
+                        user_id,
+                        clone_id,
+                        &run_id,
+                        "clone_compatibility_mismatch",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Err(error) => {
+            let error_detail = error.to_string();
+            let code = clone_compatibility_error_code(&error_detail);
+            let marked = mark_candidate_compatibility_failed(
+                db,
+                clone_id,
+                &run_id,
+                &candidate.id,
+                compatibility_retry_limit,
+                expected_compatibility_attempt,
+                code,
+                &error_detail,
+            )
+            .await?;
+            if !marked {
+                return Ok(());
+            }
+            if current_message_run_id(db, user_id, clone_id, Some(&run_id))
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
+            if expected_compatibility_attempt < compatibility_retry_limit {
+                env.queue("NICHE_RESEARCH_QUEUE")?
+                    .send(NicheResearchMessage::ValidateCloneCompatibility {
+                        user_id: user_id.to_string(),
+                        clone_id: clone_id.to_string(),
+                        run_id: Some(run_id.clone()),
+                        candidate_id: candidate.id.clone(),
+                    })
+                    .await?;
+            }
+            env.queue("NICHE_RESEARCH_QUEUE")?
+                .send(NicheResearchMessage::ReviewVisualCandidates {
+                    user_id: user_id.to_string(),
+                    clone_id: clone_id.to_string(),
+                    run_id: Some(run_id.clone()),
+                    limit: review_limit,
+                })
+                .await?;
+            enqueue_delayed_finalize_reference_pool(
+                env,
+                user_id,
+                clone_id,
+                &run_id,
+                "clone_compatibility_failed",
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn cache_approved_reference_message(
@@ -2964,6 +3177,116 @@ fn mark_candidate_cleanup_failed_sql() -> &'static str {
         "#
 }
 
+fn claim_visual_candidate_for_compatibility_sql() -> &'static str {
+    r#"
+        UPDATE visual_reference_candidates
+        SET compatibility_json = json_set(
+              CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+              '$.claimStatus',
+              'compatibility_pending',
+              '$.claimStartedAt',
+              ?,
+              '$.attempts',
+              COALESCE(CAST(json_extract(
+                CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+                '$.attempts'
+              ) AS INTEGER), 0) + 1
+            ),
+            reviewed_at = ?
+        WHERE id = ?
+          AND clone_id = ?
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND review_status IN ('compatibility_pending', 'compatibility_retryable')
+          AND cleaned_image_url IS NOT NULL
+          AND TRIM(cleaned_image_url) <> ''
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) = ?
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) < ?
+        "#
+}
+
+fn mark_candidate_compatibility_succeeded_sql() -> &'static str {
+    r#"
+        UPDATE visual_reference_candidates
+        SET review_status = 'cache_pending',
+            compatibility_json = ?,
+            rejection_reason = NULL,
+            reviewed_at = ?
+        WHERE id = ?
+          AND clone_id = ?
+          AND review_status IN ('compatibility_pending', 'compatibility_retryable')
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) = ?
+        "#
+}
+
+fn mark_candidate_clone_mismatch_sql() -> &'static str {
+    r#"
+        UPDATE visual_reference_candidates
+        SET review_status = 'clone_mismatch',
+            compatibility_json = ?,
+            rejection_reason = ?,
+            reviewed_at = ?
+        WHERE id = ?
+          AND clone_id = ?
+          AND review_status IN ('compatibility_pending', 'compatibility_retryable')
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) = ?
+        "#
+}
+
+fn mark_candidate_compatibility_failed_sql() -> &'static str {
+    r#"
+        UPDATE visual_reference_candidates
+        SET review_status = CASE
+              WHEN COALESCE(CAST(json_extract(
+                CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+                '$.attempts'
+              ) AS INTEGER), 0) < ?
+              THEN 'compatibility_retryable'
+              ELSE 'compatibility_failed'
+            END,
+            compatibility_json = json_set(
+              CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+              '$.errorCode',
+              ?,
+              '$.error',
+              ?,
+              '$.failedAt',
+              ?
+            ),
+            rejection_reason = ?,
+            reviewed_at = ?
+        WHERE id = ?
+          AND clone_id = ?
+          AND review_status IN ('compatibility_pending', 'compatibility_retryable')
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND COALESCE(CAST(json_extract(
+            CASE WHEN json_valid(compatibility_json) THEN compatibility_json ELSE '{}' END,
+            '$.attempts'
+          ) AS INTEGER), 0) = ?
+        "#
+}
+
 fn remaining_retryable_visual_candidates_sql() -> &'static str {
     r#"
         SELECT COUNT(*) AS count
@@ -3071,6 +3394,33 @@ fn claim_visual_candidate_for_cache_sql() -> &'static str {
               AND vr.media_asset_id IS NOT NULL
             LIMIT 1
           )
+        "#
+}
+
+fn load_approved_candidate_for_cache_sql() -> &'static str {
+    r#"
+        SELECT
+          id,
+          source_handle,
+          source_post_code,
+          source_url,
+          source_published_at,
+          image_url,
+          image_width,
+          image_height,
+          moodboard_id,
+          moodboard_slug,
+          review_json
+        FROM visual_reference_candidates
+        WHERE clone_id = ?
+          AND id = ?
+          AND review_status IN ('approved', 'caching')
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND image_url IS NOT NULL
+          AND TRIM(image_url) <> ''
+        LIMIT 1
         "#
 }
 
@@ -4302,6 +4652,220 @@ async fn mark_candidate_cleanup_failed(
     Ok(changed_rows(&result)? > 0)
 }
 
+async fn load_candidate_for_compatibility(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+) -> WorkerResult<Option<CompatibilityCandidateRow>> {
+    db::first(
+        db,
+        r#"
+        SELECT id, cleaned_image_url, compatibility_json
+        FROM visual_reference_candidates
+        WHERE clone_id = ?
+          AND id = ?
+          AND review_status IN ('compatibility_pending', 'compatibility_retryable')
+          AND json_valid(metadata_json)
+          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
+          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
+          AND cleaned_image_url IS NOT NULL
+          AND TRIM(cleaned_image_url) <> ''
+        LIMIT 1
+        "#,
+        vec![
+            json!(clone_id),
+            json!(candidate_id),
+            json!(run_id),
+            json!(run_id),
+        ],
+    )
+    .await
+}
+
+async fn load_clone_reference_image_urls(
+    db: &D1Database,
+    env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    limit: u32,
+) -> WorkerResult<Vec<String>> {
+    let rows = db::all::<CloneReferenceImageRow>(
+        db,
+        r#"
+        SELECT ma.storage_key, ma.content_type
+        FROM clone_reference_assets cra
+        INNER JOIN media_assets ma
+          ON ma.id = cra.media_asset_id
+         AND ma.deleted_at IS NULL
+         AND ma.storage_key IS NOT NULL
+         AND TRIM(ma.storage_key) <> ''
+        WHERE cra.user_id = ?
+          AND cra.clone_id = ?
+          AND cra.training_selected = 1
+          AND cra.eligibility_status = 'accepted'
+        ORDER BY cra.sort_order ASC, cra.created_at ASC
+        LIMIT ?
+        "#,
+        vec![json!(user_id), json!(clone_id), json!(limit)],
+    )
+    .await?;
+
+    let mut urls = Vec::with_capacity(rows.len());
+    for row in rows {
+        let object = env
+            .bucket("MEDIA")?
+            .get(row.storage_key.clone())
+            .execute()
+            .await?
+            .ok_or_else(|| Error::RustError("clone_compatibility_reference_missing".to_string()))?;
+        let body = object.body().ok_or_else(|| {
+            Error::RustError("clone_compatibility_reference_body_missing".to_string())
+        })?;
+        let bytes = body.bytes().await?;
+        let content_type = row
+            .content_type
+            .as_deref()
+            .unwrap_or("image/jpeg")
+            .split(';')
+            .next()
+            .unwrap_or("image/jpeg")
+            .trim()
+            .to_string();
+        urls.push(format!(
+            "data:{};base64,{}",
+            content_type,
+            BASE64_STANDARD.encode(bytes)
+        ));
+    }
+
+    Ok(urls)
+}
+
+async fn claim_visual_candidate_for_compatibility(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+    observed_attempts: u32,
+    compatibility_retry_limit: u32,
+) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    let result = db::run(
+        db,
+        claim_visual_candidate_for_compatibility_sql(),
+        vec![
+            json!(now),
+            json!(now),
+            json!(candidate_id),
+            json!(clone_id),
+            json!(run_id),
+            json!(run_id),
+            json!(observed_attempts),
+            json!(compatibility_retry_limit),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+async fn mark_candidate_compatibility_succeeded(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+    compatibility_json: &str,
+    expected_attempts: u32,
+) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    let result = db::run(
+        db,
+        mark_candidate_compatibility_succeeded_sql(),
+        vec![
+            json!(compatibility_json),
+            json!(now),
+            json!(candidate_id),
+            json!(clone_id),
+            json!(run_id),
+            json!(run_id),
+            json!(expected_attempts),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+async fn mark_candidate_clone_mismatch(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+    compatibility_json: &str,
+    reason: &str,
+    expected_attempts: u32,
+) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    let result = db::run(
+        db,
+        mark_candidate_clone_mismatch_sql(),
+        vec![
+            json!(compatibility_json),
+            json!(reason),
+            json!(now),
+            json!(candidate_id),
+            json!(clone_id),
+            json!(run_id),
+            json!(run_id),
+            json!(expected_attempts),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+async fn mark_candidate_compatibility_failed(
+    db: &D1Database,
+    clone_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+    compatibility_retry_limit: u32,
+    expected_attempts: u32,
+    code: &str,
+    error: &str,
+) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    let compact_error = compact_error_detail(error);
+    let result = db::run(
+        db,
+        mark_candidate_compatibility_failed_sql(),
+        vec![
+            json!(compatibility_retry_limit),
+            json!(code),
+            json!(compact_error),
+            json!(now),
+            json!(format!("clone_compatibility_failed:{compact_error}")),
+            json!(now),
+            json!(candidate_id),
+            json!(clone_id),
+            json!(run_id),
+            json!(run_id),
+            json!(expected_attempts),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+fn clone_compatibility_error_code(error: &str) -> &'static str {
+    if error.contains("clone_compatibility_reference_missing") {
+        "clone_compatibility_reference_missing"
+    } else if error.contains("clone_compatibility_reference_body_missing") {
+        "clone_compatibility_reference_body_missing"
+    } else {
+        queue_error_code(error)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuardedCandidateApproval {
     Approved,
@@ -4482,30 +5046,7 @@ async fn load_approved_candidate_for_cache(
 ) -> WorkerResult<Option<ApprovedVisualCandidateRow>> {
     db::first(
         db,
-        r#"
-        SELECT
-          id,
-          source_handle,
-          source_post_code,
-          source_url,
-          source_published_at,
-          image_url,
-          image_width,
-          image_height,
-          moodboard_id,
-          moodboard_slug,
-          review_json
-        FROM visual_reference_candidates
-        WHERE clone_id = ?
-          AND id = ?
-          AND review_status IN ('approved', 'caching')
-          AND json_valid(metadata_json)
-          AND CAST(json_extract(metadata_json, '$.runId') AS TEXT) = ?
-          AND CAST(json_extract(metadata_json, '$.approvedRunId') AS TEXT) = ?
-          AND image_url IS NOT NULL
-          AND TRIM(image_url) <> ''
-        LIMIT 1
-        "#,
+        load_approved_candidate_for_cache_sql(),
         vec![
             json!(clone_id),
             json!(candidate_id),
@@ -5801,6 +6342,19 @@ struct CleanupCandidateRow {
     cleanup_json: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct CompatibilityCandidateRow {
+    id: String,
+    cleaned_image_url: String,
+    compatibility_json: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CloneReferenceImageRow {
+    storage_key: String,
+    content_type: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct SeedreamCleanupRequest {
     access_token: String,
@@ -6465,6 +7019,101 @@ mod tests {
 
         assert!(prepare_pos < stale_guard_pos);
         assert!(stale_guard_pos < seedream_call_pos);
+    }
+
+    #[test]
+    fn compatibility_sql_uses_single_review_status_lifecycle() {
+        assert!(claim_visual_candidate_for_compatibility_sql()
+            .contains("review_status IN ('compatibility_pending', 'compatibility_retryable')"));
+        assert!(mark_candidate_compatibility_succeeded_sql()
+            .contains("review_status = 'cache_pending'"));
+        assert!(mark_candidate_clone_mismatch_sql().contains("review_status = 'clone_mismatch'"));
+        assert!(
+            mark_candidate_compatibility_failed_sql().contains("THEN 'compatibility_retryable'")
+        );
+        assert!(mark_candidate_compatibility_failed_sql().contains("ELSE 'compatibility_failed'"));
+    }
+
+    #[test]
+    fn compatibility_completion_sql_guards_claimed_attempt() {
+        for sql in [
+            mark_candidate_compatibility_succeeded_sql(),
+            mark_candidate_clone_mismatch_sql(),
+            mark_candidate_compatibility_failed_sql(),
+        ] {
+            let where_clause = sql.split("WHERE id = ?").nth(1).expect("where clause");
+
+            assert!(where_clause.contains("compatibility_json"));
+            assert!(where_clause.contains("$.attempts"));
+            assert!(where_clause.contains(") = ?"));
+        }
+    }
+
+    #[test]
+    fn compatibility_message_gates_followup_side_effects_on_mark_result() {
+        let source = include_str!("niche_research.rs");
+        let body = function_body(source, "async fn validate_clone_compatibility_message");
+
+        let success_mark = body
+            .find("let marked = mark_candidate_compatibility_succeeded(")
+            .expect("success mark result should be captured");
+        let cache_enqueue = body
+            .find("NicheResearchMessage::CacheApprovedReference")
+            .expect("cache enqueue");
+        assert!(success_mark < cache_enqueue);
+        assert!(body[success_mark..cache_enqueue].contains("if !marked {"));
+
+        let mismatch_mark = body
+            .find("let marked = mark_candidate_clone_mismatch(")
+            .expect("mismatch mark result should be captured");
+        let review_enqueue = body
+            .find("NicheResearchMessage::ReviewVisualCandidates")
+            .expect("review enqueue");
+        assert!(mismatch_mark < review_enqueue);
+        assert!(body[mismatch_mark..review_enqueue].contains("if !marked {"));
+
+        let failure_mark = body
+            .find("let marked = mark_candidate_compatibility_failed(")
+            .expect("failure mark result should be captured");
+        let failure_review_enqueue = body[failure_mark..]
+            .find("NicheResearchMessage::ReviewVisualCandidates")
+            .map(|offset| failure_mark + offset)
+            .expect("failure review enqueue");
+        assert!(failure_mark < failure_review_enqueue);
+        assert!(body[failure_mark..failure_review_enqueue].contains("if !marked {"));
+    }
+
+    #[test]
+    fn compatibility_message_rechecks_current_run_after_reference_load_before_ai_call() {
+        let source = include_str!("niche_research.rs");
+        let body = function_body(source, "async fn validate_clone_compatibility_message");
+
+        let reference_load_pos = body
+            .find("load_clone_reference_image_urls(")
+            .expect("reference load helper");
+        let ai_call_pos = body
+            .find("run_multi_vision_json::<CloneCompatibilityReview>")
+            .expect("compatibility ai call");
+        let stale_guard_pos = body[reference_load_pos..ai_call_pos]
+            .find("current_message_run_id(db, user_id, clone_id, Some(&run_id))")
+            .map(|offset| reference_load_pos + offset)
+            .expect("run guard between reference load and ai call");
+
+        assert!(reference_load_pos < stale_guard_pos);
+        assert!(stale_guard_pos < ai_call_pos);
+    }
+
+    // Task 11 owns the cleaned-image cache contract. Keep this test ignored here so
+    // Task 10 can land compatibility state without changing cache consumption.
+    #[test]
+    #[ignore = "Task 11 updates cache load to require cleaned compatible candidates"]
+    fn cache_load_requires_cleaned_compatible_candidate() {
+        let sql = load_approved_candidate_for_cache_sql();
+
+        assert!(sql.contains("review_status IN ('cache_pending', 'caching')"));
+        assert!(sql.contains("cleaned_image_url"));
+        assert!(sql.contains("compatibility_json"));
+        assert!(!sql.contains("review_status IN ('approved', 'caching')"));
     }
 
     #[test]
