@@ -122,8 +122,12 @@ fn blitz_route_does_not_swallow_unknown_service_errors() {
 
 #[test]
 fn visual_reference_pipeline_schema_has_required_columns_and_config() {
-    let migration =
+    let rebuild_migration =
         include_str!("../../../config/d1/migrations/1007_visual_reference_pipeline.sql");
+    let append_migration = include_str!(
+        "../../../config/d1/migrations/1008_visual_reference_cleanup_compatibility.sql"
+    );
+    let migration = format!("{rebuild_migration}\n{append_migration}");
 
     assert!(migration.contains("DROP TABLE IF EXISTS visual_reference_candidates"));
     assert!(migration.contains("CREATE TABLE IF NOT EXISTS visual_reference_candidates"));
@@ -146,6 +150,28 @@ fn visual_reference_pipeline_schema_has_required_columns_and_config() {
     assert!(migration.contains("instagram_max_handles_per_moodboard"));
     assert!(migration.contains("instagram_min_image_width"));
     assert!(migration.contains("instagram_min_image_height"));
+    assert!(migration.contains("visual_reference_cleanup_retry_limit"));
+    assert!(migration.contains("visual_reference_compatibility_retry_limit"));
+    assert!(migration.contains("clone_compatibility_reference_limit"));
+}
+
+#[test]
+fn visual_reference_pipeline_append_migration_updates_existing_d1_databases() {
+    let migration = include_str!(
+        "../../../config/d1/migrations/1008_visual_reference_cleanup_compatibility.sql"
+    );
+
+    assert!(migration.contains(
+        "ALTER TABLE visual_reference_candidates ADD COLUMN cleanup_json TEXT NOT NULL DEFAULT '{}'"
+    ));
+    assert!(migration.contains(
+        "ALTER TABLE visual_reference_candidates ADD COLUMN cleaned_image_url TEXT"
+    ));
+    assert!(migration.contains(
+        "ALTER TABLE visual_reference_candidates ADD COLUMN compatibility_json TEXT NOT NULL DEFAULT '{}'"
+    ));
+    assert!(migration.contains("INSERT OR REPLACE INTO blitz_config"));
+    assert!(migration.contains("instagram_search_terms_per_moodboard"));
     assert!(migration.contains("visual_reference_cleanup_retry_limit"));
     assert!(migration.contains("visual_reference_compatibility_retry_limit"));
     assert!(migration.contains("clone_compatibility_reference_limit"));
