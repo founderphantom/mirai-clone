@@ -404,7 +404,7 @@ Normalized fields:
 - `like_count`
 - `comment_count`
 - `play_count`
-- `source_moodboard_slug`
+- `discovery_moodboard_slug`
 - `assigned_moodboard_slug`
 - `discovered_via`
 - `first_seen_run_id`
@@ -548,6 +548,18 @@ Acceptance thresholds:
 - at least two of `editorialCompositionScore`, `realPoseAngleScore`,
   `fashionCultureCueScore`, and `lightingColorDirectionScore` must be `>= 0.62`
 
+Candidate review state:
+
+- Kimi approval sets `review_status = 'approved'` and keeps
+  `candidate_status = 'active'`.
+- Kimi rejection sets `review_status = 'rejected'` and keeps
+  `candidate_status = 'active'` so the rejection is available for audit and
+  learning but not reusable as a reference.
+- Kimi infrastructure/provider failure with attempts remaining leaves
+  `review_status = 'failed'` with retry metadata.
+- Kimi failure after retries are exhausted sets `review_status = 'failed'` and
+  `candidate_status = 'review_failed'`.
+
 Recommended SQL columns on `global_moodboard_references`:
 
 - `editorial_composition_score REAL NOT NULL DEFAULT 0`
@@ -588,14 +600,14 @@ Rules:
 - The prompt must not ask Seedream to improve, restyle, beautify, crop, sharpen,
   relight, or otherwise alter the image.
 - Retry cleanup up to `visual_reference_cleanup_retry_limit`.
-- If cleanup fails after retries, mark the candidate `cleanup_failed` and
-  continue searching for replacements.
+- If cleanup fails after retries, set `candidate_status = 'cleanup_failed'`,
+  `cleanup_status = 'failed'`, and continue searching for replacements.
 - Only cleaned images are cached in R2.
 - Raw source images are not cached as reusable references.
 - If Kimi or Seedream cannot fetch the external source image because the URL is
   expired, returns `403`, returns `404`, times out repeatedly, or no longer
-  serves image content, mark the candidate `source_unavailable` and continue
-  searching for replacements.
+  serves image content, set `candidate_status = 'source_unavailable'` and
+  continue searching for replacements.
 - Do not enable ScrapeCreators `download_media=true` as an automatic retry in
   v1. If source URL expiry becomes common, revisit that as a costed product
   decision.
@@ -645,20 +657,34 @@ Recommended schema:
   - `last_seen_run_id`
   - `discovery_moodboard_slug`
   - `assigned_moodboard_slug`
+  - `candidate_status`
   - `review_status`
   - `review_run_id`
   - `review_attempt_count`
   - `review_claim_id`
   - `review_locked_until`
+  - `review_error_code`
+  - `review_error_message`
+  - `cleanup_status`
+  - `cleanup_attempt_count`
+  - `cleanup_error_code`
+  - `cleanup_error_message`
+  - `source_error_code`
+  - `source_error_message`
+  - candidate status values: `active`, `source_unavailable`, `review_failed`,
+    `cleanup_failed`, `disabled`
   - review status values: `queued`, `reviewing`, `approved`, `rejected`,
+    `failed`
+  - cleanup status values: `not_required`, `queued`, `cleaning`, `cleaned`,
     `failed`
   - `metadata_json TEXT NOT NULL DEFAULT '{}'`
   - stores source metadata, Kimi review, cleanup status, and cleanup attempts
   - uniqueness by `platform, source_image_key`
-  - stores source moodboard slug for discovery audit
+  - stores discovery moodboard slug for discovery audit
   - stores assigned moodboard slug after Kimi routing
-  - rejected, source-unavailable, cleanup-failed, and review-failed states live
-    here
+  - source-unavailable, cleanup-failed, and review-failed states live in
+    `candidate_status`; Kimi accept/reject/failed state lives in
+    `review_status`; Seedream cleanup progress lives in `cleanup_status`
 - `global_visual_candidate_discoveries`
   - run-level discovery audit for global candidates
   - fields: `candidate_id`, `run_id`, `moodboard_slug`,
@@ -700,7 +726,8 @@ Recommended schema:
     `error_code`, `error_message`, `created_at`
   - indexes: `(pool_run_id, clone_id)` and `(clone_id, global_reference_id)`
 - `clone_pool_waiting_moodboards`
-  - indexed wakeup table for clone pools waiting on global moodboard supply
+  - indexed wakeup table for clone pools waiting on or passively blocked by
+    global moodboard supply
   - one row per `pool_run_id + moodboard_slug`
   - fields: `user_id`, `clone_id`, `pool_run_id`, `moodboard_slug`, `status`,
     `created_at`, `resolved_at`
@@ -722,10 +749,10 @@ Recommended schema:
   - fields: `queue_name`, `message_kind`, `dedupe_key`, optional `run_id`,
     optional `pool_run_id`, `status`, `created_at`, `updated_at`, `expires_at`
   - required uniqueness: `UNIQUE(queue_name, message_kind, dedupe_key)`
-  - status values: `reserved`, `enqueued`, `handling`, `handled`, `failed`,
-    `expired`, `cancelled`
-  - active statuses are `reserved`, `enqueued`, and `handling`; active rows block
-    duplicate enqueue only while `expires_at` is in the future
+  - status values: `reserved`, `enqueued`, `handling`, `retrying`, `handled`,
+    `failed`, `expired`, `cancelled`
+  - active statuses are `reserved`, `enqueued`, `handling`, and `retrying`;
+    active rows block duplicate enqueue only while `expires_at` is in the future
   - terminal statuses are `handled`, `failed`, `expired`, and `cancelled`;
     terminal rows do not suppress future legitimate work after the caller
     re-runs the normal eligibility gate
@@ -931,30 +958,42 @@ Rules:
   `global_moodboard_references.moodboard_slug` created or activated with
   `source_run_id = run_id`.
 - For each impacted slug, finalization must recount active global references,
-  update that slug's readiness fields, and inspect ready, nonfailed clones in
-  `waiting_for_global_library` for users who selected that slug through
-  `clone_pool_waiting_moodboards`, not by scanning JSON.
+  update that slug's readiness fields, and inspect ready, nonfailed clones whose
+  current pool run has `clone_pool_waiting_moodboards.status IN ('waiting',
+  'insufficient')` for users who selected that slug, not by scanning JSON.
 - Finalization must reserve/enqueue `BuildCloneReferencePool` wakeup messages
   when the global library has at least one active reference for the current
   selected moodboards. The wakeup resumes the existing current pool run when it
   is still nonstale, current, and has the same selected moodboard hash; it
   supersedes only when the waiting run is stale, no longer current, or selection
   changed.
+- For passive `insufficient` rows, the old pool run is terminal. The wakeup
+  should still enqueue `BuildCloneReferencePool`; the kickoff handler creates a
+  replacement pool run unless another reusable active run already exists.
 - Cross-routed wakeups are required. If an A run creates a reference assigned to
-  B, waiting clone pools registered for B must be considered even if B did not
-  own the source run.
-- If `FinalizeGlobalMoodboardLibrary` finds waiting ready clones but the global
+  B, waiting or passive insufficient clone pools registered for B must be
+  considered even if B did not own the source run.
+- Passive insufficient wakeups are required. If a clone pool was marked
+  `insufficient_refs` because every selected slug was exhausted or retry-gated,
+  later references created for an impacted selected slug, including cross-routed
+  references, must re-check that pool through `clone_pool_waiting_moodboards`
+  `insufficient` rows and reserve/enqueue `BuildCloneReferencePool` when the
+  user still selects the slug and the clone is still ready.
+- If `FinalizeGlobalMoodboardLibrary` finds tracked ready clones but the global
   library still has zero active references for selected moodboards and no
   currently retryable global discovery work remains, including when all missing
   slugs are blocked by future `next_retry_at`, it should mark those current pool
-  runs `insufficient_refs` rather than waiting forever.
+  runs `insufficient_refs` rather than waiting forever and keep or write passive
+  `insufficient` rows for later wakeup.
 - `clone_pool_waiting_moodboards` transition rules:
   - insert `waiting` rows when a current clone pool run enters
     `waiting_for_global_library`
   - mark rows `resumed` when `FinalizeGlobalMoodboardLibrary` reserves/enqueues
-    a wakeup and the kickoff handler continues the same current pool run
+    a wakeup and the kickoff handler continues the same current pool run, or
+    when a passive insufficient row is consumed by a replacement pool kickoff
   - mark rows `insufficient` when discovery is exhausted or retry-gated and no
-    global references are available for the selected moodboards
+    global references are available for the selected moodboards; these rows are
+    passive wakeup indexes and remain queryable until resumed or superseded
   - mark rows `superseded` when `clone_reference_state.current_pool_run_id` no
     longer equals the row's `pool_run_id`, the clone is no longer ready, or the
     selected moodboard hash has changed
@@ -971,14 +1010,18 @@ Idempotent queue reservations:
   - update to `enqueued` after the queue send succeeds
   - update to `handling` when a handler starts work
   - update to `handled` when the handler succeeds or intentionally no-ops
-  - update to `failed` for retryable handler failures
+  - update to `retrying` for retryable handler failures while the queue will
+    retry the same message or while provider retry is already scheduled
+  - update to `failed` only when queue retries are exhausted, the handler will
+    not retry the same message, or the work must be re-evaluated from a fresh
+    eligibility check
   - update to `cancelled` when the run or pool is superseded before handling
   - update to `expired` only when replacing an active row whose `expires_at` is
     in the past
-- Active reservations (`reserved`, `enqueued`, `handling`) suppress duplicate
-  enqueue only until `expires_at`. Terminal reservations (`handled`, `failed`,
-  `expired`, `cancelled`) never suppress future legitimate work after the normal
-  eligibility gate passes again.
+- Active reservations (`reserved`, `enqueued`, `handling`, `retrying`) suppress
+  duplicate enqueue only until `expires_at`. Terminal reservations (`handled`,
+  `failed`, `expired`, `cancelled`) never suppress future legitimate work after
+  the normal eligibility gate passes again.
 - Required `expires_at` policy:
   - kickoff, wakeup, ensure, and finalize reservations: `now + 5 minutes`
   - downstream global run reservations: `now +
@@ -1098,7 +1141,8 @@ Recommended status storage:
   - `started_at`
   - `completed_at`
 - `clone_pool_waiting_moodboards`
-  - canonical wakeup index for waiting clone pools by moodboard slug
+  - canonical wakeup index for waiting and insufficient clone pools by moodboard
+    slug
   - queried by `FinalizeGlobalMoodboardLibrary`
   - status values: `waiting`, `resumed`, `insufficient`, `superseded`
 
@@ -1116,12 +1160,12 @@ Readiness thresholds:
 - Global counts use active `global_moodboard_references` for the moodboard slug.
 - `library_ready`: the moodboard has at least
   `global_refs_per_moodboard_target` active cleaned global references.
-  Set `last_ready_at` and `last_successful_refresh_at`.
+  Set `last_ready_at` and `last_successful_refresh_at`; clear `next_retry_at`.
 - `underfilled`: the moodboard has at least one active cleaned global reference,
   but fewer than `global_refs_per_moodboard_target`, and eligible source or
   retryable candidate work still exists now.
   Set `last_underfilled_at` and `last_successful_refresh_at`; do not update
-  `last_ready_at`.
+  `last_ready_at`; clear `next_retry_at`.
 - `underfilled_exhausted`: the moodboard has at least one active cleaned global
   reference, fewer than `global_refs_per_moodboard_target`, and all configured
   source, candidate, and cleanup work is exhausted or cooldown-gated.
@@ -1285,9 +1329,12 @@ If the global library cannot supply enough candidates for pool build:
    `waiting_for_global_library`.
 5. If every missing slug is exhausted or retry-gated, do not insert waiting
    rows. Attempt partial compatibility when at least one active global reference
-   exists, otherwise mark the pool run `insufficient_refs`.
+   exists. If zero active references exist, insert `insufficient` passive wakeup
+   rows into `clone_pool_waiting_moodboards` for selected slugs that lacked
+   supply, then mark the pool run `insufficient_refs`.
 6. When global discovery finalizes, re-check global active reference counts and
-   enqueue a wakeup that resumes the same current pool run when possible.
+   enqueue a wakeup that resumes the same current pool run when possible,
+   including pools tracked by passive `insufficient` rows.
 
 If no more global discovery work is possible but at least one active global
 reference exists for selected moodboards, attempt compatibility with that smaller
@@ -1481,7 +1528,7 @@ Unit and domain tests should cover:
   `next_retry_at` is not in the future
 - global discovery queue messages serialize without `userId` or `cloneId`
 - `BuildCloneReferencePool` and `RefreshPool` serialize without `poolRunId` and
-  create the clone pool run before downstream work
+  create or reuse the clone pool run before downstream work
 - downstream clone-scoped pool messages serialize with `userId`, `cloneId`, and
   `poolRunId`
 - global library stale and clone pool stale thresholds trigger the configured
@@ -1516,6 +1563,8 @@ Unit and domain tests should cover:
   to the current run
 - `global_visual_candidate_discoveries` uses non-null `source_key` for
   uniqueness and does not rely on nullable SQLite unique-index columns
+- candidate normalization and storage use `discovery_moodboard_slug`, not a
+  separate `source_moodboard_slug` name
 - Kimi review accepts only one likely adult with safe content
 - Kimi review rejects moodboards, screenshots, product shots, tutorials, generic
   images, no-human images, multi-human images, minors, and unsafe images
@@ -1526,10 +1575,12 @@ Unit and domain tests should cover:
   moderate when overall reference value is acceptable
 - off-style but strong images are assigned to another app moodboard
 - cross-routed approvals update the assigned moodboard slug's reference state
-  and wake waiting clone pools for that slug
+  and wake waiting or passive insufficient clone pools for that slug
 - Seedream cleanup prompt matches the exact text-only prompt
-- expired or forbidden external source image URLs mark candidates
-  `source_unavailable` and search continues
+- expired or forbidden external source image URLs set
+  `candidate_status = 'source_unavailable'` and search continues
+- candidate terminal states use `candidate_status`, Kimi review progress uses
+  `review_status`, and Seedream cleanup progress uses `cleanup_status`
 - cleanup retries are capped and failed candidates do not block replacements
 - only cleaned images are cached to R2
 - saving moodboards enqueues global discovery for selected underfilled slugs
@@ -1539,6 +1590,7 @@ Unit and domain tests should cover:
   per slug
 - `underfilled_exhausted` sets `next_retry_at` when a moodboard has some refs
   but no currently eligible source work
+- `library_ready` and currently eligible `underfilled` clear `next_retry_at`
 - scheduler and demand-triggered `EnsureGlobalMoodboardLibrary` no-op while
   `insufficient_refs` or `underfilled_exhausted` is blocked by future
   `next_retry_at`
@@ -1547,6 +1599,8 @@ Unit and domain tests should cover:
   `global_refs_for_pool_min` active not-yet-rejected global references
 - clone pool build does not wait when `EnsureGlobalMoodboardLibrary` no-ops
   because every missing slug is exhausted or retry-gated
+- clone pool build inserts passive `insufficient` wakeup rows when it marks a
+  zero-supply pool `insufficient_refs`
 - clone pool waiting wakeups use `clone_pool_waiting_moodboards` indexes, not
   JSON scans
 - `clone_pool_waiting_moodboards` enforces
@@ -1557,8 +1611,10 @@ Unit and domain tests should cover:
   are below target but have enough active refs to attempt compatibility
 - clone pool build attempts partial compatibility when discovery is exhausted
   but at least one active global reference exists for selected moodboards
-- `FinalizeGlobalMoodboardLibrary` resumes waiting ready clone pools or marks
+- `FinalizeGlobalMoodboardLibrary` resumes tracked ready clone pools or marks
   them insufficient when no references remain possible
+- `FinalizeGlobalMoodboardLibrary` wakes passive insufficient clone pools when
+  later impacted or cross-routed slugs gain active references
 - `FinalizeGlobalMoodboardLibrary` wakeups resume the same current nonstale pool
   run instead of creating a fresh run
 - stale global messages cannot create active global references or reusable
@@ -1572,6 +1628,8 @@ Unit and domain tests should cover:
 - duplicate queue nudges are collapsed by `queue_message_reservations`
 - `queue_message_reservations` status lifecycle and `expires_at` TTLs prevent
   stale non-run-scoped ensure reservations from suppressing later eligible work
+- retryable queue reservation failures use active `retrying` status until the
+  queue retry is exhausted or the reservation expires
 - `ReviewGlobalVisualCandidates` uses a batch-shaped reservation key and
   candidate-level review claims before Kimi calls
 - clone compatibility checks body proportions, hair length, and facial hair
