@@ -4,6 +4,7 @@ pub mod clone_reference_pool;
 pub mod clones;
 pub mod generation_usage;
 pub mod global_reference_discovery;
+pub mod global_reference_scheduler;
 pub mod media;
 pub mod provider_accounts;
 pub mod queue_reservations;

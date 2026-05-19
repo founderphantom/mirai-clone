@@ -43,4 +43,10 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     if let Err(error) = services::blitz::reconcile_stale_batches(&env).await {
         console_error!("scheduled blitz reconciliation failed: {}", error);
     }
+
+    if let Err(error) =
+        services::global_reference_scheduler::enqueue_due_global_moodboard_libraries(&env).await
+    {
+        console_error!("scheduled global reference scheduler failed: {}", error);
+    }
 }

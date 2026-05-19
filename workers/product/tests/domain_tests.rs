@@ -763,6 +763,49 @@ fn reference_pipeline_handler_marks_reservations_handling_terminal_and_retrying(
 }
 
 #[test]
+fn scheduled_worker_enqueues_due_global_moodboard_libraries() {
+    let lib = include_str!("../src/lib.rs");
+    let scheduler = include_str!("../src/services/global_reference_scheduler.rs");
+    assert!(lib.contains("enqueue_due_global_moodboard_libraries"));
+    assert!(scheduler.contains("scheduler_due_global_moodboard_libraries_sql"));
+    assert!(scheduler.contains("global_moodboard_definitions gmd"));
+    assert!(scheduler.contains("sync_global_moodboard_definitions_for_scheduler"));
+    assert!(scheduler.contains("gmd.status = 'active'"));
+    assert!(scheduler.contains("global_moodboard_reference_state gmrs"));
+    assert!(scheduler.contains("gmrs.next_retry_at IS NULL"));
+    assert!(scheduler.contains("OR gmrs.next_retry_at <= ?"));
+    assert!(scheduler.contains("global_library_stale_after_hours"));
+    assert!(scheduler.contains("ReferencePipelineMessage::EnsureGlobalMoodboardLibrary"));
+    assert!(scheduler.contains("global:ensure:"));
+}
+
+#[test]
+fn scheduled_global_scheduler_considers_all_due_default_moodboards() {
+    let scheduler = include_str!("../src/services/global_reference_scheduler.rs");
+    let due_sql = scheduler
+        .split("fn scheduler_due_global_moodboard_libraries_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn upsert_global_moodboard_definition_sql()")
+                .next()
+        })
+        .expect("scheduler due SQL section");
+
+    assert!(default_moodboards().len() > 25);
+    assert!(due_sql.contains("ORDER BY gmd.sort_order ASC, gmd.slug ASC"));
+    assert!(!due_sql.contains("LIMIT 25"));
+    assert!(!due_sql.contains("LIMIT"));
+}
+
+#[test]
+fn scheduled_worker_keeps_blitz_reconciliation() {
+    let lib = include_str!("../src/lib.rs");
+    assert!(lib.contains("reconcile_stale_batches"));
+    assert!(lib.contains("scheduled global reference scheduler failed"));
+}
+
+#[test]
 fn queue_reservation_claim_guards_terminal_and_duplicate_delivery_states() {
     let source = include_str!("../src/services/queue_reservations.rs");
     let handler = include_str!("../src/queues/reference_pipeline.rs");
