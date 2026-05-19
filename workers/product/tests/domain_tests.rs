@@ -256,6 +256,41 @@ fn clone_pool_messages_serialize_with_pool_run_only_after_kickoff() {
 }
 
 #[test]
+fn onboarding_moodboard_queries_are_user_scoped_not_clone_scoped() {
+    let source = include_str!("../src/routes/onboarding.rs");
+
+    assert!(source.contains("ensure_default_user_moodboards"));
+    assert!(source.contains("sync_global_moodboard_definitions"));
+    assert!(source.contains("rebuild_user_reference_state"));
+    assert!(!source.contains("missing_clone\", \"Create a clone before saving moodboards."));
+    assert!(!source.contains("AND clone_id = ?"));
+    assert!(!source.contains("deterministic_moodboard_id(user_id, clone_id"));
+}
+
+#[test]
+fn onboarding_rejects_disabled_moodboard_definitions_without_clearing_selection() {
+    let source = include_str!("../src/routes/onboarding.rs");
+
+    assert!(source.contains("disabled_moodboard"));
+    assert!(source.contains("global_moodboard_definitions"));
+    assert!(source.contains("status <> 'active'"));
+}
+
+#[test]
+fn reference_pipeline_request_kickoff_only_enqueues_queue_messages() {
+    let source = include_str!("../src/services/reference_pipeline.rs");
+
+    assert!(source.contains("EnsureGlobalMoodboardLibrary"));
+    assert!(source.contains("BuildCloneReferencePool"));
+    assert!(source.contains("REFERENCE_PIPELINE_QUEUE"));
+    assert!(!source.contains("NICHE_RESEARCH_QUEUE"));
+    assert!(!source.contains("fetch_scrapecreators_json"));
+    assert!(!source.contains("run_vision_json"));
+    assert!(!source.contains("call_tool("));
+    assert!(!source.contains("bucket(\"MEDIA\")"));
+}
+
+#[test]
 fn visual_reference_pipeline_append_migration_updates_existing_d1_databases() {
     let migration = include_str!(
         "../../../config/d1/migrations/1008_visual_reference_cleanup_compatibility.sql"

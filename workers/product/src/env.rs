@@ -6,6 +6,7 @@ pub struct Bindings {
     pub clone_training_queue: Queue,
     pub generation_queue: Queue,
     pub niche_research_queue: Queue,
+    pub reference_pipeline_queue: Queue,
 }
 
 impl Bindings {
@@ -16,6 +17,7 @@ impl Bindings {
             clone_training_queue: env.queue("CLONE_TRAINING_QUEUE")?,
             generation_queue: env.queue("GENERATION_QUEUE")?,
             niche_research_queue: env.queue("NICHE_RESEARCH_QUEUE")?,
+            reference_pipeline_queue: env.queue("REFERENCE_PIPELINE_QUEUE")?,
         })
     }
 }

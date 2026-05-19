@@ -2,9 +2,9 @@ use crate::auth_client::verify_session;
 use crate::db;
 use crate::domain::moodboards::{
     default_moodboards, deterministic_user_moodboard_id, selected_moodboard_count_is_valid,
+    selected_moodboard_hash,
 };
 use crate::http::error::ApiError;
-use crate::queues::niche_research::NicheResearchMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use worker::{Request, Response, Result as WorkerResult, RouteContext};
@@ -92,6 +92,12 @@ struct IdRow {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SelectedMoodboardStateRow {
+    id: String,
+    slug: String,
+}
+
 pub async fn onboarding_state(req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
     let auth = match verify_session(&ctx, req.headers()).await? {
         Some(auth) => auth,
@@ -101,12 +107,8 @@ pub async fn onboarding_state(req: Request, ctx: RouteContext<()>) -> WorkerResu
     let user_id = auth.user_id.as_str();
     let clones = load_clones(&db, user_id).await?;
     let active_clone = clones.first().cloned();
-    let moodboards = load_moodboards(
-        &db,
-        user_id,
-        active_clone.as_ref().map(|clone| clone.id.as_str()),
-    )
-    .await?;
+    ensure_default_user_moodboards(&db, user_id).await?;
+    let moodboards = load_moodboards(&db, user_id).await?;
     let inspiration_pool_count = count_inspiration_pool(&db, user_id).await?;
 
     Response::from_json(&OnboardingStateResponse {
@@ -153,17 +155,13 @@ pub async fn generate_moodboards(req: Request, ctx: RouteContext<()>) -> WorkerR
         None => return ApiError::unauthorized().to_response(),
     };
     let db = ctx.env.d1("DB")?;
-    let input = read_optional_json::<GenerateMoodboardsRequest>(req).await?;
-    let active_clone = match input.and_then(|input| input.clone_id) {
-        Some(clone_id) => load_clone_by_id(&db, &auth.user_id, &clone_id).await?,
-        None => load_active_clone(&db, &auth.user_id).await?,
-    };
-    let clone_id = active_clone.as_ref().map(|clone| clone.id.as_str());
-
-    ensure_default_moodboards(&db, &auth.user_id, clone_id).await?;
+    let _clone_id = read_optional_json::<GenerateMoodboardsRequest>(req)
+        .await?
+        .and_then(|input| input.clone_id);
+    ensure_default_user_moodboards(&db, &auth.user_id).await?;
 
     Response::from_json(&MoodboardsResponse {
-        moodboards: load_moodboards(&db, &auth.user_id, clone_id).await?,
+        moodboards: load_moodboards(&db, &auth.user_id).await?,
     })
 }
 
@@ -184,28 +182,30 @@ pub async fn save_moodboards(mut req: Request, ctx: RouteContext<()>) -> WorkerR
     };
 
     let db = ctx.env.d1("DB")?;
-    let active_clone = match input.clone_id {
-        Some(clone_id) => load_clone_by_id(&db, &auth.user_id, &clone_id).await?,
-        None => load_active_clone(&db, &auth.user_id).await?,
-    };
-    let Some(active_clone) = active_clone else {
-        return ApiError::bad_request("missing_clone", "Create a clone before saving moodboards.")
-            .to_response();
-    };
+    ensure_default_user_moodboards(&db, &auth.user_id).await?;
 
-    let requested_moodboard_ids = unique_selected_moodboard_ids(input.moodboard_ids);
+    let SaveMoodboardsRequest {
+        moodboard_ids,
+        clone_id: _clone_id,
+        moderation_level: _moderation_level,
+    } = input;
+    let requested_moodboard_ids = unique_selected_moodboard_ids(moodboard_ids);
     if !selected_moodboard_count_is_valid(requested_moodboard_ids.len()) {
         return ApiError::bad_request("invalid_moodboard_selection", "Choose 1 to 10 moodboards.")
             .to_response();
     }
 
-    let selected_moodboard_ids = load_matching_moodboard_ids(
-        &db,
-        &auth.user_id,
-        &active_clone.id,
-        &requested_moodboard_ids,
-    )
-    .await?;
+    if requested_disabled_moodboard_count(&db, &auth.user_id, &requested_moodboard_ids).await? > 0
+    {
+        return ApiError::bad_request(
+            "disabled_moodboard",
+            "One or more selected moodboards are no longer available.",
+        )
+        .to_response();
+    }
+
+    let selected_moodboard_ids =
+        load_matching_active_moodboard_ids(&db, &auth.user_id, &requested_moodboard_ids).await?;
     if !all_requested_moodboards_matched(&selected_moodboard_ids, &requested_moodboard_ids) {
         return ApiError::bad_request(
             "invalid_moodboard_selection",
@@ -213,26 +213,19 @@ pub async fn save_moodboards(mut req: Request, ctx: RouteContext<()>) -> WorkerR
         )
         .to_response();
     }
-    save_selected_moodboards(
+
+    save_selected_moodboards(&db, &auth.user_id, &selected_moodboard_ids).await?;
+    let selected_slugs = rebuild_user_reference_state(&db, &auth.user_id).await?;
+    crate::services::reference_pipeline::enqueue_after_moodboard_save(
         &db,
+        &ctx.env,
         &auth.user_id,
-        &active_clone.id,
-        &selected_moodboard_ids,
+        &selected_slugs,
     )
     .await?;
 
-    ctx.env
-        .queue("NICHE_RESEARCH_QUEUE")?
-        .send(NicheResearchMessage::ResearchMoodboardReferences {
-            user_id: auth.user_id.clone(),
-            clone_id: active_clone.id.clone(),
-            moodboard_ids: selected_moodboard_ids,
-            reason: "onboarding_selection".to_string(),
-        })
-        .await?;
-
     Response::from_json(&MoodboardsResponse {
-        moodboards: load_moodboards(&db, &auth.user_id, Some(&active_clone.id)).await?,
+        moodboards: load_moodboards(&db, &auth.user_id).await?,
     })
 }
 
@@ -262,117 +255,107 @@ async fn load_clones(db: &worker::D1Database, user_id: &str) -> WorkerResult<Vec
     .await
 }
 
-async fn load_active_clone(
-    db: &worker::D1Database,
-    user_id: &str,
-) -> WorkerResult<Option<CloneSummary>> {
-    Ok(load_clones(db, user_id).await?.into_iter().next())
-}
-
-async fn load_clone_by_id(
-    db: &worker::D1Database,
-    user_id: &str,
-    clone_id: &str,
-) -> WorkerResult<Option<CloneSummary>> {
-    db::first(
-        db,
-        r#"
-        SELECT
-          id,
-          display_name AS name,
-          display_name,
-          handle,
-          source,
-          status,
-          soul_status,
-          reference_count_total
-        FROM clone_profiles
-        WHERE user_id = ?
-          AND id = ?
-          AND deleted_at IS NULL
-        LIMIT 1
-        "#,
-        vec![json!(user_id), json!(clone_id)],
-    )
-    .await
-}
-
 async fn load_moodboards(
     db: &worker::D1Database,
     user_id: &str,
-    clone_id: Option<&str>,
 ) -> WorkerResult<Vec<MoodboardResponse>> {
     let rows = db::all::<MoodboardRow>(
         db,
         r#"
-        SELECT id, slug, title, vibe_summary, search_queries_json, selected
-        FROM moodboards
-        WHERE user_id = ?
-          AND ((clone_id = ?) OR (clone_id IS NULL AND ? IS NULL))
-        ORDER BY sort_order ASC, created_at ASC
+        SELECT mb.id,
+               mb.slug,
+               gmd.title,
+               gmd.vibe_summary,
+               gmd.search_queries_json,
+               CASE WHEN gmd.status = 'active' THEN mb.selected ELSE 0 END AS selected
+        FROM moodboards mb
+        INNER JOIN global_moodboard_definitions gmd
+          ON gmd.slug = mb.slug
+        WHERE mb.user_id = ?
+          AND gmd.status = 'active'
+        ORDER BY gmd.sort_order ASC, mb.created_at ASC
         "#,
-        vec![json!(user_id), json!(clone_id), json!(clone_id)],
+        vec![json!(user_id)],
     )
     .await?;
 
     Ok(rows.into_iter().map(MoodboardResponse::from).collect())
 }
 
-async fn ensure_default_moodboards(
+async fn ensure_default_user_moodboards(
     db: &worker::D1Database,
     user_id: &str,
-    clone_id: Option<&str>,
 ) -> WorkerResult<()> {
-    let existing = db::first::<CountRow>(
-        db,
-        r#"
-        SELECT COUNT(*) AS count
-        FROM moodboards
-        WHERE user_id = ?
-          AND ((clone_id = ?) OR (clone_id IS NULL AND ? IS NULL))
-        "#,
-        vec![json!(user_id), json!(clone_id), json!(clone_id)],
-    )
-    .await?;
-    if existing.map(|row| row.count).unwrap_or(0) > 0 {
-        return Ok(());
-    }
-
+    sync_global_moodboard_definitions(db).await?;
     let now = now_iso_string();
     let statements = default_moodboards()
         .into_iter()
-        .enumerate()
-        .map(|(index, seed)| {
+        .map(|seed| {
             let id = deterministic_user_moodboard_id(user_id, &seed.slug);
-            let search_queries_json =
-                serde_json::to_string(&seed.search_queries).unwrap_or_else(|_| "[]".to_string());
             (
                 r#"
                 INSERT OR IGNORE INTO moodboards (
                   id,
                   user_id,
-                  clone_id,
                   slug,
-                  title,
-                  vibe_summary,
-                  search_queries_json,
                   selected,
-                  weight,
-                  sort_order,
-                  source,
-                  created_at
+                  created_at,
+                  updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'default', ?)
+                VALUES (?, ?, ?, 0, ?, ?)
                 "#,
                 vec![
                     json!(id),
                     json!(user_id),
-                    json!(clone_id),
+                    json!(seed.slug),
+                    json!(now),
+                    json!(now),
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+
+    db::batch(db, statements).await?;
+    rebuild_user_reference_state(db, user_id).await?;
+    Ok(())
+}
+
+async fn sync_global_moodboard_definitions(db: &worker::D1Database) -> WorkerResult<()> {
+    let now = now_iso_string();
+    let statements = default_moodboards()
+        .into_iter()
+        .enumerate()
+        .map(|(index, seed)| {
+            let search_queries_json =
+                serde_json::to_string(&seed.search_queries).unwrap_or_else(|_| "[]".to_string());
+            (
+                r#"
+                INSERT INTO global_moodboard_definitions (
+                  slug,
+                  title,
+                  vibe_summary,
+                  search_queries_json,
+                  sort_order,
+                  status,
+                  created_at,
+                  updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                  title = excluded.title,
+                  vibe_summary = excluded.vibe_summary,
+                  search_queries_json = excluded.search_queries_json,
+                  sort_order = excluded.sort_order,
+                  updated_at = excluded.updated_at
+                WHERE global_moodboard_definitions.status = 'active'
+                "#,
+                vec![
                     json!(seed.slug),
                     json!(seed.title),
                     json!(seed.vibe_summary),
                     json!(search_queries_json),
                     json!(index),
+                    json!(now),
                     json!(now),
                 ],
             )
@@ -383,13 +366,76 @@ async fn ensure_default_moodboards(
     Ok(())
 }
 
+async fn selected_active_moodboard_state(
+    db: &worker::D1Database,
+    user_id: &str,
+) -> WorkerResult<Vec<SelectedMoodboardStateRow>> {
+    db::all(
+        db,
+        r#"
+        SELECT mb.id, mb.slug
+        FROM moodboards mb
+        INNER JOIN global_moodboard_definitions gmd
+          ON gmd.slug = mb.slug
+        WHERE mb.user_id = ?
+          AND mb.selected = 1
+          AND gmd.status = 'active'
+        ORDER BY mb.slug ASC
+        "#,
+        vec![json!(user_id)],
+    )
+    .await
+}
+
+async fn rebuild_user_reference_state(
+    db: &worker::D1Database,
+    user_id: &str,
+) -> WorkerResult<Vec<String>> {
+    let rows = selected_active_moodboard_state(db, user_id).await?;
+    let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let slugs = rows.iter().map(|row| row.slug.clone()).collect::<Vec<_>>();
+    let selected_hash = selected_moodboard_hash(&slugs);
+    let now = now_iso_string();
+
+    db::exec(
+        db,
+        r#"
+        INSERT INTO user_reference_state (
+          user_id,
+          selected_moodboard_ids_json,
+          selected_moodboard_slugs_json,
+          selected_moodboard_hash,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          selected_moodboard_ids_json = excluded.selected_moodboard_ids_json,
+          selected_moodboard_slugs_json = excluded.selected_moodboard_slugs_json,
+          selected_moodboard_hash = excluded.selected_moodboard_hash,
+          updated_at = excluded.updated_at
+        "#,
+        vec![
+            json!(user_id),
+            json!(serde_json::to_string(&ids)?),
+            json!(serde_json::to_string(&slugs)?),
+            json!(selected_hash),
+            json!(now),
+            json!(now),
+        ],
+    )
+    .await?;
+
+    Ok(slugs)
+}
+
 async fn save_selected_moodboards(
     db: &worker::D1Database,
     user_id: &str,
-    clone_id: &str,
     selected_moodboard_ids: &[String],
 ) -> WorkerResult<()> {
     let selected_json = serde_json::to_string(selected_moodboard_ids)?;
+    let now = now_iso_string();
     db::exec(
         db,
         r#"
@@ -400,41 +446,70 @@ async fn save_selected_moodboards(
             FROM json_each(?)
             WHERE json_each.value = moodboards.id
           )
-          THEN 1 ELSE 0 END
+          THEN 1 ELSE 0 END,
+          updated_at = ?
         WHERE user_id = ?
-          AND clone_id = ?
         "#,
-        vec![json!(selected_json), json!(user_id), json!(clone_id)],
+        vec![json!(selected_json), json!(now), json!(user_id)],
     )
     .await
 }
 
-async fn load_matching_moodboard_ids(
+async fn load_matching_active_moodboard_ids(
     db: &worker::D1Database,
     user_id: &str,
-    clone_id: &str,
     selected_moodboard_ids: &[String],
 ) -> WorkerResult<Vec<String>> {
     let selected_json = serde_json::to_string(selected_moodboard_ids)?;
     let rows = db::all::<IdRow>(
         db,
         r#"
-        SELECT id
-        FROM moodboards
-        WHERE user_id = ?
-          AND clone_id = ?
+        SELECT mb.id
+        FROM moodboards mb
+        INNER JOIN global_moodboard_definitions gmd
+          ON gmd.slug = mb.slug
+        WHERE mb.user_id = ?
+          AND gmd.status = 'active'
           AND EXISTS (
             SELECT 1
             FROM json_each(?)
-            WHERE json_each.value = moodboards.id
+            WHERE json_each.value = mb.id
           )
-        ORDER BY sort_order ASC, created_at ASC
+        ORDER BY gmd.sort_order ASC, mb.created_at ASC
         "#,
-        vec![json!(user_id), json!(clone_id), json!(selected_json)],
+        vec![json!(user_id), json!(selected_json)],
     )
     .await?;
 
     Ok(rows.into_iter().map(|row| row.id).collect())
+}
+
+async fn requested_disabled_moodboard_count(
+    db: &worker::D1Database,
+    user_id: &str,
+    selected_moodboard_ids: &[String],
+) -> WorkerResult<u32> {
+    let selected_json = serde_json::to_string(selected_moodboard_ids)?;
+    let row = db::first::<CountRow>(
+        db,
+        r#"
+        SELECT COUNT(*) AS count
+        FROM moodboards mb
+        INNER JOIN global_moodboard_definitions gmd
+          ON gmd.slug = mb.slug
+        WHERE mb.user_id = ?
+          AND gmd.status <> 'active'
+          AND EXISTS (
+            SELECT 1
+            FROM json_each(?)
+            WHERE json_each.value = mb.id
+          )
+        "#,
+        vec![json!(user_id), json!(selected_json)],
+    )
+    .await?;
+
+    Ok(row.map(|row| row.count).unwrap_or(0))
 }
 
 async fn read_optional_json<T: for<'de> Deserialize<'de>>(

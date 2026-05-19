@@ -66,7 +66,8 @@
     "producers": [
       { "binding": "CLONE_TRAINING_QUEUE", "queue": "mirai-clone-training" },
       { "binding": "GENERATION_QUEUE", "queue": "mirai-generation" },
-      { "binding": "NICHE_RESEARCH_QUEUE", "queue": "mirai-niche-research" }
+      { "binding": "NICHE_RESEARCH_QUEUE", "queue": "mirai-niche-research" },
+      { "binding": "REFERENCE_PIPELINE_QUEUE", "queue": "mirai-reference-pipeline" }
     ],
     "consumers": [
       {
