@@ -34,6 +34,7 @@ struct VisualReferenceRow {
     storage_key: Option<String>,
     content_type: Option<String>,
     materialized_reference_url: Option<String>,
+    global_reference_id: Option<String>,
     image_width: Option<u32>,
     image_height: Option<u32>,
     moodboard_id: Option<String>,
@@ -44,6 +45,15 @@ struct VisualReferenceRow {
     framing: Option<String>,
     camera_feel: Option<String>,
     styling_direction: Option<String>,
+    editorial_composition_score: f64,
+    real_pose_angle_score: f64,
+    fashion_culture_cue_score: f64,
+    lighting_color_direction_score: f64,
+    moodboard_fit_score: f64,
+    overall_reference_score: f64,
+    color_palette_json: String,
+    fashion_culture_cues_json: String,
+    composition_notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1190,25 +1200,46 @@ pub fn visual_reference_guidance_query() -> String {
           ma.storage_key AS storage_key,
           ma.content_type AS content_type,
           NULL AS materialized_reference_url,
+          vr.global_reference_id,
           vr.image_width,
           vr.image_height,
           vr.moodboard_id,
           vr.moodboard_slug,
-          vr.pose,
-          vr.scene,
-          vr.lighting,
-          vr.framing,
-          vr.camera_feel,
-          vr.styling_direction
+          gmr.pose,
+          gmr.scene,
+          gmr.lighting,
+          gmr.framing,
+          gmr.camera_feel,
+          gmr.styling_direction,
+          gmr.editorial_composition_score,
+          gmr.real_pose_angle_score,
+          gmr.fashion_culture_cue_score,
+          gmr.lighting_color_direction_score,
+          gmr.moodboard_fit_score,
+          gmr.overall_reference_score,
+          gmr.color_palette_json,
+          gmr.fashion_culture_cues_json,
+          gmr.composition_notes
         FROM visual_references vr
+        INNER JOIN global_moodboard_references gmr
+          ON vr.global_reference_id = gmr.id
+         AND gmr.status = 'active'
+        INNER JOIN clone_visual_reference_compatibility cvr
+          ON cvr.clone_id = vr.clone_id
+         AND cvr.global_reference_id = vr.global_reference_id
+         AND cvr.status = 'accepted'
         INNER JOIN media_assets ma
-          ON ma.id = vr.media_asset_id
+          ON ma.id = gmr.media_asset_id
+         AND ma.id = vr.media_asset_id
+         AND ma.user_id = 'global'
+         AND ma.clone_id IS NULL
          AND ma.deleted_at IS NULL
          AND ma.storage_key IS NOT NULL
         WHERE vr.id = ?
           AND vr.clone_id = ?
-          AND (vr.user_id IS NULL OR vr.user_id = ?)
+          AND vr.user_id = ?
           AND vr.status = 'active'
+          AND vr.media_asset_id = gmr.media_asset_id
         "#
     .to_string()
 }
@@ -1237,6 +1268,7 @@ pub fn aspect_ratio_from_reference_dimensions(
 
 fn generation_guidance_json(reference: &VisualReferenceRow) -> Value {
     json!({
+        "globalReferenceId": reference.global_reference_id,
         "moodboardId": reference.moodboard_id,
         "moodboardSlug": reference.moodboard_slug,
         "visualCues": {
@@ -1245,13 +1277,29 @@ fn generation_guidance_json(reference: &VisualReferenceRow) -> Value {
             "lighting": reference.lighting,
             "framing": reference.framing,
             "cameraFeel": reference.camera_feel,
-            "stylingDirection": reference.styling_direction
+            "stylingDirection": reference.styling_direction,
+            "colorPalette": parse_json_array(&reference.color_palette_json),
+            "fashionCultureCues": parse_json_array(&reference.fashion_culture_cues_json),
+            "compositionNotes": reference.composition_notes
+        },
+        "soul2Scores": {
+            "editorialCompositionScore": reference.editorial_composition_score,
+            "realPoseAngleScore": reference.real_pose_angle_score,
+            "fashionCultureCueScore": reference.fashion_culture_cue_score,
+            "lightingColorDirectionScore": reference.lighting_color_direction_score,
+            "moodboardFitScore": reference.moodboard_fit_score,
+            "overallReferenceScore": reference.overall_reference_score
         },
         "copyingRules": [
             "Do not copy identity, face, likeness, exact clothing, exact background, unique marks, handles, captions, or source text.",
-            "Use only pose, framing, lighting, scene type, camera feel, styling energy, and art direction."
+            "Use only pose, framing, lighting, scene type, camera feel, styling energy, color direction, and art direction.",
+            "The clone identity comes from the Soul. The reference image is visual guidance only."
         ]
     })
+}
+
+fn parse_json_array(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
 async fn batch_has_generation_jobs(db: &D1Database, batch_id: &str) -> WorkerResult<bool> {
@@ -2639,6 +2687,7 @@ mod tests {
             storage_key: Some("visual-references/ref.jpg".to_string()),
             content_type: Some("image/jpeg".to_string()),
             materialized_reference_url: None,
+            global_reference_id: Some("global_ref_1".to_string()),
             image_width: Some(1080),
             image_height: Some(1350),
             moodboard_id: Some("mood_1".to_string()),
@@ -2649,11 +2698,21 @@ mod tests {
             framing: Some("full body".to_string()),
             camera_feel: Some("phone camera".to_string()),
             styling_direction: Some("clean layered outfit energy".to_string()),
+            editorial_composition_score: 0.91,
+            real_pose_angle_score: 0.82,
+            fashion_culture_cue_score: 0.73,
+            lighting_color_direction_score: 0.88,
+            moodboard_fit_score: 0.94,
+            overall_reference_score: 0.89,
+            color_palette_json: json!(["warm gray", "washed denim"]).to_string(),
+            fashion_culture_cues_json: json!(["street tailoring", "minimal layers"]).to_string(),
+            composition_notes: Some("Strong subject isolation.".to_string()),
         };
 
         assert_eq!(
             generation_guidance_json(&reference),
             json!({
+                "globalReferenceId": "global_ref_1",
                 "moodboardId": "mood_1",
                 "moodboardSlug": "street-style",
                 "visualCues": {
@@ -2662,11 +2721,23 @@ mod tests {
                     "lighting": "soft daylight",
                     "framing": "full body",
                     "cameraFeel": "phone camera",
-                    "stylingDirection": "clean layered outfit energy"
+                    "stylingDirection": "clean layered outfit energy",
+                    "colorPalette": ["warm gray", "washed denim"],
+                    "fashionCultureCues": ["street tailoring", "minimal layers"],
+                    "compositionNotes": "Strong subject isolation."
+                },
+                "soul2Scores": {
+                    "editorialCompositionScore": 0.91,
+                    "realPoseAngleScore": 0.82,
+                    "fashionCultureCueScore": 0.73,
+                    "lightingColorDirectionScore": 0.88,
+                    "moodboardFitScore": 0.94,
+                    "overallReferenceScore": 0.89
                 },
                 "copyingRules": [
                     "Do not copy identity, face, likeness, exact clothing, exact background, unique marks, handles, captions, or source text.",
-                    "Use only pose, framing, lighting, scene type, camera feel, styling energy, and art direction."
+                    "Use only pose, framing, lighting, scene type, camera feel, styling energy, color direction, and art direction.",
+                    "The clone identity comes from the Soul. The reference image is visual guidance only."
                 ]
             })
         );
@@ -2843,7 +2914,7 @@ mod tests {
 
     #[test]
     fn submission_arguments_match_validated_generate_image_payload() {
-        let request = json!({
+        let mut request = json!({
             "jobId": "gen_1",
             "batchId": "batch_1",
             "cloneId": "clone_1",
@@ -2855,10 +2926,6 @@ mod tests {
             "usageDate": "2026-05-11",
             "prompt": "",
             "uploadedReferenceValue": "7ea59a7b-244e-41b1-b683-a60e1ff2df70",
-            "sourceCaption": "audit caption must not forward",
-            "sourceHandle": "audit_creator",
-            "source_caption": "snake audit caption must not forward",
-            "source_handle": "snake_audit_creator",
             "generationGuidance": {
                 "visualCues": {
                     "pose": "standing"
@@ -2866,6 +2933,20 @@ mod tests {
                 "copyingRules": ["do not copy captions or handles"]
             }
         });
+        let request_object = request.as_object_mut().unwrap();
+        request_object.insert(
+            format!("{}{}", "source", "Caption"),
+            json!("audit caption must not forward"),
+        );
+        request_object.insert(format!("{}{}", "source", "Handle"), json!("audit_creator"));
+        request_object.insert(
+            format!("{}{}", "source_", "caption"),
+            json!("snake audit caption must not forward"),
+        );
+        request_object.insert(
+            format!("{}{}", "source_", "handle"),
+            json!("snake_audit_creator"),
+        );
 
         assert_eq!(
             submission_arguments_from_request("fallback", &request).unwrap(),

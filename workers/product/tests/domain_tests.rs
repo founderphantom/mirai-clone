@@ -1455,6 +1455,33 @@ fn visual_reference_cache_metadata_uses_cleaned_remote_url_label() {
 }
 
 #[test]
+fn generation_visual_reference_query_requires_active_global_reference_and_accepted_compatibility() {
+    let source = include_str!("../src/queues/generation.rs");
+    assert!(source.contains("visual_reference_guidance_query"));
+    assert!(source.contains("INNER JOIN global_moodboard_references gmr"));
+    assert!(source.contains("gmr.status = 'active'"));
+    assert!(source.contains("INNER JOIN clone_visual_reference_compatibility cvr"));
+    assert!(source.contains("cvr.status = 'accepted'"));
+    assert!(source.contains("vr.global_reference_id = gmr.id"));
+    assert!(source.contains("vr.media_asset_id = gmr.media_asset_id"));
+    assert!(source.contains("ma.user_id = 'global'"));
+    assert!(source.contains("ma.clone_id IS NULL"));
+    assert!(!source.contains("vr.user_id IS NULL OR vr.user_id = ?"));
+}
+
+#[test]
+fn generation_guidance_includes_scores_and_excludes_source_text() {
+    let source = include_str!("../src/queues/generation.rs");
+    assert!(source.contains("\"globalReferenceId\""));
+    assert!(source.contains("\"overallReferenceScore\""));
+    assert!(source.contains("\"soul2Scores\""));
+    assert!(source.contains("\"copyingRules\""));
+    assert!(source.contains("Do not copy identity"));
+    assert!(!source.contains("\"sourceCaption\""));
+    assert!(!source.contains("\"sourceHandle\""));
+}
+
+#[test]
 fn candidate_ranking_prefers_static_configured_recent_engaged_images() {
     let candidates = vec![
         ranking_candidate(
