@@ -1233,7 +1233,7 @@ pub async fn insert_clone_visual_reference_for_accepted_global_reference(
 
 pub async fn finalize_clone_reference_pool(
     db: &D1Database,
-    _env: &Env,
+    env: &Env,
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
@@ -1293,6 +1293,41 @@ pub async fn finalize_clone_reference_pool(
     } else {
         "insufficient_refs"
     };
+
+    let batch_provider_soul_id =
+        if final_status == "pool_ready" || final_status == "partial_pool_ready" {
+            db::first::<CloneForPoolRow>(
+                db,
+                load_clone_for_pool_sql(),
+                vec![json!(user_id), json!(clone_id)],
+            )
+            .await?
+            .and_then(|clone| {
+                if clone.soul_status.as_deref() == Some("ready") {
+                    clone
+                        .provider_soul_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+    if let Some(provider_soul_id) = batch_provider_soul_id {
+        if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+            return Ok(());
+        }
+        crate::services::blitz::create_next_batch(db, env, user_id, clone_id, &provider_soul_id)
+            .await?;
+        if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+            return Ok(());
+        }
+    }
 
     let result = db::run(
         db,

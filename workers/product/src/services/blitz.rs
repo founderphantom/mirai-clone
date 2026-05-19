@@ -2,8 +2,7 @@ use crate::db;
 use crate::domain::blitz::{
     accumulate_influence, select_visual_references, SwipeMetadata, VisualReferenceForSelection,
 };
-use crate::queues::messages::GenerationMessage;
-use crate::queues::niche_research::NicheResearchMessage;
+use crate::queues::messages::{GenerationMessage, ReferencePipelineMessage};
 use crate::services::generation_usage::GenerationUsageSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -108,11 +107,13 @@ struct SwipeMetadataSnapshot {
     #[serde(default)]
     source_platform: String,
     visual_reference_id: Option<String>,
+    global_reference_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct VisualReferenceRow {
     id: String,
+    global_reference_id: String,
     source_platform: String,
     source_published_at: Option<String>,
     niche_cluster: Option<String>,
@@ -161,6 +162,7 @@ struct OutputResponseRow {
 #[derive(Debug, Deserialize)]
 struct OutputSwipeRow {
     visual_reference_id: Option<String>,
+    global_reference_id: Option<String>,
     source_platform: Option<String>,
     niche_cluster: Option<String>,
     moodboard_id: Option<String>,
@@ -632,6 +634,7 @@ pub async fn record_swipe(
         "sourceHandle": output.source_handle,
         "sourcePlatform": output.source_platform.clone().unwrap_or_default(),
         "visualReferenceId": output.visual_reference_id,
+        "globalReferenceId": output.global_reference_id,
         "pose": output.pose,
         "scene": output.scene,
         "lighting": output.lighting,
@@ -885,8 +888,8 @@ async fn enqueue_refresh_pool(
     clone_id: &str,
     reason: &str,
 ) -> WorkerResult<()> {
-    env.queue("NICHE_RESEARCH_QUEUE")?
-        .send(NicheResearchMessage::RefreshPool {
+    env.queue("REFERENCE_PIPELINE_QUEUE")?
+        .send(ReferencePipelineMessage::RefreshPool {
             user_id: user_id.to_string(),
             clone_id: clone_id.to_string(),
             reason: reason.to_string(),
@@ -988,7 +991,10 @@ async fn load_influence(
                     .as_ref()
                     .map(|snapshot| snapshot.source_platform.clone())
                     .unwrap_or_default(),
-                visual_reference_id: snapshot.and_then(|snapshot| snapshot.visual_reference_id),
+                visual_reference_id: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.visual_reference_id.clone()),
+                global_reference_id: snapshot.and_then(|snapshot| snapshot.global_reference_id),
             }
         })
         .collect::<Vec<_>>();
@@ -1004,22 +1010,39 @@ async fn load_visual_references_for_selection(
         db,
         r#"
         SELECT
-          id,
-          source_platform,
-          source_published_at,
-          niche_cluster,
-          moodboard_id,
-          moodboard_slug,
-          source_handle,
-          aesthetic_tags_json,
-          human_presence_score,
-          organic_photo_score,
-          freshness_visual_score,
-          generation_use_count,
-          last_liked_at
-        FROM visual_references
-        WHERE clone_id = ?
-          AND status = 'active'
+          vr.id,
+          vr.global_reference_id,
+          vr.source_platform,
+          vr.source_published_at,
+          vr.niche_cluster,
+          vr.moodboard_id,
+          vr.moodboard_slug,
+          vr.source_handle,
+          vr.aesthetic_tags_json,
+          vr.human_presence_score,
+          vr.organic_photo_score,
+          vr.freshness_visual_score,
+          vr.generation_use_count,
+          vr.last_liked_at
+        FROM visual_references vr
+        INNER JOIN moodboards mb
+          ON mb.user_id = vr.user_id
+         AND mb.slug = vr.moodboard_slug
+         AND mb.selected = 1
+        INNER JOIN global_moodboard_definitions gmd
+          ON gmd.slug = mb.slug
+         AND gmd.status = 'active'
+        INNER JOIN global_moodboard_references gmr
+          ON gmr.id = vr.global_reference_id
+         AND gmr.moodboard_slug = vr.moodboard_slug
+         AND gmr.status = 'active'
+        INNER JOIN clone_visual_reference_compatibility cvr
+          ON cvr.clone_id = vr.clone_id
+         AND cvr.global_reference_id = vr.global_reference_id
+         AND cvr.status = 'accepted'
+        WHERE vr.clone_id = ?
+          AND vr.status = 'active'
+          AND vr.media_asset_id = gmr.media_asset_id
         "#,
         vec![json!(clone_id)],
     )
@@ -1027,20 +1050,39 @@ async fn load_visual_references_for_selection(
 
     Ok(rows
         .into_iter()
-        .map(|row| VisualReferenceForSelection {
-            id: row.id,
-            source_platform: row.source_platform,
-            source_published_at: row.source_published_at,
-            niche_cluster: row.niche_cluster,
-            moodboard_id: row.moodboard_id,
-            moodboard_slug: row.moodboard_slug,
-            source_handle: row.source_handle,
-            aesthetic_tags: parse_string_array(&row.aesthetic_tags_json),
-            human_presence_score: row.human_presence_score,
-            organic_photo_score: row.organic_photo_score,
-            freshness_visual_score: row.freshness_visual_score,
-            generation_use_count: row.generation_use_count,
-            last_liked_at: row.last_liked_at,
+        .map(|row| {
+            let VisualReferenceRow {
+                id,
+                global_reference_id: _global_reference_id,
+                source_platform,
+                source_published_at,
+                niche_cluster,
+                moodboard_id,
+                moodboard_slug,
+                source_handle,
+                aesthetic_tags_json,
+                human_presence_score,
+                organic_photo_score,
+                freshness_visual_score,
+                generation_use_count,
+                last_liked_at,
+            } = row;
+
+            VisualReferenceForSelection {
+                id,
+                source_platform,
+                source_published_at,
+                niche_cluster,
+                moodboard_id,
+                moodboard_slug,
+                source_handle,
+                aesthetic_tags: parse_string_array(&aesthetic_tags_json),
+                human_presence_score,
+                organic_photo_score,
+                freshness_visual_score,
+                generation_use_count,
+                last_liked_at,
+            }
         })
         .collect())
 }
@@ -1241,6 +1283,7 @@ async fn load_output_for_swipe(
         r#"
         SELECT
           gj.input_visual_reference_id AS visual_reference_id,
+          vr.global_reference_id,
           vr.source_platform,
           vr.niche_cluster,
           vr.moodboard_id,

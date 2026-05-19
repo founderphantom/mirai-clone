@@ -521,6 +521,37 @@ fn clone_reference_pool_finalization_treats_in_progress_compatibility_leases_as_
 }
 
 #[test]
+fn clone_reference_pool_finalization_orchestrates_blitz_batch_for_ready_pool() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let body =
+        reference_pipeline_function_body(source, "pub async fn finalize_clone_reference_pool");
+
+    assert!(body.contains("env: &Env"));
+    assert!(!body.contains("_env: &Env"));
+    assert!(body.contains("final_status == \"pool_ready\""));
+    assert!(body.contains("final_status == \"partial_pool_ready\""));
+    assert!(body.contains("load_clone_for_pool_sql()"));
+    assert!(body.contains("crate::services::blitz::create_next_batch"));
+
+    let create_batch = body
+        .find("crate::services::blitz::create_next_batch")
+        .expect("ready pool should create next Blitz batch");
+    let terminal_write = body
+        .find("finalize_clone_pool_run_sql()")
+        .expect("ready pool should still write terminal pool state");
+    assert!(create_batch < terminal_write);
+
+    let before_batch = &body[..create_batch];
+    assert!(before_batch.contains("clone.soul_status.as_deref() == Some(\"ready\")"));
+    assert!(before_batch.contains("provider_soul_id"));
+
+    let after_batch = &body[create_batch..terminal_write];
+    assert!(after_batch.contains("current_pool_run_allows_side_effects"));
+    assert!(!after_batch.contains("\"insufficient_refs\""));
+    assert!(!after_batch.contains("\"compatibility_reviewing\""));
+}
+
+#[test]
 fn clone_finalize_messages_are_not_permanently_deduped_by_pool_run() {
     let source = include_str!("../src/services/clone_reference_pool.rs");
     let body = reference_pipeline_function_body(source, "async fn enqueue_finalize_clone_pool");
@@ -5197,6 +5228,39 @@ fn default_moodboards_provide_exact_curated_research_choices() {
 }
 
 #[test]
+fn blitz_refresh_pool_uses_reference_pipeline_queue() {
+    let source = include_str!("../src/services/blitz.rs");
+    assert!(source.contains("ReferencePipelineMessage::RefreshPool"));
+    assert!(source.contains("REFERENCE_PIPELINE_QUEUE"));
+    assert!(!source.contains("NicheResearchMessage::RefreshPool"));
+    assert!(!source.contains("NICHE_RESEARCH_QUEUE"));
+}
+
+#[test]
+fn blitz_selection_filters_to_current_selected_active_moodboards() {
+    let source = include_str!("../src/services/blitz.rs");
+    assert!(source.contains("load_visual_references_for_selection"));
+    assert!(source.contains("INNER JOIN moodboards mb"));
+    assert!(source.contains("mb.user_id = vr.user_id"));
+    assert!(source.contains("mb.slug = vr.moodboard_slug"));
+    assert!(source.contains("mb.selected = 1"));
+    assert!(source.contains("INNER JOIN global_moodboard_definitions gmd"));
+    assert!(source.contains("gmd.status = 'active'"));
+    assert!(source.contains("clone_visual_reference_compatibility cvr"));
+    assert!(source.contains("cvr.status = 'accepted'"));
+    assert!(source.contains("gmr.moodboard_slug = vr.moodboard_slug"));
+}
+
+#[test]
+fn blitz_swipe_metadata_snapshots_global_reference_id() {
+    let source = include_str!("../src/services/blitz.rs");
+    let domain = include_str!("../src/domain/blitz.rs");
+    assert!(domain.contains("pub global_reference_id: Option<String>"));
+    assert!(source.contains("globalReferenceId"));
+    assert!(source.contains("output.global_reference_id"));
+}
+
+#[test]
 fn influence_accumulates_likes_and_dislikes_from_metadata() {
     let influence = accumulate_influence(&[
         SwipeMetadata {
@@ -5208,6 +5272,7 @@ fn influence_accumulates_likes_and_dislikes_from_metadata() {
             source_handle: Some("Creator_A".to_string()),
             source_platform: "tiktok".to_string(),
             visual_reference_id: Some("vref_1".to_string()),
+            global_reference_id: Some("gref_1".to_string()),
         },
         SwipeMetadata {
             action: "dislike".to_string(),
@@ -5218,6 +5283,7 @@ fn influence_accumulates_likes_and_dislikes_from_metadata() {
             source_handle: Some("Creator_B".to_string()),
             source_platform: "instagram".to_string(),
             visual_reference_id: Some("vref_2".to_string()),
+            global_reference_id: Some("gref_2".to_string()),
         },
     ]);
 
@@ -5244,6 +5310,7 @@ fn influence_normalizes_text_keys_but_preserves_reference_id_case() {
         source_handle: Some(" Creator_A ".to_string()),
         source_platform: "TikTok".to_string(),
         visual_reference_id: Some(" VRef_A ".to_string()),
+        global_reference_id: Some(" GRef_A ".to_string()),
     }]);
 
     assert_eq!(influence.liked_tags["minimalist"], 1);
@@ -5303,6 +5370,7 @@ fn influence_scores_moodboard_and_handle_preferences() {
             source_handle: Some(" Creator_A ".to_string()),
             source_platform: "instagram".to_string(),
             visual_reference_id: None,
+            global_reference_id: None,
         },
         SwipeMetadata {
             action: "dislike".to_string(),
@@ -5313,6 +5381,7 @@ fn influence_scores_moodboard_and_handle_preferences() {
             source_handle: Some("Creator_B".to_string()),
             source_platform: "instagram".to_string(),
             visual_reference_id: None,
+            global_reference_id: None,
         },
     ]);
 

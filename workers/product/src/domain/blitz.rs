@@ -54,6 +54,7 @@ pub struct SwipeMetadata {
     pub source_handle: Option<String>,
     pub source_platform: String,
     pub visual_reference_id: Option<String>,
+    pub global_reference_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
