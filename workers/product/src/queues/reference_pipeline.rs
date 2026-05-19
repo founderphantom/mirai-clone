@@ -1,5 +1,5 @@
-use crate::db;
 use crate::ai::workers_ai::{global_visual_reference_review_prompt, run_vision_json};
+use crate::db;
 use crate::domain::global_reference::{
     accept_global_visual_review, instagram_source_image_key, GlobalVisualReferenceReview,
 };
@@ -11,6 +11,12 @@ use crate::instagram_references::{
     extract_instagram_reels_owner_handles, instagram_candidate_meets_min_dimensions,
     normalize_instagram_post_detail, normalize_instagram_profile_related_handles,
     normalize_instagram_user_posts, InstagramFallbackPolicy, InstagramImageCandidate,
+};
+use crate::providers::higgsfield_auth::provider_account_access_token;
+use crate::providers::higgsfield_mcp::{call_tool, upload_media_files, HiggsfieldMcpMediaFile};
+use crate::providers::seedream::{
+    extract_seedream_cleaned_image_url, seedream_cleanup_arguments_with_model,
+    SEEDREAM_CLEANUP_MODEL,
 };
 use crate::queues::messages::ReferencePipelineMessage;
 use crate::scrapecreators::fetch_scrapecreators_json;
@@ -26,6 +32,10 @@ use std::collections::{HashMap, HashSet};
 use worker::{D1Database, Env, Error, MessageBatch, MessageExt, Result as WorkerResult};
 
 const REFERENCE_PIPELINE_QUEUE_BINDING: &str = "REFERENCE_PIPELINE_QUEUE";
+const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER";
+const HIGGSFIELD_PROVIDER_ACCOUNT_ID: &str = "pa_higgsfield_founder";
+const HIGGSFIELD_CLEANUP_TOOL_VAR: &str = "HIGGSFIELD_MCP_CLEANUP_TOOL";
+const HIGGSFIELD_CLEANUP_MODEL_VAR: &str = "HIGGSFIELD_MCP_CLEANUP_MODEL";
 
 pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<()> {
     let db = env.d1("DB")?;
@@ -148,8 +158,15 @@ async fn handle_message(
             run_id,
             limit,
         } => review_global_visual_candidates(db, env, &moodboard_slug, &run_id, limit).await,
-        ReferencePipelineMessage::CleanupGlobalMoodboardReference { .. }
-        | ReferencePipelineMessage::FinalizeGlobalMoodboardLibrary { .. } => {
+        ReferencePipelineMessage::CleanupGlobalMoodboardReference {
+            moodboard_slug,
+            run_id,
+            candidate_id,
+        } => {
+            cleanup_global_moodboard_reference(db, env, &moodboard_slug, &run_id, &candidate_id)
+                .await
+        }
+        ReferencePipelineMessage::FinalizeGlobalMoodboardLibrary { .. } => {
             global_review_cleanup_and_finalize_are_enabled_in_tasks_11_to_13();
             Ok(())
         }
@@ -688,10 +705,9 @@ async fn review_global_visual_candidates(
         limit.min(configured_limit)
     }
     .max(1);
-    let review_retry_limit =
-        config_value_u32(db, "visual_reference_review_retry_limit", 2)
-            .await?
-            .max(1);
+    let review_retry_limit = config_value_u32(db, "visual_reference_review_retry_limit", 2)
+        .await?
+        .max(1);
     let now = now_iso_string();
     let candidates = db::all::<GlobalVisualCandidateReviewRow>(
         db,
@@ -851,6 +867,254 @@ async fn review_global_visual_candidates(
     }
 }
 
+async fn cleanup_global_moodboard_reference(
+    db: &D1Database,
+    env: &Env,
+    moodboard_slug: &str,
+    run_id: &str,
+    candidate_id: &str,
+) -> WorkerResult<()> {
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+
+    let retry_limit = config_value_u32(db, "visual_reference_cleanup_retry_limit", 3)
+        .await?
+        .max(1);
+    let now = now_iso_string();
+    let Some(candidate) = db::first::<GlobalVisualCandidateCleanupRow>(
+        db,
+        load_global_candidate_for_cleanup_sql(),
+        vec![
+            json!(candidate_id),
+            json!(now),
+            json!(now),
+            json!(moodboard_slug),
+            json!(run_id),
+        ],
+    )
+    .await?
+    else {
+        resume_or_finalize_cleaned_global_candidate(
+            db,
+            env,
+            moodboard_slug,
+            run_id,
+            candidate_id,
+            retry_limit,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let cleanup_lock_expires_at = retry_after_minutes(15);
+    let claim_result = db::run(
+        db,
+        claim_global_candidate_for_cleanup_sql(),
+        vec![
+            json!(cleanup_lock_expires_at),
+            json!(now_iso_string()),
+            json!(candidate_id),
+            json!(retry_limit),
+            json!(now_iso_string()),
+            json!(now_iso_string()),
+            json!(moodboard_slug),
+            json!(run_id),
+        ],
+    )
+    .await?;
+    if changed_rows(&claim_result)? == 0 {
+        if !resume_or_finalize_cleaned_global_candidate(
+            db,
+            env,
+            moodboard_slug,
+            run_id,
+            candidate_id,
+            retry_limit,
+        )
+        .await?
+        {
+            enqueue_finalize_global_moodboard_library(
+                env,
+                moodboard_slug,
+                run_id,
+                "global_cleanup_claim_skipped",
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+
+    let review = match serde_json::from_str::<GlobalVisualReferenceReview>(&candidate.review_json) {
+        Ok(review) => review,
+        Err(error) => {
+            record_global_candidate_cleanup_failure_and_finalize(
+                db,
+                env,
+                moodboard_slug,
+                run_id,
+                candidate_id,
+                retry_limit,
+                &cleanup_lock_expires_at,
+                "global_review_json_malformed",
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let cleanup_auth = match prepare_global_seedream_cleanup_auth(env).await {
+        Ok(auth) => auth,
+        Err(error) => {
+            record_global_candidate_cleanup_failure_and_finalize(
+                db,
+                env,
+                moodboard_slug,
+                run_id,
+                candidate_id,
+                retry_limit,
+                &cleanup_lock_expires_at,
+                "global_seedream_cleanup_auth_failed",
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+
+    let source_image = match fetch_global_seedream_cleanup_image(&candidate.image_url).await {
+        Ok(image) => image,
+        Err(error) => {
+            record_global_candidate_cleanup_failure_and_finalize(
+                db,
+                env,
+                moodboard_slug,
+                run_id,
+                candidate_id,
+                retry_limit,
+                &cleanup_lock_expires_at,
+                "global_seedream_cleanup_fetch_failed",
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+
+    let cleanup_request =
+        match upload_global_seedream_cleanup_image(&cleanup_auth, candidate_id, source_image).await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                record_global_candidate_cleanup_failure_and_finalize(
+                    db,
+                    env,
+                    moodboard_slug,
+                    run_id,
+                    candidate_id,
+                    retry_limit,
+                    &cleanup_lock_expires_at,
+                    "global_seedream_cleanup_upload_failed",
+                    &error.to_string(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+
+    let (cleaned_url, provider_job_id, raw_cleanup_json) =
+        match call_global_seedream_cleanup(candidate_id, &cleanup_request).await {
+            Ok(result) => result,
+            Err(error) => {
+                record_global_candidate_cleanup_failure_and_finalize(
+                    db,
+                    env,
+                    moodboard_slug,
+                    run_id,
+                    candidate_id,
+                    retry_limit,
+                    &cleanup_lock_expires_at,
+                    "global_seedream_cleanup_failed",
+                    &error.to_string(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+
+    let cleanup_json = serde_json::to_string(&json!({
+        "provider": "higgsfield_mcp",
+        "tool": cleanup_request.tool_name,
+        "model": cleanup_request.model,
+        "providerJobId": provider_job_id,
+        "cleanedImageUrl": cleaned_url,
+        "raw": raw_cleanup_json,
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    let write_now = now_iso_string();
+    let mark_result = db::run(
+        db,
+        mark_global_candidate_cleanup_succeeded_sql(),
+        vec![
+            json!(cleaned_url),
+            json!(cleanup_json),
+            json!(write_now),
+            json!(write_now),
+            json!(candidate_id),
+            json!(cleanup_lock_expires_at),
+            json!(moodboard_slug),
+            json!(run_id),
+        ],
+    )
+    .await?;
+    if changed_rows(&mark_result)? == 0 {
+        enqueue_finalize_global_moodboard_library(
+            env,
+            moodboard_slug,
+            run_id,
+            "global_cleanup_success_write_skipped",
+        )
+        .await?;
+        return Ok(());
+    }
+    complete_cleaned_global_moodboard_reference(
+        db,
+        env,
+        moodboard_slug,
+        run_id,
+        candidate_id,
+        retry_limit,
+        &cleanup_lock_expires_at,
+        &GlobalVisualCandidateReferenceRow {
+            cleaned_image_url: cleaned_url,
+            image_width: candidate.image_width,
+            image_height: candidate.image_height,
+            discovery_moodboard_slug: candidate.discovery_moodboard_slug,
+            assigned_moodboard_slug: candidate.assigned_moodboard_slug,
+            source_handle: candidate.source_handle,
+            review_json: candidate.review_json,
+        },
+        Some(review),
+    )
+    .await
+}
+
 fn global_review_cleanup_and_finalize_are_enabled_in_tasks_11_to_13() {}
 
 fn clone_pool_messages_are_enabled_in_part_three() {}
@@ -915,9 +1179,7 @@ async fn load_active_global_moodboard_definition(
     .await
 }
 
-async fn load_active_global_moodboard_briefs(
-    db: &D1Database,
-) -> WorkerResult<Vec<MoodboardBrief>> {
+async fn load_active_global_moodboard_briefs(db: &D1Database) -> WorkerResult<Vec<MoodboardBrief>> {
     let rows = db::all::<GlobalMoodboardDefinitionRow>(
         db,
         r#"
@@ -1316,6 +1578,287 @@ fn mark_global_candidate_review_failed_sql() -> &'static str {
       AND review_status = 'reviewing'
       AND review_run_id = ?
       AND review_claim_id = ?
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn load_global_candidate_for_cleanup_sql() -> &'static str {
+    r#"
+    SELECT
+      id,
+      image_url,
+      image_width,
+      image_height,
+      discovery_moodboard_slug,
+      assigned_moodboard_slug,
+      source_handle,
+      source_post_id,
+      source_post_code,
+      source_url,
+      source_published_at,
+      review_json,
+      cleanup_attempt_count
+    FROM global_visual_reference_candidates
+    WHERE id = ?
+      AND candidate_status = 'active'
+      AND review_status = 'approved'
+      AND cleanup_status IN ('queued', 'failed', 'cleaning')
+      AND assigned_moodboard_slug IS NOT NULL
+      AND image_url IS NOT NULL
+      AND (cleanup_status != 'cleaning' OR cleanup_next_retry_at <= ?)
+      AND (cleanup_status = 'cleaning' OR cleanup_next_retry_at IS NULL OR cleanup_next_retry_at <= ?)
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn claim_global_candidate_for_cleanup_sql() -> &'static str {
+    r#"
+    UPDATE global_visual_reference_candidates
+    SET cleanup_status = 'cleaning',
+        cleanup_next_retry_at = ?,
+        cleanup_attempt_count = cleanup_attempt_count + 1,
+        updated_at = ?
+    WHERE id = ?
+      AND candidate_status = 'active'
+      AND review_status = 'approved'
+      AND cleanup_status IN ('queued', 'failed', 'cleaning')
+      AND assigned_moodboard_slug IS NOT NULL
+      AND cleanup_attempt_count < ?
+      AND (cleanup_status != 'cleaning' OR cleanup_next_retry_at <= ?)
+      AND (cleanup_status = 'cleaning' OR cleanup_next_retry_at IS NULL OR cleanup_next_retry_at <= ?)
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn load_cleaned_global_candidate_for_followup_sql() -> &'static str {
+    r#"
+    SELECT
+      discovery_moodboard_slug,
+      assigned_moodboard_slug,
+      source_handle
+    FROM global_visual_reference_candidates gvc
+    WHERE gvc.id = ?
+      AND gvc.candidate_status = 'active'
+      AND gvc.review_status = 'approved'
+      AND gvc.cleanup_status = 'cleaned'
+      AND gvc.assigned_moodboard_slug IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_references gmr
+        WHERE gmr.candidate_id = gvc.id
+          AND gmr.status = 'active'
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn load_cleaned_global_candidate_for_reference_resume_sql() -> &'static str {
+    r#"
+    SELECT
+      cleaned_image_url,
+      image_width,
+      image_height,
+      discovery_moodboard_slug,
+      assigned_moodboard_slug,
+      source_handle,
+      source_post_id,
+      source_post_code,
+      source_url,
+      source_published_at,
+      review_json
+    FROM global_visual_reference_candidates gvc
+    WHERE gvc.id = ?
+      AND gvc.candidate_status = 'active'
+      AND gvc.review_status = 'approved'
+      AND gvc.cleanup_status = 'cleaned'
+      AND gvc.cleaned_image_url IS NOT NULL
+      AND gvc.assigned_moodboard_slug IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM global_moodboard_references gmr
+        WHERE gmr.candidate_id = gvc.id
+          AND gmr.status = 'active'
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn claim_cleaned_global_candidate_for_reference_resume_sql() -> &'static str {
+    r#"
+    UPDATE global_visual_reference_candidates
+    SET cleanup_next_retry_at = ?,
+        updated_at = ?
+    WHERE id = ?
+      AND candidate_status = 'active'
+      AND review_status = 'approved'
+      AND cleanup_status = 'cleaned'
+      AND cleaned_image_url IS NOT NULL
+      AND assigned_moodboard_slug IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM global_moodboard_references gmr
+        WHERE gmr.candidate_id = global_visual_reference_candidates.id
+          AND gmr.status = 'active'
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn mark_global_candidate_cleanup_failed_sql() -> &'static str {
+    r#"
+    UPDATE global_visual_reference_candidates
+    SET cleanup_status = 'failed',
+        -- Exhausted cleanup attempts make candidate_status = 'cleanup_failed'.
+        candidate_status = CASE WHEN cleanup_attempt_count >= ? THEN 'cleanup_failed' ELSE candidate_status END,
+        cleanup_error_code = ?,
+        cleanup_error_message = ?,
+        cleanup_next_retry_at = CASE WHEN cleanup_attempt_count >= ? THEN NULL ELSE ? END,
+        updated_at = ?
+    WHERE id = ?
+      AND review_status = 'approved'
+      AND cleanup_status IN ('cleaning', 'cleaned')
+      AND cleanup_next_retry_at = ?
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn mark_global_candidate_cleanup_succeeded_sql() -> &'static str {
+    r#"
+    UPDATE global_visual_reference_candidates
+    SET cleanup_status = 'cleaned',
+        cleanup_error_code = NULL,
+        cleanup_error_message = NULL,
+        cleaned_image_url = ?,
+        cleanup_json = ?,
+        cleaned_at = ?,
+        updated_at = ?
+    WHERE id = ?
+      AND candidate_status = 'active'
+      AND review_status = 'approved'
+      AND cleanup_status = 'cleaning'
+      AND cleanup_next_retry_at = ?
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn insert_global_moodboard_reference_sql() -> &'static str {
+    r#"
+    INSERT OR IGNORE INTO global_moodboard_references (
+      id,
+      candidate_id,
+      media_asset_id,
+      moodboard_slug,
+      discovery_moodboard_slug,
+      source_run_id,
+      source_platform,
+      source_image_key,
+      source_handle,
+      source_post_id,
+      source_post_code,
+      source_url,
+      source_published_at,
+      image_width,
+      image_height,
+      editorial_composition_score,
+      real_pose_angle_score,
+      fashion_culture_cue_score,
+      lighting_color_direction_score,
+      moodboard_fit_score,
+      overall_reference_score,
+      pose,
+      scene,
+      lighting,
+      framing,
+      camera_feel,
+      styling_direction,
+      color_palette_json,
+      fashion_culture_cues_json,
+      composition_notes,
+      review_json,
+      status,
+      created_at,
+      updated_at
+    )
+    SELECT
+      ?,
+      gvc.id,
+      ?,
+      gvc.assigned_moodboard_slug,
+      gvc.discovery_moodboard_slug,
+      ?,
+      gvc.platform,
+      gvc.source_image_key,
+      gvc.source_handle,
+      gvc.source_post_id,
+      gvc.source_post_code,
+      gvc.source_url,
+      gvc.source_published_at,
+      gvc.image_width,
+      gvc.image_height,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      ?,
+      gvc.review_json,
+      'active',
+      ?,
+      ?
+    FROM global_visual_reference_candidates gvc
+    WHERE gvc.id = ?
+      AND gvc.review_status = 'approved'
+      AND gvc.cleanup_status = 'cleaned'
+      AND gvc.assigned_moodboard_slug IS NOT NULL
       AND EXISTS (
         SELECT 1
         FROM global_moodboard_reference_state
@@ -1791,6 +2334,375 @@ async fn enqueue_finalize_global_moodboard_library(
         .await
 }
 
+async fn record_global_candidate_cleanup_failure_and_finalize(
+    db: &D1Database,
+    env: &Env,
+    moodboard_slug: &str,
+    run_id: &str,
+    candidate_id: &str,
+    retry_limit: u32,
+    cleanup_claim_expires_at: &str,
+    error_code: &str,
+    error_message: &str,
+) -> WorkerResult<()> {
+    let now = now_iso_string();
+    let next_retry_at = retry_after_minutes(15);
+    db::exec(
+        db,
+        mark_global_candidate_cleanup_failed_sql(),
+        vec![
+            json!(retry_limit),
+            json!(error_code),
+            json!(compact_error_detail(error_message)),
+            json!(retry_limit),
+            json!(next_retry_at),
+            json!(now),
+            json!(candidate_id),
+            json!(cleanup_claim_expires_at),
+            json!(moodboard_slug),
+            json!(run_id),
+        ],
+    )
+    .await?;
+    enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "global_cleanup_failed")
+        .await
+}
+
+async fn resume_or_finalize_cleaned_global_candidate(
+    db: &D1Database,
+    env: &Env,
+    moodboard_slug: &str,
+    run_id: &str,
+    candidate_id: &str,
+    retry_limit: u32,
+) -> WorkerResult<bool> {
+    if let Some(candidate) = db::first::<GlobalVisualCandidateReferenceRow>(
+        db,
+        load_cleaned_global_candidate_for_reference_resume_sql(),
+        vec![json!(candidate_id), json!(moodboard_slug), json!(run_id)],
+    )
+    .await?
+    {
+        let cleanup_lock_expires_at = retry_after_minutes(15);
+        let claim_result = db::run(
+            db,
+            claim_cleaned_global_candidate_for_reference_resume_sql(),
+            vec![
+                json!(cleanup_lock_expires_at),
+                json!(now_iso_string()),
+                json!(candidate_id),
+                json!(moodboard_slug),
+                json!(run_id),
+            ],
+        )
+        .await?;
+        if changed_rows(&claim_result)? > 0 {
+            complete_cleaned_global_moodboard_reference(
+                db,
+                env,
+                moodboard_slug,
+                run_id,
+                candidate_id,
+                retry_limit,
+                &cleanup_lock_expires_at,
+                &candidate,
+                None,
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
+
+    if let Some(candidate) = db::first::<GlobalVisualCandidateFollowupRow>(
+        db,
+        load_cleaned_global_candidate_for_followup_sql(),
+        vec![json!(candidate_id), json!(moodboard_slug), json!(run_id)],
+    )
+    .await?
+    {
+        ensure_global_cleanup_followups(db, env, moodboard_slug, run_id, &candidate).await?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+async fn complete_cleaned_global_moodboard_reference(
+    db: &D1Database,
+    env: &Env,
+    moodboard_slug: &str,
+    run_id: &str,
+    candidate_id: &str,
+    retry_limit: u32,
+    cleanup_claim_expires_at: &str,
+    candidate: &GlobalVisualCandidateReferenceRow,
+    review: Option<GlobalVisualReferenceReview>,
+) -> WorkerResult<()> {
+    let review = match review {
+        Some(review) => review,
+        None => match serde_json::from_str::<GlobalVisualReferenceReview>(&candidate.review_json) {
+            Ok(review) => review,
+            Err(error) => {
+                record_global_candidate_cleanup_failure_and_finalize(
+                    db,
+                    env,
+                    moodboard_slug,
+                    run_id,
+                    candidate_id,
+                    retry_limit,
+                    cleanup_claim_expires_at,
+                    "global_review_json_malformed",
+                    &error.to_string(),
+                )
+                .await?;
+                return Ok(());
+            }
+        },
+    };
+
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+    let global_reference_id = deterministic_global_moodboard_reference_id(candidate_id);
+    let cached =
+        match crate::services::visual_reference_cache::cache_cleaned_global_moodboard_reference(
+            db,
+            env,
+            &candidate.assigned_moodboard_slug,
+            &global_reference_id,
+            &candidate.cleaned_image_url,
+            candidate.image_width,
+            candidate.image_height,
+        )
+        .await
+        {
+            Ok(cached) => cached,
+            Err(error) => {
+                record_global_candidate_cleanup_failure_and_finalize(
+                    db,
+                    env,
+                    moodboard_slug,
+                    run_id,
+                    candidate_id,
+                    retry_limit,
+                    cleanup_claim_expires_at,
+                    "global_reference_cache_failed",
+                    &error.to_string(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+
+    let insert_result = db::run(
+        db,
+        insert_global_moodboard_reference_sql(),
+        vec![
+            json!(global_reference_id),
+            json!(cached.media_asset_id),
+            json!(run_id),
+            json!(review.editorial_composition_score),
+            json!(review.real_pose_angle_score),
+            json!(review.fashion_culture_cue_score),
+            json!(review.lighting_color_direction_score),
+            json!(review.moodboard_fit_score),
+            json!(review.overall_reference_score),
+            json!(empty_string_as_null(&review.pose)),
+            json!(empty_string_as_null(&review.scene)),
+            json!(empty_string_as_null(&review.lighting)),
+            json!(empty_string_as_null(&review.framing)),
+            json!(empty_string_as_null(&review.camera_feel)),
+            json!(empty_string_as_null(&review.styling_direction)),
+            json!(
+                serde_json::to_string(&review.color_palette).unwrap_or_else(|_| "[]".to_string())
+            ),
+            json!(serde_json::to_string(&review.fashion_culture_cues)
+                .unwrap_or_else(|_| "[]".to_string())),
+            json!(empty_string_as_null(&review.composition_notes)),
+            json!(now_iso_string()),
+            json!(now_iso_string()),
+            json!(candidate_id),
+            json!(moodboard_slug),
+            json!(run_id),
+        ],
+    )
+    .await;
+    if let Err(error) = insert_result {
+        record_global_candidate_cleanup_failure_and_finalize(
+            db,
+            env,
+            moodboard_slug,
+            run_id,
+            candidate_id,
+            retry_limit,
+            cleanup_claim_expires_at,
+            "global_reference_insert_failed",
+            &error.to_string(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    ensure_global_cleanup_followups(
+        db,
+        env,
+        moodboard_slug,
+        run_id,
+        &GlobalVisualCandidateFollowupRow {
+            discovery_moodboard_slug: candidate.discovery_moodboard_slug.clone(),
+            assigned_moodboard_slug: candidate.assigned_moodboard_slug.clone(),
+            source_handle: candidate.source_handle.clone(),
+        },
+    )
+    .await
+}
+
+async fn ensure_global_cleanup_followups(
+    db: &D1Database,
+    env: &Env,
+    moodboard_slug: &str,
+    run_id: &str,
+    candidate: &GlobalVisualCandidateFollowupRow,
+) -> WorkerResult<()> {
+    if candidate.assigned_moodboard_slug != candidate.discovery_moodboard_slug {
+        if let Some(handle) = candidate.source_handle.as_deref() {
+            if let Err(error) = upsert_global_handle(
+                db,
+                &candidate.assigned_moodboard_slug,
+                handle,
+                "cross_routed_acceptance",
+                0,
+                &now_iso_string(),
+            )
+            .await
+            {
+                web_sys::console::error_1(
+                    &format!("global cleanup cross-routed handle upsert failed: {error}").into(),
+                );
+            }
+        }
+    }
+
+    enqueue_finalize_global_moodboard_library(
+        env,
+        moodboard_slug,
+        run_id,
+        "global_cleanup_already_cleaned",
+    )
+    .await
+}
+
+async fn prepare_global_seedream_cleanup_auth(env: &Env) -> WorkerResult<SeedreamCleanupAuth> {
+    let token = provider_account_access_token(
+        env,
+        HIGGSFIELD_PROVIDER_ACCOUNT_ID,
+        HIGGSFIELD_REFRESH_SECRET_NAME,
+    )
+    .await
+    .map_err(|error| Error::RustError(format!("seedream_cleanup_auth_failed:{error}")))?;
+    let tool_name = env
+        .var(HIGGSFIELD_CLEANUP_TOOL_VAR)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "generate_image".to_string());
+    let model = env
+        .var(HIGGSFIELD_CLEANUP_MODEL_VAR)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| SEEDREAM_CLEANUP_MODEL.to_string());
+    Ok(SeedreamCleanupAuth {
+        access_token: token.access_token,
+        tool_name,
+        model,
+    })
+}
+
+async fn fetch_global_seedream_cleanup_image(
+    image_url: &str,
+) -> WorkerResult<SeedreamCleanupImage> {
+    let (bytes, content_type) =
+        crate::services::visual_reference_cache::fetch_visual_reference_image(image_url).await?;
+    Ok(SeedreamCleanupImage {
+        bytes,
+        content_type,
+    })
+}
+
+async fn upload_global_seedream_cleanup_image(
+    auth: &SeedreamCleanupAuth,
+    candidate_id: &str,
+    image: SeedreamCleanupImage,
+) -> WorkerResult<SeedreamCleanupRequest> {
+    let uploaded = upload_media_files(
+        &auth.access_token,
+        &[HiggsfieldMcpMediaFile {
+            filename: format!("{candidate_id}.{}", cleanup_extension(&image.content_type)),
+            content_type: image.content_type,
+            bytes: image.bytes,
+        }],
+    )
+    .await
+    .map_err(|error| Error::RustError(format!("seedream_cleanup_upload_failed:{error}")))?;
+    let Some(reference) = uploaded.first() else {
+        return Err(Error::RustError(
+            "seedream_cleanup_upload_missing".to_string(),
+        ));
+    };
+    Ok(SeedreamCleanupRequest {
+        access_token: auth.access_token.clone(),
+        reference_value: reference.reference_value.clone(),
+        tool_name: auth.tool_name.clone(),
+        model: auth.model.clone(),
+    })
+}
+
+async fn call_global_seedream_cleanup(
+    candidate_id: &str,
+    request: &SeedreamCleanupRequest,
+) -> WorkerResult<(String, String, Value)> {
+    let response = call_tool(
+        &request.access_token,
+        json!(format!("seedream-cleanup:{candidate_id}")),
+        &request.tool_name,
+        seedream_cleanup_arguments_with_model(&request.reference_value, &request.model),
+    )
+    .await
+    .map_err(|error| Error::RustError(format!("seedream_cleanup_failed:{error}")))?;
+    let cleaned_url = extract_seedream_cleaned_image_url(&response.raw_json)
+        .ok_or_else(|| Error::RustError("seedream_cleanup_missing_output_url".to_string()))?;
+    let provider_job_id =
+        crate::providers::higgsfield_mcp::extract_provider_job_id(&response.raw_json)
+            .unwrap_or_default();
+    Ok((cleaned_url, provider_job_id, response.raw_json))
+}
+
+fn cleanup_extension(content_type: &str) -> &'static str {
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        _ => "jpg",
+    }
+}
+
+fn deterministic_global_moodboard_reference_id(candidate_id: &str) -> String {
+    deterministic_id("global_reference", &[candidate_id])
+}
+
+fn empty_string_as_null(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 fn env_var(env: &Env, key: &str, error_code: &str) -> WorkerResult<String> {
     match env.var(key) {
         Ok(value) if !value.to_string().trim().is_empty() => Ok(value.to_string()),
@@ -2013,6 +2925,56 @@ struct GlobalVisualCandidateReviewRow {
     comment_count: Option<u64>,
     image_url: String,
     review_attempt_count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobalVisualCandidateCleanupRow {
+    image_url: String,
+    image_width: Option<u32>,
+    image_height: Option<u32>,
+    discovery_moodboard_slug: String,
+    assigned_moodboard_slug: String,
+    source_handle: Option<String>,
+    review_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobalVisualCandidateReferenceRow {
+    cleaned_image_url: String,
+    image_width: Option<u32>,
+    image_height: Option<u32>,
+    discovery_moodboard_slug: String,
+    assigned_moodboard_slug: String,
+    source_handle: Option<String>,
+    review_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobalVisualCandidateFollowupRow {
+    discovery_moodboard_slug: String,
+    assigned_moodboard_slug: String,
+    source_handle: Option<String>,
+}
+
+#[derive(Debug)]
+struct SeedreamCleanupAuth {
+    access_token: String,
+    tool_name: String,
+    model: String,
+}
+
+#[derive(Debug)]
+struct SeedreamCleanupImage {
+    bytes: Vec<u8>,
+    content_type: String,
+}
+
+#[derive(Debug)]
+struct SeedreamCleanupRequest {
+    access_token: String,
+    reference_value: String,
+    tool_name: String,
+    model: String,
 }
 
 #[derive(Debug, Deserialize)]

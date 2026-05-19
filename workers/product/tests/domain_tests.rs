@@ -577,6 +577,191 @@ fn seedream_cleanup_prompt_is_exact_text_only_instruction() {
 }
 
 #[test]
+fn seedream_cleanup_prompt_is_text_only_removal() {
+    assert_eq!(
+        mirai_product_worker::seedream::cleanup_prompt(),
+        "Remove only the visible text from this image. Keep every non-text part of the image exactly the same."
+    );
+}
+
+#[test]
+fn global_cleanup_creates_reference_only_after_cleaned_candidate() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    assert!(source.contains("cleanup_status = 'cleaning'"));
+    assert!(source.contains("cleanup_status = 'cleaned'"));
+    assert!(source.contains("candidate_status = 'cleanup_failed'"));
+    assert!(source.contains("cache_cleaned_global_moodboard_reference"));
+    assert!(source.contains("INSERT OR IGNORE INTO global_moodboard_references"));
+    assert!(source.contains("review_status = 'approved'"));
+    assert!(source.contains("cleanup_status = 'cleaned'"));
+    assert!(source.contains("assigned_moodboard_slug"));
+    assert!(source.contains("source_run_id"));
+}
+
+#[test]
+fn global_cleanup_reclaims_expired_cleaning_candidates() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let load_sql = source
+        .split("fn load_global_candidate_for_cleanup_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn claim_global_candidate_for_cleanup_sql")
+                .next()
+        })
+        .expect("cleanup load sql section");
+    let claim_sql = source
+        .split("fn claim_global_candidate_for_cleanup_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn mark_global_candidate_cleanup_failed_sql")
+                .next()
+        })
+        .expect("cleanup claim sql section");
+
+    assert!(load_sql.contains("cleanup_status IN ('queued', 'failed', 'cleaning')"));
+    assert!(load_sql.contains("cleanup_status != 'cleaning' OR cleanup_next_retry_at <= ?"));
+    assert!(claim_sql.contains("cleanup_next_retry_at = ?"));
+    assert!(claim_sql.contains("cleanup_status IN ('queued', 'failed', 'cleaning')"));
+    assert!(claim_sql.contains("cleanup_status != 'cleaning' OR cleanup_next_retry_at <= ?"));
+}
+
+#[test]
+fn global_cleanup_rechecks_current_run_around_provider_side_effects() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let body =
+        reference_pipeline_function_body(source, "async fn cleanup_global_moodboard_reference");
+    let complete_body = reference_pipeline_function_body(
+        source,
+        "async fn complete_cleaned_global_moodboard_reference",
+    );
+
+    let fetch_pos = body
+        .find("fetch_global_seedream_cleanup_image(")
+        .expect("source image fetch");
+    let upload_pos = body
+        .find("upload_global_seedream_cleanup_image(")
+        .expect("higgsfield upload");
+    let seedream_pos = body
+        .find("call_global_seedream_cleanup(")
+        .expect("seedream call");
+    let cache_pos = complete_body
+        .find("cache_cleaned_global_moodboard_reference")
+        .expect("global cache helper");
+
+    assert!(body[fetch_pos..upload_pos]
+        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
+    assert!(body[upload_pos..seedream_pos]
+        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
+    assert!(body[seedream_pos..]
+        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
+    assert!(complete_body[..cache_pos]
+        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
+    assert!(complete_body[cache_pos..]
+        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
+}
+
+#[test]
+fn global_cleanup_retry_finalizes_already_cleaned_reference() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    assert!(source.contains("load_cleaned_global_candidate_for_followup_sql"));
+    assert!(source.contains("cleanup_status = 'cleaned'"));
+    assert!(source.contains("ensure_global_cleanup_followups"));
+    assert!(source.contains("global_cleanup_already_cleaned"));
+    assert!(source.contains("cross_routed_acceptance"));
+}
+
+#[test]
+fn global_cleanup_recovers_cleaned_candidate_without_reference() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let resume_sql = source
+        .split("fn load_cleaned_global_candidate_for_reference_resume_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn claim_cleaned_global_candidate_for_reference_resume_sql")
+                .next()
+        })
+        .expect("cleaned reference resume sql section");
+    let resume_claim_sql = source
+        .split("fn claim_cleaned_global_candidate_for_reference_resume_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn mark_global_candidate_cleanup_failed_sql").next())
+        .expect("cleaned reference resume claim sql section");
+
+    assert!(resume_sql.contains("cleanup_status = 'cleaned'"));
+    assert!(resume_sql.contains("cleaned_image_url"));
+    assert!(resume_sql.contains("review_json"));
+    assert!(resume_sql.contains("source_post_id"));
+    assert!(resume_sql.contains("source_post_code"));
+    assert!(resume_sql.contains("source_url"));
+    assert!(resume_sql.contains("source_published_at"));
+    assert!(resume_sql.contains("NOT EXISTS"));
+    assert!(resume_sql.contains("global_moodboard_references"));
+    assert!(!resume_sql.contains("cleanup_next_retry_at <= ?"));
+    assert!(!resume_claim_sql.contains("cleanup_attempt_count < ?"));
+    assert!(!resume_claim_sql.contains("cleanup_next_retry_at <= ?"));
+    assert!(!resume_claim_sql.contains("cleanup_attempt_count = cleanup_attempt_count + 1"));
+    assert!(source.contains("complete_cleaned_global_moodboard_reference"));
+}
+
+#[test]
+fn global_cleanup_completion_writes_are_lease_guarded() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let failed_sql = source
+        .split("fn mark_global_candidate_cleanup_failed_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn mark_global_candidate_cleanup_succeeded_sql").next())
+        .expect("cleanup failed sql section");
+    let succeeded_sql = source
+        .split("fn mark_global_candidate_cleanup_succeeded_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn insert_global_moodboard_reference_sql").next())
+        .expect("cleanup succeeded sql section");
+    let failed_where = failed_sql
+        .split("WHERE id = ?")
+        .nth(1)
+        .expect("cleanup failed where");
+    let succeeded_where = succeeded_sql
+        .split("WHERE id = ?")
+        .nth(1)
+        .expect("cleanup succeeded where");
+
+    assert!(failed_where.contains("AND cleanup_next_retry_at = ?"));
+    assert!(succeeded_where.contains("AND cleanup_next_retry_at = ?"));
+    assert!(source.contains("cleanup_claim_expires_at"));
+    assert!(source.contains("json!(cleanup_lock_expires_at)"));
+}
+
+#[test]
+fn global_reference_insert_sql_has_single_moodboard_slug_column() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let insert_sql = source
+        .split("fn insert_global_moodboard_reference_sql()")
+        .nth(1)
+        .and_then(|section| section.split("async fn upsert_global_handle").next())
+        .expect("global reference insert sql section");
+    let column_list = insert_sql
+        .split("INSERT OR IGNORE INTO global_moodboard_references (")
+        .nth(1)
+        .and_then(|section| section.split(")").next())
+        .expect("insert column list");
+
+    assert_eq!(
+        column_list
+            .lines()
+            .filter(|line| line.trim().trim_end_matches(',') == "moodboard_slug")
+            .count(),
+        1
+    );
+    assert!(column_list
+        .contains("moodboard_slug,\n      discovery_moodboard_slug,\n      source_run_id,"));
+    assert!(insert_sql
+        .contains("gvc.assigned_moodboard_slug,\n      gvc.discovery_moodboard_slug,\n      ?,"));
+}
+
+#[test]
 fn seedream_cleanup_arguments_use_lite_model_and_uploaded_reference() {
     let args = seedream_cleanup_arguments("uploaded_media_1");
 
