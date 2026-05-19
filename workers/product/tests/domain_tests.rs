@@ -466,6 +466,82 @@ fn clone_compatibility_handler_writes_terminal_rejected_and_accepted_rows() {
 }
 
 #[test]
+fn accepted_global_reference_insert_creates_clone_scoped_visual_reference_only_through_global_asset(
+) {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("INSERT OR IGNORE INTO visual_references"));
+    assert!(source.contains("clone_visual_reference_id"));
+    assert!(source.contains("gmr.status = 'active'"));
+    assert!(source.contains("cvr.status = 'accepted'"));
+    assert!(source.contains("ma.user_id = 'global'"));
+    assert!(source.contains("ma.clone_id IS NULL"));
+    assert!(source.contains("gmr.media_asset_id"));
+    assert!(source.contains("niche_cluster"));
+    assert!(source.contains("aesthetic_tags_json"));
+    assert!(source.contains("UNIQUE(clone_id, global_reference_id)"));
+}
+
+#[test]
+fn clone_reference_pool_finalization_counts_current_selected_moodboards() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("active_clone_reference_count_for_current_selection_sql"));
+    assert!(source.contains("INNER JOIN moodboards mb"));
+    assert!(source.contains("mb.selected = 1"));
+    assert!(source.contains("gmd.status = 'active'"));
+    assert!(source.contains("pool_ready"));
+    assert!(source.contains("partial_pool_ready"));
+    assert!(source.contains("insufficient_refs"));
+    assert!(source.contains("last_usable_pool_at"));
+}
+
+#[test]
+fn clone_reference_pool_finalization_treats_in_progress_compatibility_leases_as_pending() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let pending_sql = source
+        .split("fn pending_clone_compatibility_count_for_current_selection_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn finalize_clone_pool_run_sql()").next())
+        .expect("pending compatibility count sql");
+
+    assert!(pending_sql.contains("cvr.status = 'queued'"));
+    assert!(pending_sql.contains("cvr.status = 'failed'"));
+    assert!(pending_sql.contains("cvr.next_retry_at IS NOT NULL"));
+    assert!(!pending_sql.contains("cvr.next_retry_at <= ?"));
+    assert!(pending_sql.contains("ma.user_id = 'global'"));
+    assert!(pending_sql.contains("ma.clone_id IS NULL"));
+    assert!(pending_sql.contains("ma.deleted_at IS NULL"));
+    assert!(pending_sql.contains("mb.selected = 1"));
+    assert!(pending_sql.contains("gmd.status = 'active'"));
+
+    let body =
+        reference_pipeline_function_body(source, "pub async fn finalize_clone_reference_pool");
+    assert!(body.contains("pending_compatibility_count"));
+    assert!(body.contains("pending_compatibility_count > 0"));
+    assert!(body.contains("\"compatibility_reviewing\""));
+}
+
+#[test]
+fn clone_finalize_messages_are_not_permanently_deduped_by_pool_run() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let body = reference_pipeline_function_body(source, "async fn enqueue_finalize_clone_pool");
+
+    assert!(body.contains("env.queue(REFERENCE_QUEUE_NAME)?"));
+    assert!(body.contains(".send(ReferencePipelineMessage::FinalizeCloneReferencePool"));
+    assert!(!body.contains("reserve_and_send_clone_message"));
+    assert!(!body.contains("\"finalize_clone_reference_pool\""));
+}
+
+#[test]
+fn clone_inspiration_pool_remains_clone_scoped() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("INSERT OR IGNORE INTO user_inspiration_pool"));
+    assert!(source.contains("clone_inspiration_pool_id"));
+    assert!(source.contains("visual_reference_id"));
+    assert!(source.contains("WHERE vr.user_id = ?"));
+    assert!(source.contains("AND vr.clone_id = ?"));
+}
+
+#[test]
 fn clone_compatibility_unavailable_global_reference_marks_failed_before_finalize() {
     let source = include_str!("../src/services/clone_reference_pool.rs");
     let body =
@@ -697,7 +773,7 @@ fn reference_pipeline_queue_is_bound_in_worker_config() {
 }
 
 #[test]
-fn reference_pipeline_queue_handler_owns_global_messages_only_in_part_two() {
+fn reference_pipeline_queue_handler_routes_global_and_clone_pool_messages() {
     let source = include_str!("../src/queues/reference_pipeline.rs");
     for message in [
         "EnsureGlobalMoodboardLibrary",
@@ -711,7 +787,10 @@ fn reference_pipeline_queue_handler_owns_global_messages_only_in_part_two() {
     ] {
         assert!(source.contains(message), "{message}");
     }
-    assert!(source.contains("clone_pool_messages_are_enabled_in_part_three"));
+    assert!(source.contains("build_or_refresh_clone_pool"));
+    assert!(source.contains("validate_clone_compatibility"));
+    assert!(source.contains("finalize_clone_reference_pool"));
+    assert!(!source.contains("clone_pool_messages_are_enabled_in_part_three"));
 }
 
 #[test]

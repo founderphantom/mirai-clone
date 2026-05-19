@@ -1,7 +1,8 @@
 use crate::db;
 use crate::domain::clone_reference_pool::{
-    clone_pool_run_is_reusable, compatibility_action_for, select_balanced_compatibility_wave,
-    CompatibilityAction, GlobalReferenceForClonePool,
+    clone_inspiration_pool_id, clone_pool_run_is_reusable, clone_visual_reference_id,
+    compatibility_action_for, select_balanced_compatibility_wave, CompatibilityAction,
+    GlobalReferenceForClonePool,
 };
 use crate::domain::moodboards::selected_moodboard_hash;
 use crate::queues::messages::ReferencePipelineMessage;
@@ -56,6 +57,11 @@ struct GlobalReferenceActionableRow {
 #[derive(Debug, Deserialize)]
 struct CountRow {
     count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct VisualReferenceIdRow {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,6 +361,16 @@ fn insert_or_claim_clone_compatibility_sql() -> &'static str {
     "#
 }
 
+fn insert_queued_clone_compatibility_sql() -> &'static str {
+    r#"
+    INSERT OR IGNORE INTO clone_visual_reference_compatibility (
+      id, clone_id, global_reference_id, status, attempt_count,
+      created_at, updated_at
+    )
+    VALUES (?, ?, ?, 'queued', 0, ?, ?)
+    "#
+}
+
 fn increment_clone_compatibility_attempt_sql() -> &'static str {
     r#"
     UPDATE clone_visual_reference_compatibility
@@ -477,6 +493,223 @@ fn mark_clone_compatibility_failed_sql() -> &'static str {
           AND cpr.id = ?
           AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
       )
+    "#
+}
+
+// visual_references has UNIQUE(clone_id, global_reference_id).
+fn insert_clone_visual_reference_sql() -> &'static str {
+    r#"
+    INSERT OR IGNORE INTO visual_references (
+      id, user_id, clone_id, global_reference_id, media_asset_id,
+      source_platform, source_image_key, source_handle, source_post_id,
+      source_post_code, source_url, source_published_at, image_width,
+      image_height, moodboard_id, moodboard_slug, niche_cluster,
+      human_presence_type, human_presence_score, organic_photo_score,
+      freshness_visual_score, visual_fit_score, pose, scene, lighting,
+      framing, camera_feel, styling_direction, aesthetic_tags_json,
+      source_caption_removed, status, created_at, updated_at
+    )
+    SELECT
+      ?, ?, ?, gmr.id, gmr.media_asset_id,
+      gmr.source_platform, gmr.source_image_key, gmr.source_handle,
+      gmr.source_post_id, gmr.source_post_code, gmr.source_url,
+      gmr.source_published_at, gmr.image_width, gmr.image_height,
+      mb.id, gmr.moodboard_slug, gmr.moodboard_slug,
+      'person', 1, 1, 1, gmr.moodboard_fit_score,
+      gmr.pose, gmr.scene, gmr.lighting, gmr.framing, gmr.camera_feel,
+      gmr.styling_direction,
+      json_array(
+        gmr.pose,
+        gmr.scene,
+        gmr.lighting,
+        gmr.framing,
+        gmr.camera_feel,
+        gmr.styling_direction
+      ),
+      1, 'active', ?, ?
+    FROM global_moodboard_references gmr
+    INNER JOIN media_assets ma
+      ON ma.id = gmr.media_asset_id
+     AND ma.user_id = 'global'
+     AND ma.clone_id IS NULL
+     AND ma.deleted_at IS NULL
+    INNER JOIN clone_visual_reference_compatibility cvr
+      ON cvr.clone_id = ?
+     AND cvr.global_reference_id = gmr.id
+     AND cvr.status = 'accepted'
+    INNER JOIN moodboards mb
+      ON mb.user_id = ?
+     AND mb.slug = gmr.moodboard_slug
+     AND mb.selected = 1
+    INNER JOIN global_moodboard_definitions gmd
+      ON gmd.slug = mb.slug
+     AND gmd.status = 'active'
+    LEFT JOIN visual_references vr
+      ON vr.clone_id = ?
+     AND vr.global_reference_id = gmr.id
+    WHERE gmr.id = ?
+      AND gmr.status = 'active'
+      AND vr.id IS NULL
+    "#
+}
+
+fn active_clone_visual_reference_for_accepted_global_reference_sql() -> &'static str {
+    r#"
+    SELECT vr.id
+    FROM visual_references vr
+    INNER JOIN global_moodboard_references gmr
+      ON gmr.id = vr.global_reference_id
+     AND gmr.status = 'active'
+     AND gmr.media_asset_id = vr.media_asset_id
+    INNER JOIN media_assets ma
+      ON ma.id = gmr.media_asset_id
+     AND ma.user_id = 'global'
+     AND ma.clone_id IS NULL
+     AND ma.deleted_at IS NULL
+    INNER JOIN clone_visual_reference_compatibility cvr
+      ON cvr.clone_id = vr.clone_id
+     AND cvr.global_reference_id = gmr.id
+     AND cvr.status = 'accepted'
+    INNER JOIN moodboards mb
+      ON mb.user_id = vr.user_id
+     AND mb.slug = vr.moodboard_slug
+     AND mb.slug = gmr.moodboard_slug
+     AND mb.selected = 1
+    INNER JOIN global_moodboard_definitions gmd
+      ON gmd.slug = mb.slug
+     AND gmd.status = 'active'
+    WHERE vr.user_id = ?
+      AND vr.clone_id = ?
+      AND vr.global_reference_id = ?
+      AND vr.status = 'active'
+    LIMIT 1
+    "#
+}
+
+fn insert_clone_inspiration_pool_sql() -> &'static str {
+    r#"
+    INSERT OR IGNORE INTO user_inspiration_pool (
+      id, user_id, clone_id, moodboard_id, visual_reference_id,
+      discovery_item_id, score, created_at
+    )
+    SELECT ?, vr.user_id, vr.clone_id, vr.moodboard_id, vr.id, NULL, 1, ?
+    FROM visual_references vr
+    WHERE vr.user_id = ?
+      AND vr.clone_id = ?
+      AND vr.id = ?
+      AND vr.status = 'active'
+    "#
+}
+
+fn active_clone_reference_count_for_current_selection_sql() -> &'static str {
+    r#"
+    SELECT COUNT(*) AS count
+    FROM visual_references vr
+    INNER JOIN moodboards mb
+      ON mb.user_id = vr.user_id
+     AND mb.slug = vr.moodboard_slug
+     AND mb.selected = 1
+    INNER JOIN global_moodboard_definitions gmd
+      ON gmd.slug = mb.slug
+     AND gmd.status = 'active'
+    INNER JOIN global_moodboard_references gmr
+      ON gmr.id = vr.global_reference_id
+     AND gmr.status = 'active'
+     AND gmr.media_asset_id = vr.media_asset_id
+     AND gmr.moodboard_slug = vr.moodboard_slug
+    INNER JOIN media_assets ma
+      ON ma.id = gmr.media_asset_id
+     AND ma.user_id = 'global'
+     AND ma.clone_id IS NULL
+     AND ma.deleted_at IS NULL
+    INNER JOIN clone_visual_reference_compatibility cvr
+      ON cvr.clone_id = vr.clone_id
+     AND cvr.global_reference_id = vr.global_reference_id
+     AND cvr.status = 'accepted'
+    WHERE vr.user_id = ?
+      AND vr.clone_id = ?
+      AND vr.status = 'active'
+    "#
+}
+
+fn pending_clone_compatibility_count_for_current_selection_sql() -> &'static str {
+    r#"
+    SELECT COUNT(*) AS count
+    FROM clone_visual_reference_compatibility cvr
+    INNER JOIN global_moodboard_references gmr
+      ON gmr.id = cvr.global_reference_id
+     AND gmr.status = 'active'
+    INNER JOIN media_assets ma
+      ON ma.id = gmr.media_asset_id
+     AND ma.user_id = 'global'
+     AND ma.clone_id IS NULL
+     AND ma.deleted_at IS NULL
+    INNER JOIN moodboards mb
+      ON mb.user_id = ?
+     AND mb.slug = gmr.moodboard_slug
+     AND mb.selected = 1
+    INNER JOIN global_moodboard_definitions gmd
+      ON gmd.slug = mb.slug
+     AND gmd.status = 'active'
+    WHERE cvr.clone_id = ?
+      AND (
+        cvr.status = 'queued'
+        OR (
+          cvr.status = 'failed'
+          AND cvr.next_retry_at IS NOT NULL
+        )
+      )
+    "#
+}
+
+fn finalize_clone_pool_run_sql() -> &'static str {
+    r#"
+    UPDATE clone_pool_runs
+    SET status = ?,
+        reason = ?,
+        updated_at = ?,
+        completed_at = CASE
+          WHEN ? IN ('pool_ready', 'partial_pool_ready', 'insufficient_refs') THEN ?
+          ELSE completed_at
+        END
+    WHERE id = ?
+      AND user_id = ?
+      AND clone_id = ?
+      AND status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        WHERE crs.user_id = clone_pool_runs.user_id
+          AND crs.clone_id = clone_pool_runs.clone_id
+          AND crs.current_pool_run_id = clone_pool_runs.id
+      )
+    "#
+}
+
+fn finalize_clone_reference_state_sql() -> &'static str {
+    r#"
+    UPDATE clone_reference_state
+    SET status = ?,
+        last_usable_pool_at = CASE
+          WHEN ? IN ('pool_ready', 'partial_pool_ready') THEN ?
+          ELSE last_usable_pool_at
+        END,
+        last_ready_at = CASE
+          WHEN ? = 'pool_ready' THEN ?
+          ELSE last_ready_at
+        END,
+        last_partial_ready_at = CASE
+          WHEN ? = 'partial_pool_ready' THEN ?
+          ELSE last_partial_ready_at
+        END,
+        last_insufficient_at = CASE
+          WHEN ? = 'insufficient_refs' THEN ?
+          ELSE last_insufficient_at
+        END,
+        updated_at = ?
+    WHERE user_id = ?
+      AND clone_id = ?
+      AND current_pool_run_id = ?
     "#
 }
 
@@ -846,6 +1079,15 @@ pub async fn validate_clone_compatibility(
                     )
                     .await?
                     {
+                        let _ = insert_clone_visual_reference_for_accepted_global_reference(
+                            db,
+                            user_id,
+                            clone_id,
+                            pool_run_id,
+                            global_reference_id,
+                            &write_now,
+                        )
+                        .await?;
                         insert_compatibility_attempt_audit(
                             db,
                             pool_run_id,
@@ -927,6 +1169,168 @@ pub async fn validate_clone_compatibility(
         pool_run_id,
         "compatibility_result",
         &write_now,
+    )
+    .await
+}
+
+pub async fn insert_clone_visual_reference_for_accepted_global_reference(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+    global_reference_id: &str,
+    now: &str,
+) -> WorkerResult<Option<String>> {
+    if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+        return Ok(None);
+    }
+
+    let deterministic_visual_reference_id =
+        clone_visual_reference_id(clone_id, global_reference_id);
+    db::run(
+        db,
+        insert_clone_visual_reference_sql(),
+        vec![
+            json!(deterministic_visual_reference_id),
+            json!(user_id),
+            json!(clone_id),
+            json!(now),
+            json!(now),
+            json!(clone_id),
+            json!(user_id),
+            json!(clone_id),
+            json!(global_reference_id),
+        ],
+    )
+    .await?;
+
+    let Some(visual_reference) = db::first::<VisualReferenceIdRow>(
+        db,
+        active_clone_visual_reference_for_accepted_global_reference_sql(),
+        vec![json!(user_id), json!(clone_id), json!(global_reference_id)],
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let pool_id = clone_inspiration_pool_id(clone_id, &visual_reference.id);
+    db::run(
+        db,
+        insert_clone_inspiration_pool_sql(),
+        vec![
+            json!(pool_id),
+            json!(now),
+            json!(user_id),
+            json!(clone_id),
+            json!(visual_reference.id.clone()),
+        ],
+    )
+    .await?;
+
+    Ok(Some(visual_reference.id))
+}
+
+pub async fn finalize_clone_reference_pool(
+    db: &D1Database,
+    _env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+    reason: &str,
+) -> WorkerResult<()> {
+    let now = now_iso_string();
+    let config = load_pool_config(db).await?;
+    let selected = db::all::<SelectedMoodboardRow>(
+        db,
+        load_current_selected_moodboard_snapshot_sql(),
+        vec![json!(user_id)],
+    )
+    .await?;
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    let selected_slugs = selected
+        .iter()
+        .map(|row| row.slug.clone())
+        .collect::<Vec<_>>();
+    let selected_hash = selected_moodboard_hash(&selected_slugs);
+    let Some(run) = db::first::<PoolRunRow>(
+        db,
+        load_current_pool_run_sql(),
+        vec![json!(user_id), json!(clone_id)],
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    if run.id != pool_run_id {
+        return Ok(());
+    }
+
+    if !clone_pool_run_is_reusable(
+        &run.status,
+        run.selected_moodboard_hash == selected_hash,
+        run.updated_at.as_deref(),
+        &now,
+        config.clone_pool_run_stale_after_minutes,
+    ) {
+        return Ok(());
+    }
+
+    let active_selected_count =
+        active_clone_reference_count_for_current_selection(db, user_id, clone_id).await?;
+    let pending_compatibility_count =
+        pending_clone_compatibility_count_for_current_selection(db, user_id, clone_id).await?;
+
+    let final_status = if active_selected_count >= config.batch_size {
+        "pool_ready"
+    } else if pending_compatibility_count > 0 {
+        "compatibility_reviewing"
+    } else if active_selected_count > 0 {
+        "partial_pool_ready"
+    } else {
+        "insufficient_refs"
+    };
+
+    let result = db::run(
+        db,
+        finalize_clone_pool_run_sql(),
+        vec![
+            json!(final_status),
+            json!(reason),
+            json!(now),
+            json!(final_status),
+            json!(now),
+            json!(pool_run_id),
+            json!(user_id),
+            json!(clone_id),
+        ],
+    )
+    .await?;
+    if changed_rows(&result)? == 0 {
+        return Ok(());
+    }
+
+    db::exec(
+        db,
+        finalize_clone_reference_state_sql(),
+        vec![
+            json!(final_status),
+            json!(final_status),
+            json!(now),
+            json!(final_status),
+            json!(now),
+            json!(final_status),
+            json!(now),
+            json!(final_status),
+            json!(now),
+            json!(now),
+            json!(user_id),
+            json!(clone_id),
+            json!(pool_run_id),
+        ],
     )
     .await
 }
@@ -1092,6 +1496,18 @@ async fn schedule_compatibility_wave(
     );
 
     for reference in selected {
+        db::exec(
+            db,
+            insert_queued_clone_compatibility_sql(),
+            vec![
+                json!(format!("clone_compatibility_{}", Uuid::new_v4().simple())),
+                json!(clone_id),
+                json!(reference.id.clone()),
+                json!(now),
+                json!(now),
+            ],
+        )
+        .await?;
         reserve_and_send_clone_message(
             db,
             env,
@@ -1122,13 +1538,33 @@ async fn schedule_compatibility_wave(
 }
 
 async fn repair_already_accepted_references(
-    _db: &D1Database,
-    _user_id: &str,
-    _clone_id: &str,
-    _pool_run_id: &str,
-    _rows: &[GlobalReferenceActionableRow],
-    _now: &str,
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+    rows: &[GlobalReferenceActionableRow],
+    now: &str,
 ) -> WorkerResult<()> {
+    for row in rows {
+        if compatibility_action_for(
+            row.compatibility_status.as_deref(),
+            row.next_retry_at.as_deref(),
+            row.visual_reference_id.is_some(),
+            now,
+        ) == CompatibilityAction::RepairMissingVisualReference
+        {
+            let _ = insert_clone_visual_reference_for_accepted_global_reference(
+                db,
+                user_id,
+                clone_id,
+                pool_run_id,
+                &row.id,
+                now,
+            )
+            .await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1548,6 +1984,34 @@ async fn active_global_reference_count(db: &D1Database, moodboard_slug: &str) ->
     Ok(row.map(|row| row.count).unwrap_or(0))
 }
 
+async fn active_clone_reference_count_for_current_selection(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+) -> WorkerResult<u32> {
+    let row = db::first::<CountRow>(
+        db,
+        active_clone_reference_count_for_current_selection_sql(),
+        vec![json!(user_id), json!(clone_id)],
+    )
+    .await?;
+    Ok(row.map(|row| row.count).unwrap_or(0))
+}
+
+async fn pending_clone_compatibility_count_for_current_selection(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+) -> WorkerResult<u32> {
+    let row = db::first::<CountRow>(
+        db,
+        pending_clone_compatibility_count_for_current_selection_sql(),
+        vec![json!(user_id), json!(clone_id)],
+    )
+    .await?;
+    Ok(row.map(|row| row.count).unwrap_or(0))
+}
+
 async fn mark_pool_waiting_for_global_library(
     db: &D1Database,
     user_id: &str,
@@ -1679,29 +2143,22 @@ fn compact_error_detail(error: &str) -> String {
 }
 
 async fn enqueue_finalize_clone_pool(
-    db: &D1Database,
+    _db: &D1Database,
     env: &Env,
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
     reason: &str,
-    now: &str,
+    _now: &str,
 ) -> WorkerResult<()> {
-    reserve_and_send_clone_message(
-        db,
-        env,
-        "finalize_clone_reference_pool",
-        pool_run_id,
-        Some(pool_run_id),
-        ReferencePipelineMessage::FinalizeCloneReferencePool {
+    env.queue(REFERENCE_QUEUE_NAME)?
+        .send(ReferencePipelineMessage::FinalizeCloneReferencePool {
             user_id: user_id.to_string(),
             clone_id: clone_id.to_string(),
             pool_run_id: pool_run_id.to_string(),
             reason: reason.to_string(),
-        },
-        now,
-    )
-    .await
+        })
+        .await
 }
 
 fn changed_rows(result: &worker::D1Result) -> WorkerResult<usize> {

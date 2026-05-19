@@ -202,9 +202,21 @@ async fn handle_message(
             )
             .await
         }
-        ReferencePipelineMessage::FinalizeCloneReferencePool { .. } => {
-            clone_pool_messages_are_enabled_in_part_three();
-            Ok(())
+        ReferencePipelineMessage::FinalizeCloneReferencePool {
+            user_id,
+            clone_id,
+            pool_run_id,
+            reason,
+        } => {
+            crate::services::clone_reference_pool::finalize_clone_reference_pool(
+                db,
+                env,
+                &user_id,
+                &clone_id,
+                &pool_run_id,
+                &reason,
+            )
+            .await
         }
     }
 }
@@ -1266,8 +1278,6 @@ async fn finalize_global_moodboard_library(
     )
     .await
 }
-
-fn clone_pool_messages_are_enabled_in_part_three() {}
 
 async fn sync_default_global_moodboard_definitions(db: &D1Database) -> WorkerResult<()> {
     let now = now_iso_string();
