@@ -6,6 +6,7 @@ use crate::domain::clone_reference_pool::{
 };
 use crate::domain::moodboards::selected_moodboard_hash;
 use crate::queues::messages::ReferencePipelineMessage;
+use crate::services::queue_reservations::{QueueReservation, ReservationOutcome, ReservationTtl};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Deserialize;
 use serde_json::json;
@@ -44,6 +45,11 @@ struct PoolRunRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct PoolRunGuardRow {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GlobalReferenceActionableRow {
     id: String,
     moodboard_slug: String,
@@ -57,6 +63,15 @@ struct GlobalReferenceActionableRow {
 #[derive(Debug, Deserialize)]
 struct CountRow {
     count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurrentGlobalTopupRow {
+    current_run_id: Option<String>,
+    state_status: String,
+    next_retry_at: Option<String>,
+    run_status: Option<String>,
+    run_updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +112,13 @@ struct PoolConfig {
     clone_pool_compatibility_wave_size: usize,
 }
 
+#[derive(Debug, Default)]
+struct GlobalTopupSummary {
+    active_or_started_run_slugs: Vec<String>,
+    blocked_or_exhausted_slugs: Vec<String>,
+    underfilled_slug_count: usize,
+}
+
 fn load_clone_for_pool_sql() -> &'static str {
     r#"
     SELECT id, user_id, soul_status, provider_soul_id
@@ -135,6 +157,136 @@ fn load_current_pool_run_sql() -> &'static str {
     WHERE crs.user_id = ?
       AND crs.clone_id = ?
     LIMIT 1
+    "#
+}
+
+fn passive_insufficient_wakeup_pool_run_sql() -> &'static str {
+    r#"
+    SELECT cpr.id, cpr.status, cpr.selected_moodboard_hash, cpr.updated_at
+    FROM clone_reference_state crs
+    INNER JOIN clone_pool_runs cpr
+      ON cpr.id = crs.current_pool_run_id
+     AND cpr.clone_id = crs.clone_id
+    INNER JOIN clone_pool_waiting_moodboards cpwm
+      ON cpwm.user_id = crs.user_id
+     AND cpwm.clone_id = crs.clone_id
+     AND cpwm.pool_run_id = cpr.id
+    WHERE crs.user_id = ?
+      AND crs.clone_id = ?
+      AND crs.current_pool_run_id = cpr.id
+      AND crs.status = 'insufficient_refs'
+      AND crs.selected_moodboard_hash = ?
+      AND cpr.selected_moodboard_hash = ?
+      AND cpr.status = 'insufficient_refs'
+      AND cpwm.moodboard_slug = ?
+      AND cpwm.status IN ('insufficient', 'resumed')
+    LIMIT 1
+    "#
+}
+
+fn revive_passive_insufficient_pool_run_for_wakeup_sql() -> &'static str {
+    r#"
+    UPDATE clone_pool_runs AS cpr
+    SET status = 'queued',
+        updated_at = ?
+    WHERE cpr.id = ?
+      AND cpr.user_id = ?
+      AND cpr.clone_id = ?
+      AND cpr.status = 'insufficient_refs'
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_waiting_moodboards cpwm
+          ON cpwm.user_id = crs.user_id
+         AND cpwm.clone_id = crs.clone_id
+         AND cpwm.pool_run_id = cpr.id
+        WHERE crs.user_id = ?
+          AND crs.clone_id = ?
+          AND crs.current_pool_run_id = cpr.id
+          AND crs.status = 'insufficient_refs'
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+          AND cpwm.moodboard_slug = ?
+          AND cpwm.status IN ('insufficient', 'resumed')
+        LIMIT 1
+      )
+    "#
+}
+
+fn clear_revived_passive_insufficient_pool_run_for_wakeup_sql() -> &'static str {
+    r#"
+    UPDATE clone_pool_runs AS cpr
+    SET waiting_moodboard_slugs_json = '[]',
+        completed_at = NULL,
+        updated_at = ?
+    WHERE cpr.id = ?
+      AND cpr.user_id = ?
+      AND cpr.clone_id = ?
+      AND cpr.status = 'queued'
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        WHERE crs.user_id = ?
+          AND crs.clone_id = ?
+          AND crs.current_pool_run_id = cpr.id
+          AND crs.status = 'queued'
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+        LIMIT 1
+      )
+    "#
+}
+
+fn revert_passive_insufficient_pool_run_for_wakeup_sql() -> &'static str {
+    r#"
+    UPDATE clone_pool_runs AS cpr
+    SET status = 'insufficient_refs',
+        updated_at = ?
+    WHERE cpr.id = ?
+      AND cpr.user_id = ?
+      AND cpr.clone_id = ?
+      AND cpr.status = 'queued'
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        WHERE crs.user_id = ?
+          AND crs.clone_id = ?
+          AND crs.current_pool_run_id = cpr.id
+          AND crs.status = 'insufficient_refs'
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+        LIMIT 1
+      )
+    "#
+}
+
+fn revive_passive_insufficient_clone_reference_state_for_wakeup_sql() -> &'static str {
+    r#"
+    UPDATE clone_reference_state
+    SET status = 'queued',
+        waiting_moodboard_slugs_json = '[]',
+        updated_at = ?
+    WHERE user_id = ?
+      AND clone_id = ?
+      AND current_pool_run_id = ?
+      AND status = 'insufficient_refs'
+      AND EXISTS (
+        SELECT 1
+        FROM clone_pool_runs cpr
+        INNER JOIN clone_pool_waiting_moodboards cpwm
+          ON cpwm.user_id = clone_reference_state.user_id
+         AND cpwm.clone_id = clone_reference_state.clone_id
+         AND cpwm.pool_run_id = cpr.id
+        WHERE cpr.id = clone_reference_state.current_pool_run_id
+          AND cpr.user_id = clone_reference_state.user_id
+          AND cpr.clone_id = clone_reference_state.clone_id
+          AND cpr.status = 'queued'
+          AND clone_reference_state.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+          AND cpwm.moodboard_slug = ?
+          AND cpwm.status IN ('insufficient', 'resumed')
+        LIMIT 1
+      )
     "#
 }
 
@@ -290,18 +442,6 @@ fn mark_reserved_reference_pipeline_message_failed_sql() -> &'static str {
     "#
 }
 
-fn update_pool_status_sql() -> &'static str {
-    r#"
-    UPDATE clone_pool_runs
-    SET status = ?,
-        waiting_moodboard_slugs_json = ?,
-        updated_at = ?
-    WHERE id = ?
-      AND user_id = ?
-      AND clone_id = ?
-    "#
-}
-
 fn update_clone_reference_state_status_sql() -> &'static str {
     r#"
     UPDATE clone_reference_state
@@ -311,6 +451,35 @@ fn update_clone_reference_state_status_sql() -> &'static str {
     WHERE user_id = ?
       AND clone_id = ?
       AND current_pool_run_id = ?
+      AND status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND EXISTS (
+        SELECT 1
+        FROM clone_pool_runs cpr
+        WHERE cpr.id = clone_reference_state.current_pool_run_id
+          AND cpr.user_id = clone_reference_state.user_id
+          AND cpr.clone_id = clone_reference_state.clone_id
+          AND cpr.status = ?
+          AND cpr.selected_moodboard_hash = clone_reference_state.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+        LIMIT 1
+      )
+    "#
+}
+
+fn insert_clone_pool_waiting_moodboard_sql() -> &'static str {
+    r#"
+    INSERT INTO clone_pool_waiting_moodboards (
+      id, user_id, clone_id, pool_run_id, moodboard_slug,
+      status, created_at, resolved_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+    ON CONFLICT(pool_run_id, moodboard_slug) DO UPDATE SET
+      status = excluded.status,
+      resolved_at = NULL
+    WHERE clone_pool_waiting_moodboards.status IN ('waiting', 'insufficient', 'resumed')
+    -- status = 'waiting'
+    -- status = 'insufficient'
+    -- UNIQUE(pool_run_id, moodboard_slug)
     "#
 }
 
@@ -324,6 +493,25 @@ fn mark_unclaimed_clone_pool_run_superseded_sql() -> &'static str {
     "#
 }
 
+fn current_clone_pool_run_guard_sql() -> &'static str {
+    r#"
+    SELECT cpr.id
+    FROM clone_reference_state crs
+    INNER JOIN clone_pool_runs cpr
+      ON cpr.id = crs.current_pool_run_id
+     AND cpr.clone_id = crs.clone_id
+    WHERE crs.user_id = ?
+      AND crs.clone_id = ?
+      AND crs.current_pool_run_id = ?
+      AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+      AND cpr.selected_moodboard_hash = ?
+      AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND cpr.updated_at > ?
+    LIMIT 1
+    "#
+}
+
 fn current_pool_run_allows_side_effects_sql() -> &'static str {
     r#"
     SELECT 1 AS count
@@ -334,9 +522,24 @@ fn current_pool_run_allows_side_effects_sql() -> &'static str {
     WHERE crs.user_id = ?
       AND crs.clone_id = ?
       AND crs.current_pool_run_id = ?
-      AND cpr.id = ?
+      AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+      AND cpr.selected_moodboard_hash = ?
       AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND cpr.updated_at > ?
     LIMIT 1
+    "#
+}
+
+fn record_stale_clone_compatibility_attempt_sql() -> &'static str {
+    r#"
+    INSERT INTO clone_reference_compatibility_attempts (
+      id, pool_run_id, clone_id, global_reference_id, status,
+      error_code, error_message, created_at
+    )
+    VALUES (?, ?, ?, ?, 'stale_ignored',
+      'stale_pool_run', 'stale clone pool message acknowledged without visible writes', ?)
+    -- status = 'stale_ignored'
     "#
 }
 
@@ -383,13 +586,49 @@ fn insert_or_claim_clone_compatibility_sql() -> &'static str {
       id, clone_id, global_reference_id, status, attempt_count,
       last_attempted_at, created_at, updated_at
     )
-    VALUES (?, ?, ?, 'queued', 0, NULL, ?, ?)
+    SELECT ?, ?, ?, 'queued', 0, NULL, ?, ?
+    WHERE EXISTS (
+      SELECT 1
+      FROM clone_reference_state crs
+      INNER JOIN clone_pool_runs cpr
+        ON cpr.id = crs.current_pool_run_id
+       AND cpr.clone_id = crs.clone_id
+      WHERE crs.user_id = ?
+        AND crs.clone_id = ?
+        AND crs.current_pool_run_id = ?
+        AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+        AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+        AND cpr.selected_moodboard_hash = ?
+        AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+        AND cpr.updated_at > ?
+      LIMIT 1
+    )
     ON CONFLICT(clone_id, global_reference_id) DO UPDATE SET
       updated_at = excluded.updated_at
-    WHERE clone_visual_reference_compatibility.status = 'queued'
-       OR clone_visual_reference_compatibility.status = 'failed'
-         AND clone_visual_reference_compatibility.attempt_count < ?
-         AND clone_visual_reference_compatibility.next_retry_at <= ?
+    WHERE (
+        clone_visual_reference_compatibility.status = 'queued'
+        OR (
+          clone_visual_reference_compatibility.status = 'failed'
+          AND clone_visual_reference_compatibility.attempt_count < ?
+          AND clone_visual_reference_compatibility.next_retry_at <= ?
+        )
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_runs cpr
+          ON cpr.id = crs.current_pool_run_id
+         AND cpr.clone_id = crs.clone_id
+        WHERE crs.user_id = ?
+          AND crs.clone_id = ?
+          AND crs.current_pool_run_id = ?
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+          AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND cpr.updated_at > ?
+        LIMIT 1
+      )
     "#
 }
 
@@ -399,7 +638,23 @@ fn insert_queued_clone_compatibility_sql() -> &'static str {
       id, clone_id, global_reference_id, status, attempt_count,
       created_at, updated_at
     )
-    VALUES (?, ?, ?, 'queued', 0, ?, ?)
+    SELECT ?, ?, ?, 'queued', 0, ?, ?
+    WHERE EXISTS (
+      SELECT 1
+      FROM clone_reference_state crs
+      INNER JOIN clone_pool_runs cpr
+        ON cpr.id = crs.current_pool_run_id
+       AND cpr.clone_id = crs.clone_id
+      WHERE crs.user_id = ?
+        AND crs.clone_id = ?
+        AND crs.current_pool_run_id = ?
+        AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+        AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+        AND cpr.selected_moodboard_hash = ?
+        AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+        AND cpr.updated_at > ?
+      LIMIT 1
+    )
     "#
 }
 
@@ -418,6 +673,22 @@ fn increment_clone_compatibility_attempt_sql() -> &'static str {
         status = 'queued'
         OR status = 'failed'
           AND next_retry_at <= ?
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_runs cpr
+          ON cpr.id = crs.current_pool_run_id
+         AND cpr.clone_id = crs.clone_id
+        WHERE crs.user_id = ?
+          AND crs.clone_id = ?
+          AND crs.current_pool_run_id = ?
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+          AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND cpr.updated_at > ?
+        LIMIT 1
       )
     "#
 }
@@ -461,8 +732,11 @@ fn mark_clone_compatibility_accepted_sql() -> &'static str {
         WHERE crs.user_id = ?
           AND crs.clone_id = clone_visual_reference_compatibility.clone_id
           AND crs.current_pool_run_id = ?
-          AND cpr.id = ?
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
           AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND cpr.updated_at > ?
       )
     "#
 }
@@ -494,8 +768,11 @@ fn mark_clone_compatibility_rejected_sql() -> &'static str {
         WHERE crs.user_id = ?
           AND crs.clone_id = clone_visual_reference_compatibility.clone_id
           AND crs.current_pool_run_id = ?
-          AND cpr.id = ?
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
           AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND cpr.updated_at > ?
       )
     "#
 }
@@ -522,8 +799,11 @@ fn mark_clone_compatibility_failed_sql() -> &'static str {
         WHERE crs.user_id = ?
           AND crs.clone_id = clone_visual_reference_compatibility.clone_id
           AND crs.current_pool_run_id = ?
-          AND cpr.id = ?
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
           AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND cpr.updated_at > ?
       )
     "#
 }
@@ -578,6 +858,22 @@ fn insert_clone_visual_reference_sql() -> &'static str {
      AND gmd.status = 'active'
     WHERE gmr.id = ?
       AND gmr.status = 'active'
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_runs cpr
+          ON cpr.id = crs.current_pool_run_id
+         AND cpr.clone_id = crs.clone_id
+        WHERE crs.user_id = ?
+          AND crs.clone_id = ?
+          AND crs.current_pool_run_id = ?
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+          AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND cpr.updated_at > ?
+        LIMIT 1
+      )
     ON CONFLICT(clone_id, global_reference_id) DO UPDATE SET
       user_id = excluded.user_id,
       media_asset_id = excluded.media_asset_id,
@@ -656,6 +952,22 @@ fn insert_clone_inspiration_pool_sql() -> &'static str {
       AND vr.clone_id = ?
       AND vr.id = ?
       AND vr.status = 'active'
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_runs cpr
+          ON cpr.id = crs.current_pool_run_id
+         AND cpr.clone_id = crs.clone_id
+        WHERE crs.user_id = ?
+          AND crs.clone_id = ?
+          AND crs.current_pool_run_id = ?
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+          AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND cpr.updated_at > ?
+        LIMIT 1
+      )
     "#
 }
 
@@ -715,6 +1027,7 @@ fn pending_clone_compatibility_count_for_current_selection_sql() -> &'static str
         OR (
           cvr.status = 'failed'
           AND cvr.next_retry_at IS NOT NULL
+          AND cvr.next_retry_at <= ?
         )
       )
     "#
@@ -725,6 +1038,7 @@ fn finalize_clone_pool_run_sql() -> &'static str {
     UPDATE clone_pool_runs
     SET status = ?,
         reason = ?,
+        waiting_moodboard_slugs_json = ?,
         updated_at = ?,
         completed_at = CASE
           WHEN ? IN ('pool_ready', 'partial_pool_ready', 'insufficient_refs') THEN ?
@@ -740,6 +1054,9 @@ fn finalize_clone_pool_run_sql() -> &'static str {
         WHERE crs.user_id = clone_pool_runs.user_id
           AND crs.clone_id = clone_pool_runs.clone_id
           AND crs.current_pool_run_id = clone_pool_runs.id
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = clone_pool_runs.selected_moodboard_hash
+          AND clone_pool_runs.selected_moodboard_hash = ?
       )
     "#
 }
@@ -748,6 +1065,10 @@ fn finalize_clone_reference_state_sql() -> &'static str {
     r#"
     UPDATE clone_reference_state
     SET status = ?,
+        waiting_moodboard_slugs_json = CASE
+          WHEN ? = 'insufficient_refs' THEN ?
+          ELSE '[]'
+        END,
         last_usable_pool_at = CASE
           WHEN ? IN ('pool_ready', 'partial_pool_ready') THEN ?
           ELSE last_usable_pool_at
@@ -768,6 +1089,42 @@ fn finalize_clone_reference_state_sql() -> &'static str {
     WHERE user_id = ?
       AND clone_id = ?
       AND current_pool_run_id = ?
+      AND status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND EXISTS (
+        SELECT 1
+        FROM clone_pool_runs cpr
+        WHERE cpr.id = clone_reference_state.current_pool_run_id
+          AND cpr.user_id = clone_reference_state.user_id
+          AND cpr.clone_id = clone_reference_state.clone_id
+          AND cpr.status = ?
+          AND cpr.selected_moodboard_hash = clone_reference_state.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+        LIMIT 1
+      )
+    "#
+}
+
+fn update_clone_pool_run_status_if_current_sql() -> &'static str {
+    r#"
+    UPDATE clone_pool_runs
+    SET status = ?,
+        waiting_moodboard_slugs_json = ?,
+        updated_at = ?,
+        completed_at = CASE WHEN ? IN ('pool_ready', 'partial_pool_ready', 'insufficient_refs', 'pool_failed') THEN ? ELSE completed_at END
+    WHERE id = ?
+      AND user_id = ?
+      AND clone_id = ?
+      AND status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND clone_pool_runs.selected_moodboard_hash = ?
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        WHERE crs.user_id = clone_pool_runs.user_id
+          AND crs.clone_id = clone_pool_runs.clone_id
+          AND crs.current_pool_run_id = clone_pool_runs.id
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = clone_pool_runs.selected_moodboard_hash
+      )
     "#
 }
 
@@ -781,12 +1138,83 @@ fn insert_compatibility_attempt_audit_sql() -> &'static str {
     "#
 }
 
+fn current_global_topup_state_sql() -> &'static str {
+    r#"
+    SELECT
+      gmrs.current_run_id,
+      gmrs.status AS state_status,
+      gmrs.next_retry_at,
+      gsr.status AS run_status,
+      gsr.updated_at AS run_updated_at
+    FROM global_moodboard_reference_state gmrs
+    LEFT JOIN global_moodboard_source_runs gsr
+      ON gsr.id = gmrs.current_run_id
+     AND gsr.moodboard_slug = gmrs.moodboard_slug
+    WHERE gmrs.moodboard_slug = ?
+    LIMIT 1
+    "#
+}
+
+fn eligible_global_topup_work_sql() -> &'static str {
+    r#"
+    SELECT
+      (
+        SELECT COUNT(*)
+        FROM global_moodboard_search_state
+        WHERE moodboard_slug = ?
+          AND status IN ('active', 'cooldown')
+          AND (next_eligible_at IS NULL OR next_eligible_at <= ?)
+      ) + (
+        SELECT COUNT(*)
+        FROM global_moodboard_handles
+        WHERE moodboard_slug = ?
+          AND status IN ('active', 'cooldown')
+          AND (cooldown_until IS NULL OR cooldown_until <= ?)
+      ) + (
+        SELECT COUNT(*)
+        FROM global_visual_reference_candidates
+        WHERE (discovery_moodboard_slug = ? OR assigned_moodboard_slug = ?)
+          AND candidate_status = 'active'
+          AND (
+            review_status = 'queued'
+            OR (
+              review_status = 'reviewing'
+              AND review_locked_until IS NOT NULL
+              AND review_locked_until <= ?
+              AND review_attempt_count < ?
+            )
+            OR (
+              review_status = 'failed'
+              AND review_attempt_count < ?
+              AND (review_next_retry_at IS NULL OR review_next_retry_at <= ?)
+            )
+            OR (
+              review_status = 'approved'
+              AND cleanup_status = 'queued'
+            )
+            OR (
+              review_status = 'approved'
+              AND cleanup_status = 'cleaning'
+              AND (cleanup_next_retry_at IS NULL OR cleanup_next_retry_at <= ?)
+            )
+            OR (
+              review_status = 'approved'
+              AND cleanup_status = 'failed'
+              AND cleanup_attempt_count < ?
+              AND (cleanup_next_retry_at IS NULL OR cleanup_next_retry_at <= ?)
+            )
+          )
+      ) AS count
+    "#
+}
+
 pub async fn build_or_refresh_clone_pool(
     db: &D1Database,
     env: &Env,
     user_id: &str,
     clone_id: &str,
     reason: &str,
+    wakeup_moodboard_slug: Option<&str>,
 ) -> WorkerResult<()> {
     let Some(clone) = db::first::<CloneForPoolRow>(
         db,
@@ -815,7 +1243,7 @@ pub async fn build_or_refresh_clone_pool(
     }
 
     let config = load_pool_config(db).await?;
-    let _ = (config.batch_size, config.global_refs_for_pool_min);
+    let _ = config.batch_size;
     let selected_ids = selected
         .iter()
         .map(|row| row.id.clone())
@@ -826,9 +1254,20 @@ pub async fn build_or_refresh_clone_pool(
         .collect::<Vec<_>>();
     let selected_hash = selected_moodboard_hash(&selected_slugs);
     let now = now_iso_string();
+    let stale_cutoff = add_minutes_iso(&now, -config.clone_pool_run_stale_after_minutes.max(1));
 
     let pool_run_id =
-        match reusable_pool_run(db, user_id, clone_id, &selected_hash, &now, &config).await? {
+        match reusable_pool_run(
+            db,
+            user_id,
+            clone_id,
+            &selected_hash,
+            &now,
+            &config,
+            wakeup_moodboard_slug,
+        )
+        .await?
+        {
             Some(run_id) => run_id,
             None => {
                 create_clone_pool_run(
@@ -846,14 +1285,19 @@ pub async fn build_or_refresh_clone_pool(
             }
         };
 
-    enqueue_global_topups_for_underfilled_selected_slugs(
+    let topup_summary = enqueue_global_topups_for_underfilled_selected_slugs(
         db,
         env,
         &selected_slugs,
         config.global_refs_per_moodboard_target,
         "clone_pool_topup",
+        &now,
     )
     .await?;
+    let _ = (
+        topup_summary.underfilled_slug_count,
+        topup_summary.blocked_or_exhausted_slugs.len(),
+    );
 
     let actionable = load_actionable_global_references(
         db,
@@ -864,27 +1308,79 @@ pub async fn build_or_refresh_clone_pool(
     )
     .await?;
 
-    if actionable.is_empty() {
-        mark_pool_waiting_for_global_library(
+    if actionable.len() < config.global_refs_for_pool_min as usize
+        && !topup_summary.active_or_started_run_slugs.is_empty()
+    {
+        if mark_pool_waiting_for_global_library(
             db,
             user_id,
             clone_id,
             &pool_run_id,
-            &selected_slugs,
+            &selected_hash,
+            &topup_summary.active_or_started_run_slugs,
             &now,
         )
-        .await?;
+        .await?
+        {
+            write_clone_pool_waiting_rows(
+                db,
+                user_id,
+                clone_id,
+                &pool_run_id,
+                &topup_summary.active_or_started_run_slugs,
+                "waiting",
+                &now,
+            )
+            .await?;
+        }
         return Ok(());
     }
 
-    repair_already_accepted_references(db, user_id, clone_id, &pool_run_id, &actionable, &now)
-        .await?;
+    if actionable.is_empty() {
+        if mark_pool_status(
+            db,
+            user_id,
+            clone_id,
+            &pool_run_id,
+            "insufficient_refs",
+            &selected_hash,
+            &selected_slugs,
+            &now,
+        )
+        .await?
+        {
+            write_clone_pool_waiting_rows(
+                db,
+                user_id,
+                clone_id,
+                &pool_run_id,
+                &selected_slugs,
+                "insufficient",
+                &now,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
+    repair_already_accepted_references(
+        db,
+        user_id,
+        clone_id,
+        &pool_run_id,
+        &selected_hash,
+        &actionable,
+        &now,
+        &stale_cutoff,
+    )
+    .await?;
     schedule_compatibility_wave(
         db,
         env,
         user_id,
         clone_id,
         &pool_run_id,
+        &selected_hash,
         &selected_slugs,
         actionable,
         &config,
@@ -912,7 +1408,49 @@ pub async fn validate_clone_compatibility(
     global_reference_id: &str,
 ) -> WorkerResult<()> {
     let now = now_iso_string();
-    if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+    let stale_after_minutes =
+        config_value_i64(db, "clone_pool_run_stale_after_minutes", 30).await?;
+    let selected = db::all::<SelectedMoodboardRow>(
+        db,
+        load_current_selected_moodboard_snapshot_sql(),
+        vec![json!(user_id)],
+    )
+    .await?;
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let current_selected_slugs = selected
+        .iter()
+        .map(|row| row.slug.clone())
+        .collect::<Vec<_>>();
+    let current_selected_hash = selected_moodboard_hash(&current_selected_slugs);
+    if !current_clone_pool_run_or_record_stale(
+        db,
+        user_id,
+        clone_id,
+        pool_run_id,
+        &current_selected_hash,
+        Some(global_reference_id),
+        &now,
+        stale_after_minutes,
+    )
+    .await?
+    {
+        must_not_mutate_clone_visible_state_from_stale_pool();
+        return Ok(());
+    }
+    let stale_cutoff =
+        crate::services::queue_reservations::add_minutes_iso(&now, -stale_after_minutes.max(1));
+    if !current_pool_run_allows_side_effects(
+        db,
+        user_id,
+        clone_id,
+        pool_run_id,
+        &current_selected_hash,
+        &stale_cutoff,
+    )
+    .await?
+    {
         insert_compatibility_attempt_audit(
             db,
             pool_run_id,
@@ -930,9 +1468,34 @@ pub async fn validate_clone_compatibility(
     let retry_limit = config_value_u32(db, "visual_reference_compatibility_retry_limit", 2).await?;
     let clone_reference_limit =
         config_value_u32(db, "clone_compatibility_reference_limit", 4).await?;
-    let Some(compatibility_claim) =
-        claim_clone_compatibility(db, clone_id, global_reference_id, retry_limit, &now).await?
+    let Some(compatibility_claim) = claim_clone_compatibility(
+        db,
+        user_id,
+        clone_id,
+        pool_run_id,
+        &current_selected_hash,
+        global_reference_id,
+        retry_limit,
+        &now,
+        &stale_cutoff,
+    )
+    .await?
     else {
+        if !current_clone_pool_run_or_record_stale(
+            db,
+            user_id,
+            clone_id,
+            pool_run_id,
+            &current_selected_hash,
+            Some(global_reference_id),
+            &now,
+            stale_after_minutes,
+        )
+        .await?
+        {
+            must_not_mutate_clone_visible_state_from_stale_pool();
+            return Ok(());
+        }
         return enqueue_finalize_clone_pool(
             db,
             env,
@@ -945,14 +1508,32 @@ pub async fn validate_clone_compatibility(
         .await;
     };
 
-    if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+    if !current_pool_run_allows_side_effects(
+        db,
+        user_id,
+        clone_id,
+        pool_run_id,
+        &current_selected_hash,
+        &stale_cutoff,
+    )
+    .await?
+    {
         return Ok(());
     }
 
     let Some(global_reference) =
         load_global_reference_for_compatibility(db, global_reference_id).await?
     else {
-        if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+        if !current_pool_run_allows_side_effects(
+            db,
+            user_id,
+            clone_id,
+            pool_run_id,
+            &current_selected_hash,
+            &stale_cutoff,
+        )
+        .await?
+        {
             return Ok(());
         }
         if mark_clone_compatibility_failed(
@@ -960,12 +1541,14 @@ pub async fn validate_clone_compatibility(
             user_id,
             clone_id,
             pool_run_id,
+            &current_selected_hash,
             global_reference_id,
             &compatibility_claim,
             retry_limit,
             "global_reference_unavailable",
             "Global reference was not active or had no global media asset.",
             &now,
+            &stale_cutoff,
         )
         .await?
         {
@@ -1008,7 +1591,16 @@ pub async fn validate_clone_compatibility(
         Err(error) => {
             let detail = compact_error_detail(&error.to_string());
             let code = compatibility_image_error_code(&detail);
-            if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+            if !current_pool_run_allows_side_effects(
+                db,
+                user_id,
+                clone_id,
+                pool_run_id,
+                &current_selected_hash,
+                &stale_cutoff,
+            )
+            .await?
+            {
                 return Ok(());
             }
             if mark_clone_compatibility_failed(
@@ -1016,12 +1608,14 @@ pub async fn validate_clone_compatibility(
                 user_id,
                 clone_id,
                 pool_run_id,
+                &current_selected_hash,
                 global_reference_id,
                 &compatibility_claim,
                 retry_limit,
                 code,
                 &detail,
                 &now,
+                &stale_cutoff,
             )
             .await?
             {
@@ -1050,7 +1644,16 @@ pub async fn validate_clone_compatibility(
         }
     };
     if image_urls.len() <= 1 {
-        if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+        if !current_pool_run_allows_side_effects(
+            db,
+            user_id,
+            clone_id,
+            pool_run_id,
+            &current_selected_hash,
+            &stale_cutoff,
+        )
+        .await?
+        {
             return Ok(());
         }
         if mark_clone_compatibility_failed(
@@ -1058,12 +1661,14 @@ pub async fn validate_clone_compatibility(
             user_id,
             clone_id,
             pool_run_id,
+            &current_selected_hash,
             global_reference_id,
             &compatibility_claim,
             retry_limit,
             "clone_compatibility_reference_missing",
             "No clone reference images were available.",
             &now,
+            &stale_cutoff,
         )
         .await?
         {
@@ -1103,7 +1708,35 @@ pub async fn validate_clone_compatibility(
         Err(error) => Err(error),
     };
 
-    if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+    let write_now = now_iso_string();
+    let write_stale_cutoff = crate::services::queue_reservations::add_minutes_iso(
+        &write_now,
+        -stale_after_minutes.max(1),
+    );
+    let selected = db::all::<SelectedMoodboardRow>(
+        db,
+        load_current_selected_moodboard_snapshot_sql(),
+        vec![json!(user_id)],
+    )
+    .await?;
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let current_selected_slugs = selected
+        .iter()
+        .map(|row| row.slug.clone())
+        .collect::<Vec<_>>();
+    let current_selected_hash = selected_moodboard_hash(&current_selected_slugs);
+    if !current_pool_run_allows_side_effects(
+        db,
+        user_id,
+        clone_id,
+        pool_run_id,
+        &current_selected_hash,
+        &write_stale_cutoff,
+    )
+    .await?
+    {
         insert_compatibility_attempt_audit(
             db,
             pool_run_id,
@@ -1112,13 +1745,12 @@ pub async fn validate_clone_compatibility(
             "stale_pool_message",
             Some("stale_pool_message"),
             Some("Pool run became stale before compatibility write."),
-            &now_iso_string(),
+            &write_now,
         )
         .await?;
         return Ok(());
     }
 
-    let write_now = now_iso_string();
     match review {
         Ok(review) => {
             let review_json = serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string());
@@ -1129,11 +1761,13 @@ pub async fn validate_clone_compatibility(
                         user_id,
                         clone_id,
                         pool_run_id,
+                        &current_selected_hash,
                         global_reference_id,
                         &compatibility_claim,
                         &review,
                         &review_json,
                         &write_now,
+                        &write_stale_cutoff,
                     )
                     .await?
                     {
@@ -1142,8 +1776,10 @@ pub async fn validate_clone_compatibility(
                             user_id,
                             clone_id,
                             pool_run_id,
+                            &current_selected_hash,
                             global_reference_id,
                             &write_now,
+                            &write_stale_cutoff,
                         )
                         .await?;
                         insert_compatibility_attempt_audit(
@@ -1165,11 +1801,13 @@ pub async fn validate_clone_compatibility(
                         user_id,
                         clone_id,
                         pool_run_id,
+                        &current_selected_hash,
                         global_reference_id,
                         &compatibility_claim,
                         &review,
                         &review_json,
                         &write_now,
+                        &write_stale_cutoff,
                     )
                     .await?
                     {
@@ -1195,12 +1833,14 @@ pub async fn validate_clone_compatibility(
                 user_id,
                 clone_id,
                 pool_run_id,
+                &current_selected_hash,
                 global_reference_id,
                 &compatibility_claim,
                 retry_limit,
                 "provider_error",
                 &detail,
                 &write_now,
+                &write_stale_cutoff,
             )
             .await?
             {
@@ -1236,10 +1876,21 @@ pub async fn insert_clone_visual_reference_for_accepted_global_reference(
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
+    current_selected_hash: &str,
     global_reference_id: &str,
     now: &str,
+    stale_cutoff: &str,
 ) -> WorkerResult<Option<String>> {
-    if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+    if !current_pool_run_allows_side_effects(
+        db,
+        user_id,
+        clone_id,
+        pool_run_id,
+        current_selected_hash,
+        stale_cutoff,
+    )
+    .await?
+    {
         return Ok(None);
     }
 
@@ -1257,6 +1908,11 @@ pub async fn insert_clone_visual_reference_for_accepted_global_reference(
             json!(clone_id),
             json!(user_id),
             json!(global_reference_id),
+            json!(user_id),
+            json!(clone_id),
+            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
         ],
     )
     .await?;
@@ -1281,6 +1937,11 @@ pub async fn insert_clone_visual_reference_for_accepted_global_reference(
             json!(user_id),
             json!(clone_id),
             json!(visual_reference.id.clone()),
+            json!(user_id),
+            json!(clone_id),
+            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
         ],
     )
     .await?;
@@ -1298,6 +1959,7 @@ pub async fn finalize_clone_reference_pool(
 ) -> WorkerResult<()> {
     let now = now_iso_string();
     let config = load_pool_config(db).await?;
+    let stale_cutoff = add_minutes_iso(&now, -config.clone_pool_run_stale_after_minutes.max(1));
     let selected = db::all::<SelectedMoodboardRow>(
         db,
         load_current_selected_moodboard_snapshot_sql(),
@@ -1313,6 +1975,21 @@ pub async fn finalize_clone_reference_pool(
         .map(|row| row.slug.clone())
         .collect::<Vec<_>>();
     let selected_hash = selected_moodboard_hash(&selected_slugs);
+    if !current_clone_pool_run_or_record_stale(
+        db,
+        user_id,
+        clone_id,
+        pool_run_id,
+        &selected_hash,
+        None,
+        &now,
+        config.clone_pool_run_stale_after_minutes,
+    )
+    .await?
+    {
+        must_not_mutate_clone_visible_state_from_stale_pool();
+        return Ok(());
+    }
     let Some(run) = db::first::<PoolRunRow>(
         db,
         load_current_pool_run_sql(),
@@ -1339,9 +2016,63 @@ pub async fn finalize_clone_reference_pool(
     let active_selected_count =
         active_clone_reference_count_for_current_selection(db, user_id, clone_id).await?;
     let pending_compatibility_count =
-        pending_clone_compatibility_count_for_current_selection(db, user_id, clone_id).await?;
+        pending_clone_compatibility_count_for_current_selection(db, user_id, clone_id, &now)
+            .await?;
+
+    if active_selected_count < config.batch_size && pending_compatibility_count == 0 {
+        let actionable = load_actionable_global_references(
+            db,
+            clone_id,
+            &selected_slugs,
+            config.clone_pool_global_reference_review_limit,
+            &now,
+        )
+        .await?;
+        if !actionable.is_empty() {
+            repair_already_accepted_references(
+                db,
+                user_id,
+                clone_id,
+                pool_run_id,
+                &selected_hash,
+                &actionable,
+                &now,
+                &stale_cutoff,
+            )
+            .await?;
+            schedule_compatibility_wave(
+                db,
+                env,
+                user_id,
+                clone_id,
+                pool_run_id,
+                &selected_hash,
+                &selected_slugs,
+                actionable,
+                &config,
+                &now,
+            )
+            .await?;
+            return enqueue_finalize_clone_pool(
+                db,
+                env,
+                user_id,
+                clone_id,
+                pool_run_id,
+                "wave_scheduled",
+                &now,
+            )
+            .await;
+        }
+    }
 
     let final_status = if active_selected_count >= config.batch_size {
+        crate::services::queue_reservations::cancel_unstarted_pool_reservations(
+            db,
+            pool_run_id,
+            &now,
+        )
+        .await?;
         "pool_ready"
     } else if pending_compatibility_count > 0 {
         "compatibility_reviewing"
@@ -1351,40 +2082,12 @@ pub async fn finalize_clone_reference_pool(
         "insufficient_refs"
     };
 
-    let batch_provider_soul_id =
-        if final_status == "pool_ready" || final_status == "partial_pool_ready" {
-            db::first::<CloneForPoolRow>(
-                db,
-                load_clone_for_pool_sql(),
-                vec![json!(user_id), json!(clone_id)],
-            )
-            .await?
-            .and_then(|clone| {
-                if clone.soul_status.as_deref() == Some("ready") {
-                    clone
-                        .provider_soul_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string)
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
-
-    if let Some(provider_soul_id) = batch_provider_soul_id {
-        if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
-            return Ok(());
-        }
-        crate::services::blitz::create_next_batch(db, env, user_id, clone_id, &provider_soul_id)
-            .await?;
-        if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
-            return Ok(());
-        }
-    }
+    let final_waiting_slugs: &[String] = if final_status == "insufficient_refs" {
+        selected_slugs.as_slice()
+    } else {
+        &[]
+    };
+    let final_waiting_slugs_json = json!(final_waiting_slugs).to_string();
 
     let result = db::run(
         db,
@@ -1392,12 +2095,14 @@ pub async fn finalize_clone_reference_pool(
         vec![
             json!(final_status),
             json!(reason),
+            json!(final_waiting_slugs_json.clone()),
             json!(now),
             json!(final_status),
             json!(now),
             json!(pool_run_id),
             json!(user_id),
             json!(clone_id),
+            json!(selected_hash),
         ],
     )
     .await?;
@@ -1405,11 +2110,13 @@ pub async fn finalize_clone_reference_pool(
         return Ok(());
     }
 
-    db::exec(
+    let state_result = db::run(
         db,
         finalize_clone_reference_state_sql(),
         vec![
             json!(final_status),
+            json!(final_status),
+            json!(final_waiting_slugs_json),
             json!(final_status),
             json!(now),
             json!(final_status),
@@ -1422,9 +2129,59 @@ pub async fn finalize_clone_reference_pool(
             json!(user_id),
             json!(clone_id),
             json!(pool_run_id),
+            json!(final_status),
+            json!(selected_hash),
         ],
     )
-    .await
+    .await?;
+    if changed_rows(&state_result)? == 0 {
+        return Ok(());
+    }
+
+    if final_status == "insufficient_refs" {
+        write_clone_pool_waiting_rows(
+            db,
+            user_id,
+            clone_id,
+            pool_run_id,
+            &selected_slugs,
+            "insufficient",
+            &now,
+        )
+        .await?;
+    }
+
+    if final_status == "pool_ready" || final_status == "partial_pool_ready" {
+        if let Some(provider_soul_id) = db::first::<CloneForPoolRow>(
+            db,
+            load_clone_for_pool_sql(),
+            vec![json!(user_id), json!(clone_id)],
+        )
+        .await?
+        .and_then(|clone| {
+            if clone.soul_status.as_deref() == Some("ready") {
+                clone
+                    .provider_soul_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        }) {
+            crate::services::blitz::create_next_batch(
+                db,
+                env,
+                user_id,
+                clone_id,
+                &provider_soul_id,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn reusable_pool_run(
@@ -1434,6 +2191,7 @@ async fn reusable_pool_run(
     selected_hash: &str,
     now: &str,
     config: &PoolConfig,
+    wakeup_moodboard_slug: Option<&str>,
 ) -> WorkerResult<Option<String>> {
     let Some(run) = db::first::<PoolRunRow>(
         db,
@@ -1454,9 +2212,114 @@ async fn reusable_pool_run(
         config.clone_pool_run_stale_after_minutes,
     ) {
         Ok(Some(run.id))
+    } else if let Some(wakeup_moodboard_slug) = wakeup_moodboard_slug {
+        passive_insufficient_wakeup_pool_run(
+            db,
+            user_id,
+            clone_id,
+            selected_hash,
+            wakeup_moodboard_slug,
+            now,
+        )
+        .await
     } else {
         Ok(None)
     }
+}
+
+async fn passive_insufficient_wakeup_pool_run(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    selected_hash: &str,
+    wakeup_moodboard_slug: &str,
+    now: &str,
+) -> WorkerResult<Option<String>> {
+    let Some(row) = db::first::<PoolRunRow>(
+        db,
+        passive_insufficient_wakeup_pool_run_sql(),
+        vec![
+            json!(user_id),
+            json!(clone_id),
+            json!(selected_hash),
+            json!(selected_hash),
+            json!(wakeup_moodboard_slug),
+        ],
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let result = db::run(
+        db,
+        revive_passive_insufficient_pool_run_for_wakeup_sql(),
+        vec![
+            json!(now),
+            json!(row.id.clone()),
+            json!(user_id),
+            json!(clone_id),
+            json!(user_id),
+            json!(clone_id),
+            json!(selected_hash),
+            json!(wakeup_moodboard_slug),
+        ],
+    )
+    .await?;
+    if changed_rows(&result)? == 0 {
+        return Ok(None);
+    }
+
+    let state_result = db::run(
+        db,
+        revive_passive_insufficient_clone_reference_state_for_wakeup_sql(),
+        vec![
+            json!(now),
+            json!(user_id),
+            json!(clone_id),
+            json!(row.id.clone()),
+            json!(selected_hash),
+            json!(wakeup_moodboard_slug),
+        ],
+    )
+    .await?;
+    if changed_rows(&state_result)? == 0 {
+        let _ = db::run(
+            db,
+            revert_passive_insufficient_pool_run_for_wakeup_sql(),
+            vec![
+                json!(now),
+                json!(row.id.clone()),
+                json!(user_id),
+                json!(clone_id),
+                json!(user_id),
+                json!(clone_id),
+                json!(selected_hash),
+            ],
+        )
+        .await?;
+        return Ok(None);
+    }
+
+    let clear_result = db::run(
+        db,
+        clear_revived_passive_insufficient_pool_run_for_wakeup_sql(),
+        vec![
+            json!(now),
+            json!(row.id.clone()),
+            json!(user_id),
+            json!(clone_id),
+            json!(user_id),
+            json!(clone_id),
+            json!(selected_hash),
+        ],
+    )
+    .await?;
+    if changed_rows(&clear_result)? == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(row.id))
 }
 
 async fn create_clone_pool_run(
@@ -1556,6 +2419,7 @@ async fn schedule_compatibility_wave(
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
+    current_selected_hash: &str,
     selected_slugs: &[String],
     rows: Vec<GlobalReferenceActionableRow>,
     config: &PoolConfig,
@@ -1586,6 +2450,7 @@ async fn schedule_compatibility_wave(
         selected_slugs,
         config.clone_pool_compatibility_wave_size,
     );
+    let stale_cutoff = add_minutes_iso(now, -config.clone_pool_run_stale_after_minutes.max(1));
 
     for reference in selected {
         db::exec(
@@ -1597,6 +2462,11 @@ async fn schedule_compatibility_wave(
                 json!(reference.id.clone()),
                 json!(now),
                 json!(now),
+                json!(user_id),
+                json!(clone_id),
+                json!(pool_run_id),
+                json!(current_selected_hash),
+                json!(stale_cutoff),
             ],
         )
         .await?;
@@ -1617,16 +2487,18 @@ async fn schedule_compatibility_wave(
         .await?;
     }
 
-    mark_pool_status(
+    let _ = mark_pool_status(
         db,
         user_id,
         clone_id,
         pool_run_id,
         "compatibility_reviewing",
+        current_selected_hash,
         &[],
         now,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 async fn repair_already_accepted_references(
@@ -1634,8 +2506,10 @@ async fn repair_already_accepted_references(
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
+    current_selected_hash: &str,
     rows: &[GlobalReferenceActionableRow],
     now: &str,
+    stale_cutoff: &str,
 ) -> WorkerResult<()> {
     for row in rows {
         if compatibility_action_for(
@@ -1650,8 +2524,10 @@ async fn repair_already_accepted_references(
                 user_id,
                 clone_id,
                 pool_run_id,
+                current_selected_hash,
                 &row.id,
                 now,
+                stale_cutoff,
             )
             .await?;
         }
@@ -1754,6 +2630,8 @@ async fn current_pool_run_allows_side_effects(
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
+    current_selected_hash: &str,
+    stale_cutoff: &str,
 ) -> WorkerResult<bool> {
     let row = db::first::<CountRow>(
         db,
@@ -1762,12 +2640,62 @@ async fn current_pool_run_allows_side_effects(
             json!(user_id),
             json!(clone_id),
             json!(pool_run_id),
-            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
         ],
     )
     .await?;
     Ok(row.map(|row| row.count > 0).unwrap_or_default())
 }
+
+async fn current_clone_pool_run_or_record_stale(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+    current_selected_hash: &str,
+    global_reference_id: Option<&str>,
+    now: &str,
+    stale_after_minutes: i64,
+) -> WorkerResult<bool> {
+    let stale_cutoff =
+        crate::services::queue_reservations::add_minutes_iso(now, -stale_after_minutes.max(1));
+    let row = db::first::<PoolRunGuardRow>(
+        db,
+        current_clone_pool_run_guard_sql(),
+        vec![
+            json!(user_id),
+            json!(clone_id),
+            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
+        ],
+    )
+    .await?;
+    if let Some(row) = row {
+        let _ = row.id;
+        return Ok(true);
+    }
+
+    if let Some(global_reference_id) = global_reference_id {
+        db::exec(
+            db,
+            record_stale_clone_compatibility_attempt_sql(),
+            vec![
+                json!(format!("clone_compat_attempt_{}", Uuid::new_v4().simple())),
+                json!(pool_run_id),
+                json!(clone_id),
+                json!(global_reference_id),
+                json!(now),
+            ],
+        )
+        .await?;
+    }
+
+    Ok(false)
+}
+
+fn must_not_mutate_clone_visible_state_from_stale_pool() {}
 
 async fn load_global_reference_for_compatibility(
     db: &D1Database,
@@ -1783,10 +2711,14 @@ async fn load_global_reference_for_compatibility(
 
 async fn claim_clone_compatibility(
     db: &D1Database,
+    user_id: &str,
     clone_id: &str,
+    pool_run_id: &str,
+    current_selected_hash: &str,
     global_reference_id: &str,
     retry_limit: u32,
     now: &str,
+    stale_cutoff: &str,
 ) -> WorkerResult<Option<CompatibilityClaim>> {
     let compatibility_id = format!("clone_compatibility_{}", Uuid::new_v4().simple());
     let claim_expires_at = add_minutes_iso(now, 10);
@@ -1799,8 +2731,18 @@ async fn claim_clone_compatibility(
             json!(global_reference_id),
             json!(now),
             json!(now),
+            json!(user_id),
+            json!(clone_id),
+            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
             json!(retry_limit.max(1)),
             json!(now),
+            json!(user_id),
+            json!(clone_id),
+            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
         ],
     )
     .await?;
@@ -1815,6 +2757,11 @@ async fn claim_clone_compatibility(
             json!(global_reference_id),
             json!(retry_limit.max(1)),
             json!(now),
+            json!(user_id),
+            json!(clone_id),
+            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
         ],
     )
     .await?;
@@ -1917,11 +2864,13 @@ async fn mark_clone_compatibility_accepted(
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
+    current_selected_hash: &str,
     global_reference_id: &str,
     claim: &CompatibilityClaim,
     review: &crate::ai::workers_ai::CloneCompatibilityReview,
     review_json: &str,
     now: &str,
+    stale_cutoff: &str,
 ) -> WorkerResult<bool> {
     let result = db::run(
         db,
@@ -1939,7 +2888,8 @@ async fn mark_clone_compatibility_accepted(
             json!(claim.claim_expires_at),
             json!(user_id),
             json!(pool_run_id),
-            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
         ],
     )
     .await?;
@@ -1951,11 +2901,13 @@ async fn mark_clone_compatibility_rejected(
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
+    current_selected_hash: &str,
     global_reference_id: &str,
     claim: &CompatibilityClaim,
     review: &crate::ai::workers_ai::CloneCompatibilityReview,
     review_json: &str,
     now: &str,
+    stale_cutoff: &str,
 ) -> WorkerResult<bool> {
     let result = db::run(
         db,
@@ -1973,7 +2925,8 @@ async fn mark_clone_compatibility_rejected(
             json!(claim.claim_expires_at),
             json!(user_id),
             json!(pool_run_id),
-            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
         ],
     )
     .await?;
@@ -1985,12 +2938,14 @@ async fn mark_clone_compatibility_failed(
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
+    current_selected_hash: &str,
     global_reference_id: &str,
     claim: &CompatibilityClaim,
     retry_limit: u32,
     error_code: &str,
     error_message: &str,
     now: &str,
+    stale_cutoff: &str,
 ) -> WorkerResult<bool> {
     let result = db::run(
         db,
@@ -2007,7 +2962,8 @@ async fn mark_clone_compatibility_failed(
             json!(claim.claim_expires_at),
             json!(user_id),
             json!(pool_run_id),
-            json!(pool_run_id),
+            json!(current_selected_hash),
+            json!(stale_cutoff),
         ],
     )
     .await?;
@@ -2047,18 +3003,84 @@ async fn enqueue_global_topups_for_underfilled_selected_slugs(
     selected_slugs: &[String],
     target: u32,
     reason: &str,
-) -> WorkerResult<()> {
+    now: &str,
+) -> WorkerResult<GlobalTopupSummary> {
+    let mut summary = GlobalTopupSummary::default();
+    let stale_after_minutes = config_value_i64(
+        db,
+        crate::services::global_reference_discovery::GLOBAL_DISCOVERY_RUN_STALE_AFTER_MINUTES_CONFIG_KEY,
+        60,
+    )
+    .await?
+    .max(1);
+    let stale_cutoff =
+        crate::services::queue_reservations::add_minutes_iso(now, -stale_after_minutes);
+    let review_retry_limit = config_value_u32(db, "visual_reference_review_retry_limit", 2)
+        .await?
+        .max(1);
+    let cleanup_retry_limit = config_value_u32(db, "visual_reference_cleanup_retry_limit", 3)
+        .await?
+        .max(1);
+
     for slug in selected_slugs {
-        if active_global_reference_count(db, slug).await? < target {
-            env.queue(REFERENCE_QUEUE_NAME)?
-                .send(ReferencePipelineMessage::EnsureGlobalMoodboardLibrary {
+        if active_global_reference_count(db, slug).await? >= target {
+            continue;
+        }
+        summary.underfilled_slug_count += 1;
+
+        if current_global_topup_run_is_active(db, slug, &stale_cutoff).await? {
+            summary.active_or_started_run_slugs.push(slug.clone());
+            continue;
+        }
+
+        let eligible_global_work_exists = eligible_global_topup_work_exists(
+            db,
+            slug,
+            now,
+            review_retry_limit,
+            cleanup_retry_limit,
+        )
+        .await?;
+
+        if !eligible_global_work_exists && global_topup_next_retry_is_blocked(db, slug, now).await?
+        {
+            summary.blocked_or_exhausted_slugs.push(slug.clone());
+            continue;
+        }
+
+        if current_global_topup_state_exists(db, slug).await? && !eligible_global_work_exists
+        {
+            summary.blocked_or_exhausted_slugs.push(slug.clone());
+            continue;
+        }
+
+        let reservation = QueueReservation::new(
+            "ensure_global_moodboard_library",
+            format!("global:ensure:{slug}"),
+            None,
+            None,
+            ReservationTtl::FiveMinutes,
+        );
+        let outcome =
+            crate::services::queue_reservations::reserve_and_send_reference_pipeline_message(
+                db,
+                env,
+                reservation,
+                ReferencePipelineMessage::EnsureGlobalMoodboardLibrary {
                     moodboard_slug: slug.clone(),
                     reason: reason.to_string(),
-                })
-                .await?;
+                },
+                now,
+            )
+            .await?;
+        if matches!(
+            outcome,
+            ReservationOutcome::Reserved | ReservationOutcome::SuppressedActive
+        ) {
+            summary.active_or_started_run_slugs.push(slug.clone());
         }
     }
-    Ok(())
+    Ok(summary)
 }
 
 async fn active_global_reference_count(db: &D1Database, moodboard_slug: &str) -> WorkerResult<u32> {
@@ -2074,6 +3096,99 @@ async fn active_global_reference_count(db: &D1Database, moodboard_slug: &str) ->
     )
     .await?;
     Ok(row.map(|row| row.count).unwrap_or(0))
+}
+
+async fn current_global_topup_state(
+    db: &D1Database,
+    moodboard_slug: &str,
+) -> WorkerResult<Option<CurrentGlobalTopupRow>> {
+    db::first(
+        db,
+        current_global_topup_state_sql(),
+        vec![json!(moodboard_slug)],
+    )
+    .await
+}
+
+async fn current_global_topup_state_exists(
+    db: &D1Database,
+    moodboard_slug: &str,
+) -> WorkerResult<bool> {
+    Ok(current_global_topup_state(db, moodboard_slug)
+        .await?
+        .is_some())
+}
+
+async fn current_global_topup_run_is_active(
+    db: &D1Database,
+    moodboard_slug: &str,
+    stale_cutoff: &str,
+) -> WorkerResult<bool> {
+    let Some(row) = current_global_topup_state(db, moodboard_slug).await? else {
+        return Ok(false);
+    };
+    let _ = row.current_run_id.as_deref();
+    let run_status_is_active = row
+        .run_status
+        .as_deref()
+        .map(|status| matches!(status, "queued" | "refreshing" | "scraping" | "reviewing" | "cleaning"))
+        .unwrap_or(false);
+    let fresh = row
+        .run_updated_at
+        .as_deref()
+        .map(|updated_at| updated_at > stale_cutoff)
+        .unwrap_or(false);
+    Ok(run_status_is_active && fresh)
+}
+
+async fn global_topup_next_retry_is_blocked(
+    db: &D1Database,
+    moodboard_slug: &str,
+    now: &str,
+) -> WorkerResult<bool> {
+    let Some(row) = current_global_topup_state(db, moodboard_slug).await? else {
+        return Ok(false);
+    };
+    let terminal_underfill = matches!(
+        row.state_status.as_str(),
+        "insufficient_refs" | "underfilled_exhausted" | "discovery_failed"
+    );
+    Ok(terminal_underfill
+        && row
+            .next_retry_at
+            .as_deref()
+            .map(|next_retry_at| next_retry_at > now)
+            .unwrap_or(false))
+}
+
+async fn eligible_global_topup_work_exists(
+    db: &D1Database,
+    moodboard_slug: &str,
+    now: &str,
+    review_retry_limit: u32,
+    cleanup_retry_limit: u32,
+) -> WorkerResult<bool> {
+    let row = db::first::<CountRow>(
+        db,
+        eligible_global_topup_work_sql(),
+        vec![
+            json!(moodboard_slug),
+            json!(now),
+            json!(moodboard_slug),
+            json!(now),
+            json!(moodboard_slug),
+            json!(moodboard_slug),
+            json!(now),
+            json!(review_retry_limit),
+            json!(review_retry_limit),
+            json!(now),
+            json!(now),
+            json!(cleanup_retry_limit),
+            json!(now),
+        ],
+    )
+    .await?;
+    Ok(row.map(|row| row.count > 0).unwrap_or(false))
 }
 
 async fn active_clone_reference_count_for_current_selection(
@@ -2094,14 +3209,43 @@ async fn pending_clone_compatibility_count_for_current_selection(
     db: &D1Database,
     user_id: &str,
     clone_id: &str,
+    now: &str,
 ) -> WorkerResult<u32> {
     let row = db::first::<CountRow>(
         db,
         pending_clone_compatibility_count_for_current_selection_sql(),
-        vec![json!(user_id), json!(clone_id)],
+        vec![json!(user_id), json!(clone_id), json!(now)],
     )
     .await?;
     Ok(row.map(|row| row.count).unwrap_or(0))
+}
+
+async fn write_clone_pool_waiting_rows(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+    selected_slugs: &[String],
+    status: &str,
+    now: &str,
+) -> WorkerResult<()> {
+    for slug in selected_slugs {
+        db::exec(
+            db,
+            insert_clone_pool_waiting_moodboard_sql(),
+            vec![
+                json!(format!("clone_pool_waiting_{}", Uuid::new_v4().simple())),
+                json!(user_id),
+                json!(clone_id),
+                json!(pool_run_id),
+                json!(slug),
+                json!(status),
+                json!(now),
+            ],
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn mark_pool_waiting_for_global_library(
@@ -2109,15 +3253,17 @@ async fn mark_pool_waiting_for_global_library(
     user_id: &str,
     clone_id: &str,
     pool_run_id: &str,
+    current_selected_hash: &str,
     selected_slugs: &[String],
     now: &str,
-) -> WorkerResult<()> {
+) -> WorkerResult<bool> {
     mark_pool_status(
         db,
         user_id,
         clone_id,
         pool_run_id,
         "waiting_for_global_library",
+        current_selected_hash,
         selected_slugs,
         now,
     )
@@ -2130,24 +3276,31 @@ async fn mark_pool_status(
     clone_id: &str,
     pool_run_id: &str,
     status: &str,
+    current_selected_hash: &str,
     waiting_slugs: &[String],
     now: &str,
-) -> WorkerResult<()> {
+) -> WorkerResult<bool> {
     let waiting_slugs_json = json!(waiting_slugs).to_string();
-    db::exec(
+    let result = db::run(
         db,
-        update_pool_status_sql(),
+        update_clone_pool_run_status_if_current_sql(),
         vec![
             json!(status),
             json!(waiting_slugs_json),
             json!(now),
+            json!(status),
+            json!(now),
             json!(pool_run_id),
             json!(user_id),
             json!(clone_id),
+            json!(current_selected_hash),
         ],
     )
     .await?;
-    db::exec(
+    if changed_rows(&result)? == 0 {
+        return Ok(false);
+    }
+    let state_result = db::run(
         db,
         update_clone_reference_state_status_sql(),
         vec![
@@ -2157,9 +3310,15 @@ async fn mark_pool_status(
             json!(user_id),
             json!(clone_id),
             json!(pool_run_id),
+            json!(status),
+            json!(current_selected_hash),
         ],
     )
-    .await
+    .await?;
+    if changed_rows(&state_result)? == 0 {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 async fn load_pool_config(db: &D1Database) -> WorkerResult<PoolConfig> {

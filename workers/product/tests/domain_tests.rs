@@ -426,6 +426,62 @@ fn clone_pool_kickoff_reuses_current_nonstale_run_by_hash() {
 }
 
 #[test]
+fn clone_pool_wakeup_reuses_current_passive_insufficient_pool_only() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let reusable_body = source
+        .split("async fn reusable_pool_run(")
+        .nth(1)
+        .and_then(|section| section.split("async fn create_clone_pool_run").next())
+        .expect("reusable pool run helper");
+    let wakeup_sql = source
+        .split("fn passive_insufficient_wakeup_pool_run_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn load_clone_for_pool_sql").next())
+        .expect("passive insufficient wakeup pool SQL");
+    let build_body =
+        reference_pipeline_function_body(source, "pub async fn build_or_refresh_clone_pool");
+
+    assert!(source.contains("wakeup_moodboard_slug: Option<&str>"));
+    assert!(build_body.contains("wakeup_moodboard_slug"));
+    assert!(reusable_body.contains("wakeup_moodboard_slug: Option<&str>"));
+    assert!(reusable_body.contains("if let Some(wakeup_moodboard_slug) = wakeup_moodboard_slug"));
+    assert!(reusable_body.contains("clone_pool_run_is_reusable"));
+    assert!(wakeup_sql.contains("FROM clone_reference_state crs"));
+    assert!(wakeup_sql.contains("INNER JOIN clone_pool_runs cpr"));
+    assert!(wakeup_sql.contains("INNER JOIN clone_pool_waiting_moodboards cpwm"));
+    assert!(wakeup_sql.contains("crs.current_pool_run_id = cpr.id"));
+    assert!(wakeup_sql.contains("crs.selected_moodboard_hash = ?"));
+    assert!(wakeup_sql.contains("crs.status = 'insufficient_refs'"));
+    assert!(wakeup_sql.contains("cpr.selected_moodboard_hash = ?"));
+    assert!(wakeup_sql.contains("cpr.status = 'insufficient_refs'"));
+    assert!(wakeup_sql.contains("cpwm.moodboard_slug = ?"));
+    assert!(wakeup_sql.contains("cpwm.status IN ('insufficient', 'resumed')"));
+}
+
+#[test]
+fn reference_pipeline_handler_passes_clone_wakeup_context_to_build() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let service = include_str!("../src/services/reference_pipeline.rs");
+    let handler = reference_pipeline_function_body(queue, "async fn handle_message");
+    let build_arm = handler
+        .split("ReferencePipelineMessage::BuildCloneReferencePool")
+        .nth(1)
+        .and_then(|section| section.split("ReferencePipelineMessage::RefreshPool").next())
+        .expect("build clone pool handler arm");
+    let refresh_arm = handler
+        .split("ReferencePipelineMessage::RefreshPool")
+        .nth(1)
+        .and_then(|section| section.split("ReferencePipelineMessage::ValidateCloneCompatibility").next())
+        .expect("refresh clone pool handler arm");
+
+    assert!(build_arm.contains("wakeup_moodboard_slug"));
+    assert!(build_arm.contains("wakeup_moodboard_slug.as_deref()"));
+    assert!(build_arm.contains("build_or_refresh_clone_pool("));
+    assert!(refresh_arm.contains("None"));
+    assert!(service.contains("wakeup_moodboard_slug: None"));
+}
+
+#[test]
 fn clone_pool_candidate_query_uses_global_refs_and_terminal_compatibility_rules() {
     let source = include_str!("../src/services/clone_reference_pool.rs");
     assert!(source.contains("FROM global_moodboard_references gmr"));
@@ -493,6 +549,122 @@ fn clone_compatibility_handler_is_current_pool_guarded_and_audited() {
 }
 
 #[test]
+fn clone_compatibility_post_provider_guard_is_nonstale_and_hash_valid() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let guard_sql = source
+        .split("fn current_pool_run_allows_side_effects_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn record_stale_clone_compatibility_attempt_sql()").next())
+        .expect("current pool side effect guard sql");
+    let guard_helper = source
+        .split("async fn current_pool_run_allows_side_effects(")
+        .nth(1)
+        .and_then(|section| section.split("async fn current_clone_pool_run_or_record_stale").next())
+        .expect("current pool side effect guard helper");
+    let validate_body =
+        reference_pipeline_function_body(source, "pub async fn validate_clone_compatibility");
+
+    assert!(guard_sql.contains("crs.current_pool_run_id = ?"));
+    assert!(guard_sql.contains(
+        "crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
+    assert!(guard_sql.contains("crs.selected_moodboard_hash = cpr.selected_moodboard_hash"));
+    assert!(guard_sql.contains("cpr.selected_moodboard_hash = ?"));
+    assert!(guard_sql.contains("cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"));
+    assert!(guard_sql.contains("cpr.updated_at > ?"));
+    assert!(guard_helper.contains("current_selected_hash: &str"));
+    assert!(guard_helper.contains("json!(current_selected_hash)"));
+    assert!(guard_helper.contains("stale_cutoff: &str"));
+    assert!(guard_helper.contains("json!(stale_cutoff)"));
+    assert!(validate_body.contains("current_pool_run_allows_side_effects("));
+    assert!(validate_body.contains("&current_selected_hash"));
+    assert!(validate_body.contains("insert_compatibility_attempt_audit"));
+    assert!(validate_body.contains("stale_pool_message"));
+}
+
+#[test]
+fn clone_compatibility_reloads_selected_hash_after_provider_work() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let validate_body =
+        reference_pipeline_function_body(source, "pub async fn validate_clone_compatibility");
+    let provider_work = validate_body
+        .find("run_multi_vision_json")
+        .expect("provider work should exist in validate path");
+    let write_now = validate_body
+        .find("let write_now = now_iso_string()")
+        .expect("post-provider write phase");
+    let fresh_snapshot = validate_body[write_now..]
+        .find("load_current_selected_moodboard_snapshot_sql()")
+        .expect("post-provider writes should reload live selected moodboards")
+        + write_now;
+    let fresh_hash = validate_body[fresh_snapshot..]
+        .find("let current_selected_hash = selected_moodboard_hash")
+        .expect("post-provider writes should recompute live selected hash")
+        + fresh_snapshot;
+    let post_provider_guard = validate_body[fresh_hash..]
+        .find("current_pool_run_allows_side_effects(")
+        .expect("post-provider guard should use recomputed selected hash")
+        + fresh_hash;
+    let first_terminal_write = validate_body[post_provider_guard..]
+        .find("mark_clone_compatibility_")
+        .expect("terminal compatibility write should occur after fresh hash guard")
+        + post_provider_guard;
+
+    assert!(provider_work < fresh_snapshot);
+    assert!(fresh_snapshot < fresh_hash);
+    assert!(fresh_hash < post_provider_guard);
+    assert!(post_provider_guard < first_terminal_write);
+    assert!(validate_body[fresh_hash..first_terminal_write].contains("&current_selected_hash"));
+    assert!(validate_body[fresh_hash..first_terminal_write].contains("stale_pool_message"));
+}
+
+#[test]
+fn clone_compatibility_terminal_writes_are_nonstale_current_hash_guarded() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    for (helper, next_helper) in [
+        (
+            "mark_clone_compatibility_accepted_sql",
+            "fn mark_clone_compatibility_rejected_sql",
+        ),
+        (
+            "mark_clone_compatibility_rejected_sql",
+            "fn mark_clone_compatibility_failed_sql",
+        ),
+        (
+            "mark_clone_compatibility_failed_sql",
+            "// visual_references has UNIQUE",
+        ),
+    ] {
+        let sql = source
+            .split(&format!("fn {helper}()"))
+            .nth(1)
+            .and_then(|section| section.split(next_helper).next())
+            .expect("terminal compatibility sql");
+
+        assert!(sql.contains("FROM clone_reference_state crs"), "{helper}");
+        assert!(sql.contains("crs.current_pool_run_id = ?"), "{helper}");
+        assert!(sql.contains("crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"), "{helper}");
+        assert!(sql.contains("crs.selected_moodboard_hash = cpr.selected_moodboard_hash"), "{helper}");
+        assert!(sql.contains("cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"), "{helper}");
+        assert!(sql.contains("cpr.updated_at > ?"), "{helper}");
+    }
+
+    for helper in [
+        "async fn mark_clone_compatibility_accepted",
+        "async fn mark_clone_compatibility_rejected",
+        "async fn mark_clone_compatibility_failed",
+    ] {
+        let body = source
+            .split(helper)
+            .nth(1)
+            .and_then(|section| section.split("async fn insert_compatibility_attempt_audit").next())
+            .expect("terminal compatibility helper body");
+        assert!(body.contains("stale_cutoff: &str"), "{helper}");
+        assert!(body.contains("json!(stale_cutoff)"), "{helper}");
+    }
+}
+
+#[test]
 fn clone_compatibility_handler_writes_terminal_rejected_and_accepted_rows() {
     let source = include_str!("../src/services/clone_reference_pool.rs");
     assert!(source.contains("mark_clone_compatibility_accepted_sql"));
@@ -546,7 +718,7 @@ fn clone_reference_pool_finalization_treats_in_progress_compatibility_leases_as_
     assert!(pending_sql.contains("cvr.status = 'queued'"));
     assert!(pending_sql.contains("cvr.status = 'failed'"));
     assert!(pending_sql.contains("cvr.next_retry_at IS NOT NULL"));
-    assert!(!pending_sql.contains("cvr.next_retry_at <= ?"));
+    assert!(pending_sql.contains("cvr.next_retry_at <= ?"));
     assert!(pending_sql.contains("ma.user_id = 'global'"));
     assert!(pending_sql.contains("ma.clone_id IS NULL"));
     assert!(pending_sql.contains("ma.deleted_at IS NULL"));
@@ -561,10 +733,60 @@ fn clone_reference_pool_finalization_treats_in_progress_compatibility_leases_as_
 }
 
 #[test]
+fn clone_reference_pool_finalization_records_insufficient_waiting_slugs() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let finalize_sql = source
+        .split("fn finalize_clone_pool_run_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn finalize_clone_reference_state_sql()").next())
+        .expect("finalize clone pool run sql");
+    let state_sql = source
+        .split("fn finalize_clone_reference_state_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn update_clone_pool_run_status_if_current_sql").next())
+        .expect("finalize clone reference state sql");
+    let body =
+        reference_pipeline_function_body(source, "pub async fn finalize_clone_reference_pool");
+
+    assert!(finalize_sql.contains("waiting_moodboard_slugs_json = ?"));
+    assert!(finalize_sql.contains(
+        "crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
+    assert!(state_sql.contains("waiting_moodboard_slugs_json = CASE"));
+    assert!(state_sql.contains("WHEN ? = 'insufficient_refs' THEN ?"));
+    assert!(state_sql.contains("ELSE '[]'"));
+    assert!(body.contains("final_waiting_slugs"));
+    assert!(body.contains("final_status == \"insufficient_refs\""));
+    assert!(body.contains("json!(final_waiting_slugs).to_string()"));
+    assert!(body.contains("final_waiting_slugs_json"));
+}
+
+#[test]
+fn clone_reference_pool_finalization_uses_due_pending_compatibility_count() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let helper = source
+        .split("async fn pending_clone_compatibility_count_for_current_selection")
+        .nth(1)
+        .and_then(|section| section.split("async fn write_clone_pool_waiting_rows").next())
+        .expect("pending compatibility count helper");
+    let body =
+        reference_pipeline_function_body(source, "pub async fn finalize_clone_reference_pool");
+
+    assert!(helper.contains("now: &str"));
+    assert!(helper.contains("json!(now)"));
+    assert!(body.contains("pending_clone_compatibility_count_for_current_selection(db, user_id, clone_id, &now)"));
+}
+
+#[test]
 fn clone_reference_pool_finalization_orchestrates_blitz_batch_for_ready_pool() {
     let source = include_str!("../src/services/clone_reference_pool.rs");
     let body =
         reference_pipeline_function_body(source, "pub async fn finalize_clone_reference_pool");
+    let state_sql = source
+        .split("fn finalize_clone_reference_state_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn update_clone_pool_run_status_if_current_sql").next())
+        .expect("finalize clone reference state sql");
 
     assert!(body.contains("env: &Env"));
     assert!(!body.contains("_env: &Env"));
@@ -572,6 +794,9 @@ fn clone_reference_pool_finalization_orchestrates_blitz_batch_for_ready_pool() {
     assert!(body.contains("final_status == \"partial_pool_ready\""));
     assert!(body.contains("load_clone_for_pool_sql()"));
     assert!(body.contains("crate::services::blitz::create_next_batch"));
+    assert!(state_sql.contains("FROM clone_pool_runs cpr"));
+    assert!(state_sql.contains("cpr.id = clone_reference_state.current_pool_run_id"));
+    assert!(state_sql.contains("cpr.selected_moodboard_hash = clone_reference_state.selected_moodboard_hash"));
 
     let create_batch = body
         .find("crate::services::blitz::create_next_batch")
@@ -579,16 +804,280 @@ fn clone_reference_pool_finalization_orchestrates_blitz_batch_for_ready_pool() {
     let terminal_write = body
         .find("finalize_clone_pool_run_sql()")
         .expect("ready pool should still write terminal pool state");
-    assert!(create_batch < terminal_write);
+    let terminal_changed_guard = body
+        .find("changed_rows(&result)? == 0")
+        .expect("ready pool should require a successful terminal transition before Blitz");
+    let state_write = body
+        .find("finalize_clone_reference_state_sql()")
+        .expect("ready pool should update clone reference state before Blitz");
+    let state_changed_guard = body
+        .find("changed_rows(&state_result)? == 0")
+        .expect("ready pool should require a successful state transition before Blitz");
+    let state_write_prefix = &body[..state_write];
+    assert!(state_write_prefix.contains("let state_result = db::run("));
+    assert!(terminal_write < create_batch);
+    assert!(terminal_changed_guard < create_batch);
+    assert!(state_write < create_batch);
+    assert!(state_changed_guard < create_batch);
 
     let before_batch = &body[..create_batch];
     assert!(before_batch.contains("clone.soul_status.as_deref() == Some(\"ready\")"));
     assert!(before_batch.contains("provider_soul_id"));
+}
 
-    let after_batch = &body[create_batch..terminal_write];
-    assert!(after_batch.contains("current_pool_run_allows_side_effects"));
-    assert!(!after_batch.contains("\"insufficient_refs\""));
-    assert!(!after_batch.contains("\"compatibility_reviewing\""));
+#[test]
+fn clone_pool_normal_status_updates_do_not_revive_terminal_runs() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let status_sql = source
+        .split("fn update_clone_pool_run_status_if_current_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn insert_compatibility_attempt_audit_sql").next())
+        .expect("normal pool status update sql");
+    let state_status_sql = source
+        .split("fn update_clone_reference_state_status_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn insert_clone_pool_waiting_moodboard_sql").next())
+        .expect("normal clone reference state status update sql");
+    let wakeup_revival_sql = source
+        .split("fn revive_passive_insufficient_pool_run_for_wakeup_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn insert_clone_pool_run_sql").next())
+        .expect("passive insufficient wakeup revival sql");
+    let wakeup_helper = source
+        .split("async fn passive_insufficient_wakeup_pool_run")
+        .nth(1)
+        .and_then(|section| section.split("async fn create_clone_pool_run").next())
+        .expect("passive insufficient wakeup helper");
+    let wakeup_state_sql = source
+        .split("fn revive_passive_insufficient_clone_reference_state_for_wakeup_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn insert_clone_pool_run_sql").next())
+        .expect("passive insufficient wakeup state revival sql");
+
+    assert!(status_sql.contains(
+        "status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
+    assert!(status_sql.contains("EXISTS ("));
+    assert!(status_sql.contains("FROM clone_reference_state crs"));
+    assert!(status_sql.contains("crs.current_pool_run_id = clone_pool_runs.id"));
+    assert!(status_sql.contains(
+        "crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
+    assert!(status_sql.contains(
+        "crs.selected_moodboard_hash = clone_pool_runs.selected_moodboard_hash"
+    ));
+    assert!(status_sql.contains("clone_pool_runs.selected_moodboard_hash = ?"));
+    assert!(!status_sql.contains("status = 'insufficient_refs'"));
+    assert!(state_status_sql.contains(
+        "status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
+    assert!(state_status_sql.contains("FROM clone_pool_runs cpr"));
+    assert!(state_status_sql.contains("cpr.id = clone_reference_state.current_pool_run_id"));
+    assert!(state_status_sql.contains("cpr.status = ?"));
+    assert!(state_status_sql.contains(
+        "cpr.selected_moodboard_hash = clone_reference_state.selected_moodboard_hash"
+    ));
+    assert!(state_status_sql.contains("cpr.selected_moodboard_hash = ?"));
+    assert!(wakeup_revival_sql.contains("cpr.status = 'insufficient_refs'"));
+    assert!(wakeup_revival_sql.contains("crs.status = 'insufficient_refs'"));
+    assert!(wakeup_revival_sql.contains("cpwm.moodboard_slug = ?"));
+    assert!(wakeup_revival_sql.contains("cpwm.status IN ('insufficient', 'resumed')"));
+    assert!(wakeup_revival_sql.contains(
+        "crs.selected_moodboard_hash = cpr.selected_moodboard_hash"
+    ));
+    assert!(wakeup_helper.contains("wakeup_moodboard_slug"));
+    assert!(wakeup_helper.contains("revive_passive_insufficient_pool_run_for_wakeup_sql()"));
+    assert!(wakeup_state_sql.contains("UPDATE clone_reference_state"));
+    assert!(wakeup_state_sql.contains("SET status = 'queued'"));
+    assert!(wakeup_state_sql.contains("waiting_moodboard_slugs_json = '[]'"));
+    assert!(wakeup_state_sql.contains("current_pool_run_id = ?"));
+    assert!(wakeup_state_sql.contains("selected_moodboard_hash = cpr.selected_moodboard_hash"));
+    assert!(wakeup_helper
+        .contains("revive_passive_insufficient_clone_reference_state_for_wakeup_sql()"));
+    assert!(wakeup_helper.contains("revert_passive_insufficient_pool_run_for_wakeup_sql()"));
+    assert!(wakeup_helper.contains("changed_rows(&state_result)? == 0"));
+}
+
+#[test]
+fn clone_pool_waiting_rows_are_written_only_after_guarded_transitions() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let build_body =
+        reference_pipeline_function_body(source, "pub async fn build_or_refresh_clone_pool");
+    let finalize_body =
+        reference_pipeline_function_body(source, "pub async fn finalize_clone_reference_pool");
+    let mark_pool_status = reference_pipeline_function_body(source, "async fn mark_pool_status");
+    let waiting_helper = reference_pipeline_function_body(
+        source,
+        "async fn mark_pool_waiting_for_global_library",
+    );
+
+    assert!(mark_pool_status.contains("WorkerResult<bool>"));
+    assert!(mark_pool_status.contains("return Ok(false);"));
+    assert!(mark_pool_status.contains("Ok(true)"));
+    assert!(waiting_helper.contains("WorkerResult<bool>"));
+
+    let waiting_transition = build_body
+        .find("mark_pool_waiting_for_global_library(")
+        .expect("waiting branch should transition pool before waiting rows");
+    let first_waiting_write = build_body
+        .find("write_clone_pool_waiting_rows(")
+        .expect("waiting rows should still be written");
+    assert!(waiting_transition < first_waiting_write);
+    assert!(build_body.contains("if mark_pool_waiting_for_global_library("));
+
+    let insufficient_transition = build_body
+        .find("mark_pool_status(")
+        .expect("insufficient branch should transition pool before waiting rows");
+    let insufficient_write = build_body
+        .rfind("write_clone_pool_waiting_rows(")
+        .expect("insufficient rows should still be written");
+    assert!(insufficient_transition < insufficient_write);
+    assert!(build_body.contains("if mark_pool_status("));
+
+    let state_changed_guard = finalize_body
+        .find("changed_rows(&state_result)? == 0")
+        .expect("finalization should check guarded state transition");
+    let final_waiting_write = finalize_body
+        .find("write_clone_pool_waiting_rows(")
+        .expect("finalization insufficient rows should still be written");
+    assert!(state_changed_guard < final_waiting_write);
+    assert!(finalize_body.contains("if final_status == \"insufficient_refs\""));
+}
+
+#[test]
+fn clone_pool_current_guards_bind_live_selected_hash() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let snippets = [
+        (
+            "current_clone_pool_run_guard_sql",
+            "fn current_pool_run_allows_side_effects_sql",
+        ),
+        (
+            "current_pool_run_allows_side_effects_sql",
+            "fn record_stale_clone_compatibility_attempt_sql",
+        ),
+        (
+            "insert_or_claim_clone_compatibility_sql",
+            "fn insert_queued_clone_compatibility_sql",
+        ),
+        (
+            "insert_queued_clone_compatibility_sql",
+            "fn increment_clone_compatibility_attempt_sql",
+        ),
+        (
+            "increment_clone_compatibility_attempt_sql",
+            "fn load_claimed_clone_compatibility_attempt_sql",
+        ),
+        (
+            "mark_clone_compatibility_accepted_sql",
+            "fn mark_clone_compatibility_rejected_sql",
+        ),
+        (
+            "mark_clone_compatibility_rejected_sql",
+            "fn mark_clone_compatibility_failed_sql",
+        ),
+        (
+            "mark_clone_compatibility_failed_sql",
+            "// visual_references has UNIQUE",
+        ),
+        (
+            "insert_clone_visual_reference_sql",
+            "fn active_clone_visual_reference_for_accepted_global_reference_sql",
+        ),
+        (
+            "insert_clone_inspiration_pool_sql",
+            "fn active_clone_reference_count_for_current_selection_sql",
+        ),
+    ];
+
+    for (helper, next_helper) in snippets {
+        let sql = source
+            .split(&format!("fn {helper}()"))
+            .nth(1)
+            .and_then(|section| section.split(next_helper).next())
+            .expect(helper);
+        assert!(sql.contains("crs.selected_moodboard_hash = cpr.selected_moodboard_hash"), "{helper}");
+        assert!(sql.contains("crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"), "{helper}");
+        assert!(sql.contains("cpr.selected_moodboard_hash = ?"), "{helper}");
+    }
+
+    let validate_body =
+        reference_pipeline_function_body(source, "pub async fn validate_clone_compatibility");
+    assert!(validate_body.contains("let current_selected_hash = selected_moodboard_hash"));
+    assert!(validate_body.contains("current_clone_pool_run_or_record_stale("));
+    assert!(validate_body.contains("&current_selected_hash"));
+    assert!(validate_body.contains("current_pool_run_allows_side_effects("));
+
+    for helper in [
+        "async fn current_clone_pool_run_or_record_stale",
+        "async fn current_pool_run_allows_side_effects",
+        "async fn claim_clone_compatibility",
+        "async fn mark_clone_compatibility_accepted",
+        "async fn mark_clone_compatibility_rejected",
+        "async fn mark_clone_compatibility_failed",
+        "pub async fn insert_clone_visual_reference_for_accepted_global_reference",
+        "async fn schedule_compatibility_wave",
+        "async fn mark_pool_status",
+    ] {
+        let body = source
+            .split(helper)
+            .nth(1)
+            .and_then(|section| section.split("async fn ").next())
+            .unwrap_or_else(|| source.split(helper).nth(1).expect(helper));
+        assert!(body.contains("current_selected_hash: &str"), "{helper}");
+        assert!(body.contains("json!(current_selected_hash)"), "{helper}");
+    }
+}
+
+#[test]
+fn clone_visible_insert_sql_is_current_hash_nonstale_guarded() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let queued_sql = source
+        .split("fn insert_queued_clone_compatibility_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn increment_clone_compatibility_attempt_sql").next())
+        .expect("queued compatibility insert sql");
+    let visual_sql = source
+        .split("fn insert_clone_visual_reference_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn active_clone_visual_reference_for_accepted_global_reference_sql")
+                .next()
+        })
+        .expect("clone visual reference insert sql");
+    let inspiration_sql = source
+        .split("fn insert_clone_inspiration_pool_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn active_clone_reference_count_for_current_selection_sql")
+                .next()
+        })
+        .expect("clone inspiration pool insert sql");
+    let schedule_body =
+        reference_pipeline_function_body(source, "async fn schedule_compatibility_wave");
+    let accepted_body = reference_pipeline_function_body(
+        source,
+        "pub async fn insert_clone_visual_reference_for_accepted_global_reference",
+    );
+
+    for sql in [queued_sql, visual_sql, inspiration_sql] {
+        assert!(sql.contains("clone_reference_state crs"));
+        assert!(sql.contains("clone_pool_runs cpr"));
+        assert!(sql.contains("crs.user_id = ?"));
+        assert!(sql.contains("crs.clone_id = ?"));
+        assert!(sql.contains("crs.current_pool_run_id = ?"));
+        assert!(sql.contains("crs.selected_moodboard_hash = cpr.selected_moodboard_hash"));
+        assert!(sql.contains(
+            "cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+        ));
+        assert!(sql.contains("cpr.updated_at > ?"));
+    }
+
+    assert!(schedule_body.contains("stale_cutoff"));
+    assert!(schedule_body.contains("json!(stale_cutoff)"));
+    assert!(accepted_body.matches("json!(stale_cutoff)").count() >= 2);
 }
 
 #[test]
@@ -722,6 +1211,57 @@ fn clone_compatibility_claim_uses_exclusive_retry_lease_token() {
         assert!(sql.contains("AND attempt_count = ?"), "{marker}");
         assert!(sql.contains("AND next_retry_at = ?"), "{marker}");
     }
+}
+
+#[test]
+fn clone_compatibility_claim_sql_is_current_nonstale_pool_guarded() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let insert_sql = source
+        .split("fn insert_or_claim_clone_compatibility_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn insert_queued_clone_compatibility_sql")
+                .next()
+        })
+        .expect("clone compatibility insert sql");
+    let increment_sql = source
+        .split("fn increment_clone_compatibility_attempt_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn load_claimed_clone_compatibility_attempt_sql")
+                .next()
+        })
+        .expect("clone compatibility increment sql");
+    let claim_helper = source
+        .split("async fn claim_clone_compatibility")
+        .nth(1)
+        .and_then(|section| section.split("async fn load_global_reference_for_compatibility").next())
+        .expect("clone compatibility claim helper");
+    let validate_body =
+        reference_pipeline_function_body(source, "pub async fn validate_clone_compatibility");
+
+    for sql in [insert_sql, increment_sql] {
+        assert!(sql.contains("clone_reference_state crs"));
+        assert!(sql.contains("clone_pool_runs cpr"));
+        assert!(sql.contains("crs.user_id = ?"));
+        assert!(sql.contains("crs.clone_id = ?"));
+        assert!(sql.contains("crs.current_pool_run_id = ?"));
+        assert!(sql.contains("crs.selected_moodboard_hash = cpr.selected_moodboard_hash"));
+        assert!(sql.contains(
+            "cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+        ));
+        assert!(sql.contains("cpr.updated_at > ?"));
+    }
+
+    assert!(claim_helper.contains("user_id: &str"));
+    assert!(claim_helper.contains("pool_run_id: &str"));
+    assert!(claim_helper.contains("stale_cutoff: &str"));
+    assert!(validate_body.contains("claim_clone_compatibility("));
+    assert!(validate_body.contains("current_clone_pool_run_or_record_stale("));
+    assert!(validate_body.contains("must_not_mutate_clone_visible_state_from_stale_pool();"));
+    assert!(validate_body.contains("return Ok(());"));
 }
 
 #[test]
@@ -6486,12 +7026,139 @@ fn global_finalization_wakes_waiting_and_passive_insufficient_pools_by_index() {
 #[test]
 fn global_finalization_marks_waiting_rows_resumed_insufficient_or_superseded() {
     let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let resumed_sql = queue
+        .split("fn mark_waiting_rows_resumed_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn mark_waiting_rows_insufficient_sql()").next())
+        .expect("mark waiting rows resumed sql");
+    let resumed_helper =
+        reference_pipeline_function_body(queue, "async fn mark_waiting_rows_resumed");
+    let wakeup_body =
+        reference_pipeline_function_body(queue, "async fn wake_clone_pools_for_impacted_slug");
+
     assert!(queue.contains("mark_waiting_rows_resumed_sql"));
     assert!(queue.contains("status = 'resumed'"));
     assert!(queue.contains("mark_waiting_rows_insufficient_sql"));
     assert!(queue.contains("status = 'insufficient'"));
     assert!(queue.contains("mark_waiting_rows_superseded_sql"));
     assert!(queue.contains("status = 'superseded'"));
+    assert!(resumed_sql.contains("EXISTS ("));
+    assert!(resumed_sql.contains("FROM clone_reference_state crs"));
+    assert!(resumed_sql.contains("INNER JOIN clone_pool_runs cpr"));
+    assert!(resumed_sql.contains("crs.current_pool_run_id = clone_pool_waiting_moodboards.pool_run_id"));
+    assert!(resumed_sql.contains("crs.selected_moodboard_hash = cpr.selected_moodboard_hash"));
+    assert!(resumed_sql.contains("cpr.selected_moodboard_hash = ?"));
+    assert!(resumed_sql.contains(
+        "crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
+    assert!(resumed_sql.contains(
+        "cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
+    assert!(resumed_sql.contains(
+        "crs.status = 'insufficient_refs' AND cpr.status = 'insufficient_refs'"
+    ));
+    assert!(resumed_sql.contains("cp.status = 'active'"));
+    assert!(resumed_sql.contains("cp.soul_status IN ('ready', 'completed')"));
+    assert!(resumed_sql.contains("mb.selected = 1"));
+    assert!(resumed_sql.contains("gmd.status = 'active'"));
+    assert!(resumed_helper.contains("current_selected_moodboard_hash: &str"));
+    assert!(resumed_helper.contains("json!(current_selected_moodboard_hash)"));
+    assert!(wakeup_body.contains(
+        "mark_waiting_rows_resumed(db, &row, &current_selected_moodboard_hash, now)"
+    ));
+}
+
+#[test]
+fn global_finalization_insufficient_updates_pool_run_for_passive_wakeability() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let state_sql = queue
+        .split("fn mark_clone_pool_insufficient_from_global_finalization_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section.split("fn mark_clone_pool_run_insufficient_from_global_finalization_sql")
+                .next()
+        })
+        .expect("global finalization clone state insufficient SQL");
+    let pool_sql = queue
+        .split("fn mark_clone_pool_run_insufficient_from_global_finalization_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn retryable_global_work_for_user_selection_sql").next())
+        .expect("global finalization clone pool run insufficient SQL");
+    let waiting_upsert_sql = queue
+        .split("fn upsert_clone_pool_waiting_insufficient_from_global_finalization_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section.split("fn retryable_global_work_for_user_selection_sql")
+                .next()
+        })
+        .expect("global finalization waiting row upsert SQL");
+    let helper_body = reference_pipeline_function_body(
+        queue,
+        "async fn mark_clone_pool_insufficient_from_global_finalization",
+    );
+    let wakeup_body =
+        reference_pipeline_function_body(queue, "async fn wake_clone_pools_for_impacted_slug");
+
+    assert!(state_sql.contains("UPDATE clone_reference_state"));
+    assert!(state_sql.contains("waiting_moodboard_slugs_json = ?"));
+    assert!(state_sql.contains(
+        "status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
+    assert!(state_sql.contains("crs.selected_moodboard_hash = cpr.selected_moodboard_hash"));
+    assert!(state_sql.contains("cpr.selected_moodboard_hash = ?"));
+    assert!(pool_sql.contains("UPDATE clone_pool_runs"));
+    assert!(pool_sql.contains("status = 'insufficient_refs'"));
+    assert!(pool_sql.contains("waiting_moodboard_slugs_json = ?"));
+    assert!(pool_sql.contains("completed_at = ?"));
+    assert!(pool_sql.contains(
+        "status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
+    assert!(pool_sql.contains("crs.current_pool_run_id = clone_pool_runs.id"));
+    assert!(
+        pool_sql.contains("crs.selected_moodboard_hash = clone_pool_runs.selected_moodboard_hash")
+    );
+    assert!(pool_sql.contains("clone_pool_runs.selected_moodboard_hash = ?"));
+    assert!(waiting_upsert_sql.contains("FROM clone_reference_state crs"));
+    assert!(waiting_upsert_sql.contains("crs.current_pool_run_id = clone_pool_waiting_moodboards.pool_run_id"));
+    assert!(waiting_upsert_sql.contains("crs.selected_moodboard_hash = cpr.selected_moodboard_hash"));
+    assert!(waiting_upsert_sql.contains("cpr.selected_moodboard_hash = ?"));
+    assert!(waiting_upsert_sql.contains("INSERT INTO clone_pool_waiting_moodboards"));
+    assert!(waiting_upsert_sql.contains("ON CONFLICT(pool_run_id, moodboard_slug) DO UPDATE SET"));
+    assert!(waiting_upsert_sql.contains("status = 'insufficient'"));
+    assert!(waiting_upsert_sql.contains("status IN ('waiting', 'insufficient', 'resumed')"));
+    assert!(!waiting_upsert_sql.contains("'superseded'"));
+    assert!(helper_body.contains("selected_active_moodboard_slugs_for_user"));
+    assert!(helper_body.contains("current_selected_hash: &str"));
+    assert!(helper_body.contains("selected_moodboard_hash(&waiting_slugs)"));
+    assert!(helper_body.contains("current_waiting_hash != current_selected_hash"));
+    assert!(helper_body.contains("json!(waiting_slugs).to_string()"));
+    assert!(helper_body.contains("mark_clone_pool_run_insufficient_from_global_finalization_sql"));
+    assert!(helper_body.contains("json!(current_selected_hash)"));
+    assert!(helper_body.contains("WorkerResult<bool>"));
+    assert!(helper_body.contains("let pool_result = db::run"));
+    assert!(helper_body.contains("if changed_rows(&pool_result)? == 0"));
+    assert!(helper_body.contains("let state_result = db::run"));
+    assert!(helper_body.contains("if changed_rows(&state_result)? == 0"));
+    assert!(helper_body.contains("for moodboard_slug in waiting_slugs.iter()"));
+    assert!(
+        helper_body.contains("upsert_clone_pool_waiting_insufficient_from_global_finalization_sql")
+    );
+    let pool_transition = helper_body
+        .find("mark_clone_pool_run_insufficient_from_global_finalization_sql")
+        .expect("pool transition write");
+    let state_transition = helper_body
+        .find("mark_clone_pool_insufficient_from_global_finalization_sql")
+        .expect("state transition write");
+    let waiting_upsert = helper_body
+        .find("upsert_clone_pool_waiting_insufficient_from_global_finalization_sql")
+        .expect("waiting row upsert");
+    assert!(pool_transition < waiting_upsert);
+    assert!(state_transition < waiting_upsert);
+    assert!(wakeup_body.contains("row.pool_status.as_deref() == Some(\"insufficient_refs\")"));
+    assert!(wakeup_body.contains("pool_is_stale && !passive_insufficient_waiting_row_is_wakeable"));
+    assert!(wakeup_body.contains("if mark_clone_pool_insufficient_from_global_finalization"));
+    assert!(wakeup_body.contains("&current_selected_moodboard_hash"));
+    assert!(wakeup_body.contains("mark_waiting_rows_insufficient"));
 }
 
 #[test]
@@ -6579,4 +7246,153 @@ fn global_wakeup_candidates_are_not_inner_filtered_before_supersession() {
     assert!(wakeup_body.contains("pool_selected_moodboard_hash"));
     assert!(wakeup_body.contains("current_selected_moodboard_hash"));
     assert!(wakeup_body.contains("mark_waiting_rows_superseded"));
+}
+
+#[test]
+fn passive_insufficient_waiting_rows_are_wakeable_when_current_hash_valid() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let wakeup_body =
+        reference_pipeline_function_body(queue, "async fn wake_clone_pools_for_impacted_slug");
+
+    assert!(wakeup_body.contains("passive_insufficient_waiting_row_is_wakeable"));
+    assert!(wakeup_body.contains("row.waiting_status.as_str() == \"insufficient\""));
+    assert!(wakeup_body.contains("row.pool_status.as_deref() == Some(\"insufficient_refs\")"));
+    assert!(wakeup_body.contains("!passive_insufficient_waiting_row_is_wakeable"));
+    assert!(wakeup_body.contains("pool_is_stale && !passive_insufficient_waiting_row_is_wakeable"));
+}
+
+#[test]
+fn clone_pool_waiting_upsert_revives_same_run_resumed_rows_only() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let waiting_sql = source
+        .split("fn insert_clone_pool_waiting_moodboard_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn mark_unclaimed_clone_pool_run_superseded_sql").next())
+        .expect("clone pool waiting moodboard upsert SQL");
+
+    assert!(waiting_sql.contains("ON CONFLICT(pool_run_id, moodboard_slug)"));
+    assert!(waiting_sql.contains("status IN ('waiting', 'insufficient', 'resumed')"));
+    assert!(!waiting_sql.contains("'superseded'"));
+}
+
+#[test]
+fn passive_insufficient_wakeup_requires_state_and_pool_hash_match() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let wakeup_body =
+        reference_pipeline_function_body(queue, "async fn wake_clone_pools_for_impacted_slug");
+
+    assert!(wakeup_body.contains(
+        "row.selected_moodboard_hash.as_deref()\n                != Some(current_selected_moodboard_hash.as_str())"
+    ));
+    assert!(wakeup_body.contains(
+        "row.pool_selected_moodboard_hash.as_deref()\n                != Some(current_selected_moodboard_hash.as_str())"
+    ));
+    assert!(wakeup_body.contains("passive_insufficient_waiting_row_is_wakeable"));
+}
+
+#[test]
+fn clone_pool_build_writes_waiting_and_passive_insufficient_rows() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("insert_clone_pool_waiting_moodboard_sql"));
+    assert!(source.contains("status = 'waiting'"));
+    assert!(source.contains("status = 'insufficient'"));
+    assert!(source.contains("clone_pool_waiting_moodboards"));
+    assert!(source.contains("UNIQUE(pool_run_id, moodboard_slug)"));
+    assert!(source.contains("global_refs_for_pool_min"));
+    assert!(source.contains("GlobalTopupSummary"));
+    assert!(source.contains("waiting_for_global_library"));
+    assert!(source.contains("insufficient_refs"));
+}
+
+#[test]
+fn clone_pool_topup_treats_refreshing_global_runs_as_active() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let helper = source
+        .split("async fn current_global_topup_run_is_active")
+        .nth(1)
+        .and_then(|section| section.split("async fn global_topup_next_retry_is_blocked").next())
+        .expect("current global topup run active helper");
+
+    assert!(helper.contains("\"refreshing\""));
+}
+
+#[test]
+fn clone_pool_topup_blocks_discovery_failed_retry_gate() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let helper = source
+        .split("async fn global_topup_next_retry_is_blocked")
+        .nth(1)
+        .and_then(|section| section.split("async fn eligible_global_topup_work_exists").next())
+        .expect("global topup retry gate helper");
+
+    assert!(helper.contains("\"discovery_failed\""));
+    assert!(source.contains("blocked_or_exhausted_slugs"));
+}
+
+#[test]
+fn clone_pool_topup_eligible_work_includes_due_reviewing_and_cleaning_candidates() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let eligible_sql = source
+        .split("fn eligible_global_topup_work_sql()")
+        .nth(1)
+        .and_then(|section| section.split("pub async fn build_or_refresh_clone_pool").next())
+        .expect("eligible global topup work sql");
+    let helper = source
+        .split("async fn eligible_global_topup_work_exists")
+        .nth(1)
+        .and_then(|section| section.split("pub fn add_minutes_iso").next())
+        .expect("eligible global topup work helper");
+
+    assert!(eligible_sql.contains("review_status = 'reviewing'"));
+    assert!(eligible_sql.contains("review_locked_until IS NOT NULL"));
+    assert!(eligible_sql.contains("review_locked_until <= ?"));
+    assert!(eligible_sql.contains("review_attempt_count < ?"));
+    assert!(eligible_sql.contains("review_status = 'approved'"));
+    assert!(eligible_sql.contains("cleanup_status = 'cleaning'"));
+    assert!(eligible_sql.contains("cleanup_next_retry_at IS NULL OR cleanup_next_retry_at <= ?"));
+    assert!(helper.matches("json!(now)").count() >= 5);
+    assert!(helper.matches("json!(review_retry_limit)").count() >= 2);
+}
+
+#[test]
+fn clone_pool_topup_checks_eligible_work_before_retry_gate() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let body = source
+        .split("async fn enqueue_global_topups_for_underfilled_selected_slugs")
+        .nth(1)
+        .and_then(|section| section.split("async fn active_global_reference_count").next())
+        .expect("global topup classification helper");
+    let eligible_check = body
+        .find("let eligible_global_work_exists = eligible_global_topup_work_exists")
+        .expect("eligible work must be evaluated before retry gate");
+    let retry_gate = body
+        .find("global_topup_next_retry_is_blocked")
+        .expect("retry gate should still exist");
+    let blocked_condition = body
+        .find("if !eligible_global_work_exists")
+        .expect("retry gate should be conditional on no eligible work");
+
+    assert!(eligible_check < retry_gate);
+    assert!(blocked_condition < retry_gate);
+    assert!(body.contains("summary.active_or_started_run_slugs.push(slug.clone())"));
+}
+
+#[test]
+fn stale_clone_pool_messages_write_audit_only_rows() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("current_clone_pool_run_guard_sql"));
+    assert!(source.contains("record_stale_clone_compatibility_attempt_sql"));
+    assert!(source.contains("status = 'stale_ignored'"));
+    assert!(source.contains("return Ok(())"));
+    assert!(source.contains("must_not_mutate_clone_visible_state_from_stale_pool"));
+}
+
+#[test]
+fn clone_pool_stops_new_waves_after_ready_and_cancels_unstarted_reservations() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("cancel_unstarted_pool_reservations"));
+    assert!(source.contains("pool_ready"));
+    assert!(source.contains("active_clone_reference_count_for_current_selection_sql"));
+    assert!(source.contains("clone_pool_global_reference_review_limit"));
+    assert!(source.contains("clone_pool_compatibility_wave_size"));
 }

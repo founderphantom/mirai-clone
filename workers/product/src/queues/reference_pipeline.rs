@@ -242,15 +242,25 @@ async fn handle_message(
             user_id,
             clone_id,
             reason,
-            ..
+            wakeup_moodboard_slug,
+        } => {
+            crate::services::clone_reference_pool::build_or_refresh_clone_pool(
+                db,
+                env,
+                &user_id,
+                &clone_id,
+                &reason,
+                wakeup_moodboard_slug.as_deref(),
+            )
+            .await
         }
-        | ReferencePipelineMessage::RefreshPool {
+        ReferencePipelineMessage::RefreshPool {
             user_id,
             clone_id,
             reason,
         } => {
             crate::services::clone_reference_pool::build_or_refresh_clone_pool(
-                db, env, &user_id, &clone_id, &reason,
+                db, env, &user_id, &clone_id, &reason, None,
             )
             .await
         }
@@ -2141,6 +2151,45 @@ fn mark_waiting_rows_resumed_sql() -> &'static str {
       AND pool_run_id = ?
       AND moodboard_slug = ?
       AND status IN ('waiting', 'insufficient')
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_runs cpr
+          ON cpr.id = clone_pool_waiting_moodboards.pool_run_id
+         AND cpr.user_id = clone_pool_waiting_moodboards.user_id
+         AND cpr.clone_id = clone_pool_waiting_moodboards.clone_id
+        INNER JOIN clone_profiles cp
+          ON cp.user_id = clone_pool_waiting_moodboards.user_id
+         AND cp.id = clone_pool_waiting_moodboards.clone_id
+        INNER JOIN moodboards mb
+          ON mb.user_id = clone_pool_waiting_moodboards.user_id
+         AND mb.slug = clone_pool_waiting_moodboards.moodboard_slug
+        INNER JOIN global_moodboard_definitions gmd
+          ON gmd.slug = clone_pool_waiting_moodboards.moodboard_slug
+        WHERE crs.user_id = clone_pool_waiting_moodboards.user_id
+          AND crs.clone_id = clone_pool_waiting_moodboards.clone_id
+          AND crs.current_pool_run_id = clone_pool_waiting_moodboards.pool_run_id
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+          AND (
+            (
+              crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+              AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+            )
+            OR (
+              crs.status = 'insufficient_refs' AND cpr.status = 'insufficient_refs'
+              AND clone_pool_waiting_moodboards.status = 'insufficient'
+            )
+          )
+          AND cp.deleted_at IS NULL
+          AND cp.status = 'active'
+          AND cp.soul_status IN ('ready', 'completed')
+          AND cp.provider_soul_id IS NOT NULL
+          AND TRIM(cp.provider_soul_id) <> ''
+          AND mb.selected = 1
+          AND gmd.status = 'active'
+        LIMIT 1
+      )
     "#
 }
 
@@ -2171,13 +2220,96 @@ fn mark_waiting_rows_superseded_sql() -> &'static str {
 
 fn mark_clone_pool_insufficient_from_global_finalization_sql() -> &'static str {
     r#"
-    UPDATE clone_reference_state
+    UPDATE clone_reference_state AS crs
     SET status = 'insufficient_refs',
+        waiting_moodboard_slugs_json = ?,
         last_insufficient_at = ?,
         updated_at = ?
-    WHERE user_id = ?
+    WHERE crs.user_id = ?
+      AND crs.clone_id = ?
+      AND crs.current_pool_run_id = ?
+      AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND EXISTS (
+        SELECT 1
+        FROM clone_pool_runs cpr
+        WHERE cpr.id = crs.current_pool_run_id
+          AND cpr.user_id = crs.user_id
+          AND cpr.clone_id = crs.clone_id
+          AND cpr.status = 'insufficient_refs'
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+        LIMIT 1
+      )
+    "#
+}
+
+fn mark_clone_pool_run_insufficient_from_global_finalization_sql() -> &'static str {
+    r#"
+    UPDATE clone_pool_runs
+    SET status = 'insufficient_refs',
+        waiting_moodboard_slugs_json = ?,
+        updated_at = ?,
+        completed_at = ?
+    WHERE id = ?
+      AND user_id = ?
       AND clone_id = ?
-      AND current_pool_run_id = ?
+      AND status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      AND clone_pool_runs.selected_moodboard_hash = ?
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        WHERE crs.user_id = clone_pool_runs.user_id
+          AND crs.clone_id = clone_pool_runs.clone_id
+          AND crs.current_pool_run_id = clone_pool_runs.id
+          AND crs.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+          AND crs.selected_moodboard_hash = clone_pool_runs.selected_moodboard_hash
+      )
+    "#
+}
+
+fn upsert_clone_pool_waiting_insufficient_from_global_finalization_sql() -> &'static str {
+    r#"
+    INSERT INTO clone_pool_waiting_moodboards (
+      id, user_id, clone_id, pool_run_id, moodboard_slug,
+      status, created_at, resolved_at
+    )
+    SELECT ?, ?, ?, ?, ?, 'insufficient', ?, NULL
+    WHERE EXISTS (
+      SELECT 1
+      FROM clone_reference_state crs
+      INNER JOIN clone_pool_runs cpr
+        ON cpr.id = crs.current_pool_run_id
+       AND cpr.clone_id = crs.clone_id
+      WHERE crs.user_id = ?
+        AND crs.clone_id = ?
+        AND crs.current_pool_run_id = ?
+        AND cpr.id = ?
+        AND crs.status = 'insufficient_refs'
+        AND cpr.status = 'insufficient_refs'
+        AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+        AND cpr.selected_moodboard_hash = ?
+      LIMIT 1
+    )
+    ON CONFLICT(pool_run_id, moodboard_slug) DO UPDATE SET
+      status = 'insufficient',
+      resolved_at = NULL
+    WHERE clone_pool_waiting_moodboards.status IN ('waiting', 'insufficient', 'resumed')
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_runs cpr
+          ON cpr.id = crs.current_pool_run_id
+         AND cpr.clone_id = crs.clone_id
+        WHERE crs.user_id = clone_pool_waiting_moodboards.user_id
+          AND crs.clone_id = clone_pool_waiting_moodboards.clone_id
+          AND crs.current_pool_run_id = clone_pool_waiting_moodboards.pool_run_id
+          AND cpr.id = clone_pool_waiting_moodboards.pool_run_id
+          AND crs.status = 'insufficient_refs'
+          AND cpr.status = 'insufficient_refs'
+          AND crs.selected_moodboard_hash = cpr.selected_moodboard_hash
+          AND cpr.selected_moodboard_hash = ?
+        LIMIT 1
+      )
     "#
 }
 
@@ -3517,15 +3649,20 @@ async fn wake_clone_pools_for_impacted_slug(
                 )
             })
             .unwrap_or(false);
+        let passive_insufficient_waiting_row_is_wakeable =
+            row.waiting_status.as_str() == "insufficient"
+                && row.pool_status.as_deref() == Some("insufficient_refs");
 
         if row.current_pool_run_id.as_deref() != Some(row.pool_run_id.as_str())
             || row.clone_is_ready == 0
             || row.moodboard_is_selected == 0
             || row.global_definition_is_active == 0
+            || row.selected_moodboard_hash.as_deref()
+                != Some(current_selected_moodboard_hash.as_str())
             || row.pool_selected_moodboard_hash.as_deref()
                 != Some(current_selected_moodboard_hash.as_str())
-            || !pool_is_active
-            || pool_is_stale
+            || (!pool_is_active && !passive_insufficient_waiting_row_is_wakeable)
+            || (pool_is_stale && !passive_insufficient_waiting_row_is_wakeable)
         {
             mark_waiting_rows_superseded(db, &row, now).await?;
             continue;
@@ -3571,7 +3708,7 @@ async fn wake_clone_pools_for_impacted_slug(
             )
             .await?;
             if outcome == ReservationOutcome::Reserved {
-                mark_waiting_rows_resumed(db, &row, now).await?;
+                mark_waiting_rows_resumed(db, &row, &current_selected_moodboard_hash, now).await?;
             }
         } else if !retryable_global_work_exists_for_user_selection(
             db,
@@ -3581,8 +3718,16 @@ async fn wake_clone_pools_for_impacted_slug(
         )
         .await?
         {
-            mark_clone_pool_insufficient_from_global_finalization(db, &row, now).await?;
-            mark_waiting_rows_insufficient(db, &row).await?;
+            if mark_clone_pool_insufficient_from_global_finalization(
+                db,
+                &row,
+                &current_selected_moodboard_hash,
+                now,
+            )
+            .await?
+            {
+                mark_waiting_rows_insufficient(db, &row).await?;
+            }
         }
     }
 
@@ -3592,6 +3737,7 @@ async fn wake_clone_pools_for_impacted_slug(
 async fn mark_waiting_rows_resumed(
     db: &D1Database,
     row: &ClonePoolWakeupCandidateRow,
+    current_selected_moodboard_hash: &str,
     now: &str,
 ) -> WorkerResult<()> {
     db::exec(
@@ -3603,6 +3749,7 @@ async fn mark_waiting_rows_resumed(
             json!(row.clone_id.as_str()),
             json!(row.pool_run_id.as_str()),
             json!(row.moodboard_slug.as_str()),
+            json!(current_selected_moodboard_hash),
         ],
     )
     .await
@@ -3646,20 +3793,86 @@ async fn mark_waiting_rows_superseded(
 async fn mark_clone_pool_insufficient_from_global_finalization(
     db: &D1Database,
     row: &ClonePoolWakeupCandidateRow,
+    current_selected_hash: &str,
     now: &str,
-) -> WorkerResult<()> {
-    db::exec(
+) -> WorkerResult<bool> {
+    let mut waiting_slugs = selected_active_moodboard_slugs_for_user(db, &row.user_id).await?;
+    if !waiting_slugs
+        .iter()
+        .any(|slug| slug.as_str() == row.moodboard_slug.as_str())
+    {
+        waiting_slugs.push(row.moodboard_slug.clone());
+        waiting_slugs.sort();
+        waiting_slugs.dedup();
+    }
+    let current_waiting_hash = selected_moodboard_hash(&waiting_slugs);
+    if current_waiting_hash != current_selected_hash {
+        return Ok(false);
+    }
+    let waiting_slugs_json = json!(waiting_slugs).to_string();
+
+    let pool_result = db::run(
+        db,
+        mark_clone_pool_run_insufficient_from_global_finalization_sql(),
+        vec![
+            json!(waiting_slugs_json.clone()),
+            json!(now),
+            json!(now),
+            json!(row.pool_run_id.as_str()),
+            json!(row.user_id.as_str()),
+            json!(row.clone_id.as_str()),
+            json!(current_selected_hash),
+        ],
+    )
+    .await?;
+    if changed_rows(&pool_result)? == 0 {
+        return Ok(false);
+    }
+
+    let state_result = db::run(
         db,
         mark_clone_pool_insufficient_from_global_finalization_sql(),
         vec![
+            json!(waiting_slugs_json),
             json!(now),
             json!(now),
             json!(row.user_id.as_str()),
             json!(row.clone_id.as_str()),
             json!(row.pool_run_id.as_str()),
+            json!(current_selected_hash),
         ],
     )
-    .await
+    .await?;
+    if changed_rows(&state_result)? == 0 {
+        return Ok(false);
+    }
+
+    for moodboard_slug in waiting_slugs.iter() {
+        db::exec(
+            db,
+            upsert_clone_pool_waiting_insufficient_from_global_finalization_sql(),
+            vec![
+                json!(format!(
+                    "clone_pool_waiting_{}",
+                    uuid::Uuid::new_v4().simple()
+                )),
+                json!(row.user_id.as_str()),
+                json!(row.clone_id.as_str()),
+                json!(row.pool_run_id.as_str()),
+                json!(moodboard_slug),
+                json!(now),
+                json!(row.user_id.as_str()),
+                json!(row.clone_id.as_str()),
+                json!(row.pool_run_id.as_str()),
+                json!(row.pool_run_id.as_str()),
+                json!(current_selected_hash),
+                json!(current_selected_hash),
+            ],
+        )
+        .await?;
+    }
+
+    Ok(true)
 }
 
 async fn selected_active_moodboard_slugs_for_user(
