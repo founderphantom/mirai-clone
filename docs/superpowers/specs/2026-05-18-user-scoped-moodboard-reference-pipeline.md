@@ -224,6 +224,10 @@ Default global discovery caps should remain configurable:
 - `global_refs_per_moodboard_target`: `25`
 - `global_refs_per_moodboard_min_ready`: `5`
 - `global_refs_for_pool_min`: `5`
+- `global_library_stale_after_hours`: `168`
+- `global_discovery_run_stale_after_minutes`: `60`
+- `clone_pool_stale_after_hours`: `24`
+- `clone_pool_run_stale_after_minutes`: `30`
 - `instagram_search_terms_per_moodboard`: `2`
 - `instagram_reels_pages_per_term`: `1`
 - `instagram_reels_date_windows_json`: `["last-month", "last-year"]`
@@ -257,6 +261,29 @@ candidate count meets `global_refs_for_pool_min`. The empty or underfilled slugs
 should still enqueue global top-up discovery. Diversity caps later prevent
 overusing one moodboard when other compatible references exist, but they must not
 block a usable partial pool when global supply is uneven.
+
+Stale thresholds:
+
+- A global moodboard library is stale when its
+  `global_moodboard_reference_state.last_ready_at` is older than
+  `global_library_stale_after_hours`.
+- A global discovery run is stale when it is still in `queued`, `scraping`,
+  `reviewing`, or `cleaning` and `updated_at` is older than
+  `global_discovery_run_stale_after_minutes`.
+- A clone pool is stale when `clone_reference_state.last_ready_at` is older than
+  `clone_pool_stale_after_hours`, the selected moodboard hash has changed, or
+  the active pool is depleted.
+- A clone pool run is stale when it is still in `queued`,
+  `waiting_for_global_library`, or `compatibility_reviewing` and `updated_at` is
+  older than `clone_pool_run_stale_after_minutes`.
+
+Scheduler triggers:
+
+- A periodic background worker should enqueue `EnsureGlobalMoodboardLibrary` for
+  active moodboard definitions whose global library is under target or stale.
+- Opening Blitz or saving moodboards should enqueue clone pool build when a ready
+  clone has no pool, a depleted pool, a stale pool, or a selected moodboard hash
+  mismatch.
 
 ## Source Rotation and De-Dupe
 
@@ -584,6 +611,7 @@ Recommended schema:
   - one row per `pool_run_id + moodboard_slug`
   - fields: `user_id`, `clone_id`, `pool_run_id`, `moodboard_slug`, `status`,
     `created_at`, `resolved_at`
+  - required uniqueness: `UNIQUE(pool_run_id, moodboard_slug)`
   - indexes: `(moodboard_slug, status)`, `(clone_id, pool_run_id)`, and
     `(user_id, status)`
 - `visual_references`
@@ -622,6 +650,7 @@ when all of these are true:
   `global_moodboard_references` row
 - `clone_visual_reference_compatibility` has `status = 'accepted'` for the same
   `clone_id + global_reference_id`
+- `visual_references.media_asset_id = global_moodboard_references.media_asset_id`
 - `media_assets.id = global_moodboard_references.media_asset_id`
 - `media_assets.clone_id IS NULL`
 
@@ -705,11 +734,11 @@ User messages:
 
 Clone-scoped messages:
 
-- `BuildCloneReferencePool { user_id, clone_id, pool_run_id, reason }`
+- `BuildCloneReferencePool { user_id, clone_id, reason }`
+- `RefreshPool { user_id, clone_id, reason }`
 - `ValidateCloneCompatibility { user_id, clone_id, pool_run_id,
   global_reference_id }`
 - `FinalizeCloneReferencePool { user_id, clone_id, pool_run_id, reason }`
-- `RefreshPool { user_id, clone_id, pool_run_id, reason }`
 
 Rules:
 
@@ -717,11 +746,18 @@ Rules:
 - Global source reservation params must not include `userId` or `cloneId`.
 - `EnsureGlobalMoodboardLibrary` is the only global message that does not carry
   a `run_id`.
-- `EnsureGlobalMoodboardLibrary` creates or reuses the current
+- `EnsureGlobalMoodboardLibrary` creates, reuses, or supersedes the current
   `global_moodboard_source_runs` row before enqueueing downstream work, stores
   the selected run ID as `global_moodboard_reference_state.current_run_id`, and
   passes that `run_id` to every downstream global message.
 - Every downstream global message must carry the same global `run_id`.
+- `BuildCloneReferencePool` and `RefreshPool` are kickoff messages and do not
+  carry `pool_run_id`.
+- `BuildCloneReferencePool` and `RefreshPool` create a new `clone_pool_runs`
+  row, store it as `clone_reference_state.current_pool_run_id`, and pass that
+  `pool_run_id` to every downstream clone-pool message.
+- `ValidateCloneCompatibility` and `FinalizeCloneReferencePool` must carry
+  `pool_run_id`.
 - Global handlers must verify the run is still current for that moodboard before
   updating global-visible status.
 - Queue messages from stale global runs must be acked after recording
@@ -749,6 +785,16 @@ Rules:
   library still has zero active references for selected moodboards and no
   retryable global discovery work remains, it should mark those current pool
   runs `insufficient_refs` rather than waiting forever.
+- `clone_pool_waiting_moodboards` transition rules:
+  - insert `waiting` rows when a current clone pool run enters
+    `waiting_for_global_library`
+  - mark rows `resumed` when `FinalizeGlobalMoodboardLibrary` enqueues a fresh
+    `BuildCloneReferencePool` for that clone
+  - mark rows `insufficient` when discovery is exhausted and no global
+    references are available for the selected moodboards
+  - mark rows `superseded` when `clone_reference_state.current_pool_run_id` no
+    longer equals the row's `pool_run_id`, the clone is no longer ready, or the
+    selected moodboard hash has changed
 - Workers AI, ScrapeCreators, Seedream, image fetch, R2, and D1 failures must
   not panic the Worker.
 - Per-candidate failures are recorded and do not fail the whole discovery run.
@@ -874,9 +920,23 @@ or suspected stale, rebuild it from `moodboards.selected`.
 
 Global run behavior:
 
-- Starting global discovery for a moodboard creates a new
-  `global_moodboard_source_runs` row and stores its ID as
+- `EnsureGlobalMoodboardLibrary` reuses the current run when
+  `global_moodboard_reference_state.current_run_id` points to a run for the same
+  moodboard in `queued`, `scraping`, `reviewing`, or `cleaning` and that run is
+  not stale.
+- Duplicate `EnsureGlobalMoodboardLibrary` messages for a nonstale active run
+  must not create another run. They may enqueue missing downstream nudges only
+  through idempotent source/message reservation.
+- `EnsureGlobalMoodboardLibrary` creates a new run when there is no nonstale
+  active current run and the global library is below target, stale, explicitly
+  requested by a waiting clone, or the previous run is terminal.
+- `EnsureGlobalMoodboardLibrary` supersedes a stale active run by creating a new
+  run and moving `global_moodboard_reference_state.current_run_id` to the new
+  run.
+- Creating a new run stores its ID as
   `global_moodboard_reference_state.current_run_id`.
+- When a stale active run is superseded, old messages may finish per-candidate
+  audit writes but must not update current global-visible status.
 - Downstream global messages update global-visible status only when their
   `run_id` still matches `global_moodboard_reference_state.current_run_id` for
   that moodboard slug.
@@ -886,8 +946,8 @@ Global run behavior:
 
 Clone pool behavior:
 
-- Starting or refreshing a clone pool creates a new `clone_pool_runs` row and
-  stores its ID as `clone_reference_state.current_pool_run_id`.
+- `BuildCloneReferencePool` and `RefreshPool` create a new `clone_pool_runs` row
+  and store its ID as `clone_reference_state.current_pool_run_id`.
 - Downstream clone pool messages update clone-visible pool status only when
   their `pool_run_id` still matches
   `clone_reference_state.current_pool_run_id`.
@@ -903,7 +963,8 @@ The clone-specific stage runs when Blitz needs references for a clone:
 
 - after Soul training becomes ready
 - when a user opens Blitz and no active pool exists
-- when a pool is depleted or stale
+- when a pool is depleted or stale by `clone_pool_stale_after_hours`, selected
+  moodboard hash mismatch, or no remaining selectable references
 - after user moodboard selection changes and a ready clone exists
 - after global discovery completes for a selected underfilled moodboard
 
@@ -1122,9 +1183,15 @@ Unit and domain tests should cover:
 - frontend accepts 1-10 selected moodboards, not exactly 5
 - `EnsureGlobalMoodboardLibrary` has no input `runId` and creates or reuses the
   current global run before enqueueing downstream messages
+- duplicate `EnsureGlobalMoodboardLibrary` messages reuse nonstale active runs
+  and supersede terminal or stale runs
 - global discovery queue messages serialize without `userId` or `cloneId`
-- clone-scoped pool messages serialize with `userId`, `cloneId`, and
+- `BuildCloneReferencePool` and `RefreshPool` serialize without `poolRunId` and
+  create the clone pool run before downstream work
+- downstream clone-scoped pool messages serialize with `userId`, `cloneId`, and
   `poolRunId`
+- global library stale and clone pool stale thresholds trigger the configured
+  refresh behavior
 - `moodboards.selected` is canonical selection state and `user_reference_state`
   is rebuilt from it as a derived cache
 - global moodboard definitions sync new active definitions into existing users
@@ -1171,6 +1238,10 @@ Unit and domain tests should cover:
   `global_refs_for_pool_min` active not-yet-rejected global references
 - clone pool waiting wakeups use `clone_pool_waiting_moodboards` indexes, not
   JSON scans
+- `clone_pool_waiting_moodboards` enforces
+  `UNIQUE(pool_run_id, moodboard_slug)`
+- `clone_pool_waiting_moodboards` rows transition to `resumed`,
+  `insufficient`, or `superseded` under the specified conditions
 - clone pool build proceeds while top-up discovery runs when selected moodboards
   are below target but have enough active refs to attempt compatibility
 - clone pool build attempts partial compatibility when discovery is exhausted
@@ -1194,6 +1265,8 @@ Unit and domain tests should cover:
   compatibility before using a global reference
 - generation loaders permit `media_assets.user_id = 'global'` only through an
   active global reference and accepted clone compatibility
+- generation loaders require `visual_references.media_asset_id` to equal
+  `global_moodboard_references.media_asset_id`
 - Blitz selection still reads clone-scoped `visual_references` by `clone_id`
 - Workers AI, ScrapeCreators, Seedream, image fetch, R2, and D1 failures map to
   recorded failure states, not queue panics
