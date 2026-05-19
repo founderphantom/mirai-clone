@@ -180,8 +180,8 @@ After saving selected moodboards, the route should:
 
 Being below `global_refs_per_moodboard_target` is a top-up trigger, not always a
 blocking condition. Clone pool build should continue when the selected
-moodboards can provide at least `global_refs_for_pool_min` active global
-references in aggregate that have not already been rejected for that clone.
+moodboards can provide at least `global_refs_for_pool_min`
+compatibility-actionable global references in aggregate.
 Moodboard diversity is still enforced later by Blitz selection caps when enough
 compatible references exist.
 
@@ -250,6 +250,7 @@ Default global discovery caps should remain configurable:
 - `instagram_min_image_height`: `512`
 - `accepted_refs_per_profile_cap`: `3`
 - `max_accepted_refs_per_global_run`: `50`
+- `visual_reference_review_retry_limit`: `2`
 - `visual_reference_cleanup_retry_limit`: `3`
 - `visual_reference_compatibility_retry_limit`: `2`
 - `clone_compatibility_reference_limit`: `4`
@@ -334,6 +335,11 @@ Handle rotation:
 
 Exhaustion gating:
 
+- Before checking exhaustion, `EnsureGlobalMoodboardLibrary` must initialize
+  missing `global_moodboard_search_state` rows for the moodboard's active
+  `global_moodboard_definitions.search_queries` across configured Reels pages
+  and date windows. Missing search-state rows count as bootstrap work, not
+  exhaustion.
 - `EnsureGlobalMoodboardLibrary` must check for eligible source work before
   creating a new run after `insufficient_refs` or `underfilled_exhausted`.
 - Eligible work exists when at least one selected search term/page/date-window
@@ -341,10 +347,24 @@ Exhaustion gating:
   next_eligible_at <= now`, or at least one handle row in
   `global_moodboard_handles` has `cooldown_until IS NULL OR cooldown_until <=
   now`.
+- Retryable candidate work exists when at least one candidate for the moodboard
+  has `candidate_status = 'active'` and one of these is true:
+  - `review_status IN ('queued', 'reviewing')`
+  - `review_status = 'failed'`, `review_attempt_count` is below the review
+    retry limit from `visual_reference_review_retry_limit`, and
+    `review_next_retry_at IS NULL OR review_next_retry_at <= now`
+  - `review_status = 'approved'` and `cleanup_status IN ('queued', 'cleaning')`
+  - `review_status = 'approved'`, `cleanup_status = 'failed'`,
+    `cleanup_attempt_count < visual_reference_cleanup_retry_limit`, and
+    `cleanup_next_retry_at IS NULL OR cleanup_next_retry_at <= now`
+- Kimi-rejected candidates, `candidate_status IN ('source_unavailable',
+  'review_failed', 'cleanup_failed', 'disabled')`, and cleanup failures with no
+  remaining retry attempts are terminal for global supply and do not count as
+  retryable candidate work.
 - When a global run reaches `insufficient_refs` or `underfilled_exhausted`, set
   `global_moodboard_reference_state.next_retry_at` to the earliest eligible
-  search/handle time. If no source can produce another attempt, set it to
-  `now + global_insufficient_retry_after_hours`.
+  search/handle/candidate retry time. If no source or candidate can produce
+  another attempt, set it to `now + global_insufficient_retry_after_hours`.
 - Scheduler and demand-triggered `EnsureGlobalMoodboardLibrary` must no-op while
   `status IN ('insufficient_refs', 'underfilled_exhausted')`, the library is
   still below target, and `next_retry_at` is in the future.
@@ -661,12 +681,14 @@ Recommended schema:
   - `review_status`
   - `review_run_id`
   - `review_attempt_count`
+  - `review_next_retry_at`
   - `review_claim_id`
   - `review_locked_until`
   - `review_error_code`
   - `review_error_message`
   - `cleanup_status`
   - `cleanup_attempt_count`
+  - `cleanup_next_retry_at`
   - `cleanup_error_code`
   - `cleanup_error_message`
   - `source_error_code`
@@ -933,25 +955,27 @@ Rules:
   not insert or update canonical `clone_visual_reference_compatibility` rows in
   any status. They may record audit-only stale attempt metadata in
   `clone_reference_compatibility_attempts` with `status = 'stale_ignored'`.
-- If selected moodboards do not have enough active global references to attempt
-  compatibility, clone-scoped handlers enqueue `EnsureGlobalMoodboardLibrary`
-  for underfilled slugs. They may mark the clone pool run
-  `waiting_for_global_library` only when at least one selected slug has an
+- If selected moodboards do not have enough compatibility-actionable global
+  references to attempt compatibility, clone-scoped handlers enqueue
+  `EnsureGlobalMoodboardLibrary` for underfilled slugs. They may mark the clone
+  pool run `waiting_for_global_library` only when at least one selected slug has an
   active, queued, or newly created global discovery run that is not blocked by
   `next_retry_at`.
 - If `EnsureGlobalMoodboardLibrary` no-ops because every missing slug is
   exhausted or retry-gated, the clone pool run must not enter
-  `waiting_for_global_library`. If at least one active global reference exists
-  for selected moodboards, attempt compatibility with the smaller candidate set
-  and allow `partial_pool_ready`. If zero active references exist and no global
-  discovery work is queued or retryable, mark the pool run `insufficient_refs`.
+  `waiting_for_global_library`. If at least one compatibility-actionable global
+  reference exists for selected moodboards, attempt compatibility with the
+  smaller candidate set and allow `partial_pool_ready`. If no
+  compatibility-actionable global references exist and no global discovery work
+  is queued or retryable, mark the pool run `insufficient_refs`.
 - If global discovery is exhausted, selected moodboards have fewer than
-  `global_refs_for_pool_min` active references, and at least one active global
-  reference exists, clone pool build should attempt compatibility with the
-  smaller candidate set so Blitz can reach `partial_pool_ready` when possible.
+  `global_refs_for_pool_min` compatibility-actionable references, and at least
+  one compatibility-actionable reference exists, clone pool build should attempt
+  compatibility with the smaller candidate set so Blitz can reach
+  `partial_pool_ready` when possible.
 - If selected moodboards are below the ideal target but still have at least
-  `global_refs_for_pool_min` active not-yet-rejected references, clone pool build
-  should proceed while global discovery runs as background top-up.
+  `global_refs_for_pool_min` compatibility-actionable references, clone pool
+  build should proceed while global discovery runs as background top-up.
 - `FinalizeGlobalMoodboardLibrary` is responsible for resuming deferred clone
   pool work. After a current global run finishes, it must compute impacted slugs:
   the run's discovery `moodboard_slug` plus every Kimi-assigned
@@ -962,29 +986,31 @@ Rules:
   current pool run has `clone_pool_waiting_moodboards.status IN ('waiting',
   'insufficient')` for users who selected that slug, not by scanning JSON.
 - Finalization must reserve/enqueue `BuildCloneReferencePool` wakeup messages
-  when the global library has at least one active reference for the current
-  selected moodboards. The wakeup resumes the existing current pool run when it
-  is still nonstale, current, and has the same selected moodboard hash; it
-  supersedes only when the waiting run is stale, no longer current, or selection
-  changed.
+  when the global library has at least one compatibility-actionable reference
+  for the clone's current selected moodboards. The wakeup resumes the existing
+  current pool run when it is still nonstale, current, and has the same selected
+  moodboard hash; it supersedes only when the waiting run is stale, no longer
+  current, or selection changed.
 - For passive `insufficient` rows, the old pool run is terminal. The wakeup
   should still enqueue `BuildCloneReferencePool`; the kickoff handler creates a
   replacement pool run unless another reusable active run already exists.
 - Cross-routed wakeups are required. If an A run creates a reference assigned to
   B, waiting or passive insufficient clone pools registered for B must be
   considered even if B did not own the source run.
-- Passive insufficient wakeups are required. If a clone pool was marked
-  `insufficient_refs` because every selected slug was exhausted or retry-gated,
-  later references created for an impacted selected slug, including cross-routed
+- Passive insufficient wakeups are required for any terminal
+  `insufficient_refs` pool that could become viable when selected slugs gain new
+  global references, including zero-supply pools and pools where all current
+  global references were terminally rejected for clone compatibility. Later
+  references created for an impacted selected slug, including cross-routed
   references, must re-check that pool through `clone_pool_waiting_moodboards`
   `insufficient` rows and reserve/enqueue `BuildCloneReferencePool` when the
   user still selects the slug and the clone is still ready.
 - If `FinalizeGlobalMoodboardLibrary` finds tracked ready clones but the global
-  library still has zero active references for selected moodboards and no
-  currently retryable global discovery work remains, including when all missing
-  slugs are blocked by future `next_retry_at`, it should mark those current pool
-  runs `insufficient_refs` rather than waiting forever and keep or write passive
-  `insufficient` rows for later wakeup.
+  library still has no compatibility-actionable references for selected
+  moodboards and no currently retryable global discovery work remains, including
+  when all missing slugs are blocked by future `next_retry_at`, it should mark
+  those current pool runs `insufficient_refs` rather than waiting forever and
+  keep or write passive `insufficient` rows for later wakeup.
 - `clone_pool_waiting_moodboards` transition rules:
   - insert `waiting` rows when a current clone pool run enters
     `waiting_for_global_library`
@@ -992,8 +1018,10 @@ Rules:
     a wakeup and the kickoff handler continues the same current pool run, or
     when a passive insufficient row is consumed by a replacement pool kickoff
   - mark rows `insufficient` when discovery is exhausted or retry-gated and no
-    global references are available for the selected moodboards; these rows are
-    passive wakeup indexes and remain queryable until resumed or superseded
+    compatibility-actionable global references are available for the selected
+    moodboards, including when existing refs were all terminally rejected for the
+    clone; these rows are passive wakeup indexes and remain queryable until
+    resumed or superseded
   - mark rows `superseded` when `clone_reference_state.current_pool_run_id` no
     longer equals the row's `pool_run_id`, the clone is no longer ready, or the
     selected moodboard hash has changed
@@ -1190,13 +1218,14 @@ Readiness thresholds:
   Set `last_partial_ready_at` and `last_usable_pool_at`; do not update
   `last_ready_at`.
 - `waiting_for_global_library`: the selected moodboards have fewer than
-  `global_refs_for_pool_min` active not-yet-rejected global references for this
+  `global_refs_for_pool_min` compatibility-actionable global references for this
   clone, and one or more selected moodboards have an active or queued global
   discovery run that is not blocked by `next_retry_at`.
 - `insufficient_refs`: no compatible active clone-scoped references are
-  available after compatibility work is exhausted, and no global discovery work
-  is queued, in progress, or currently retryable for the selected moodboards.
-  Set `last_insufficient_at`; do not update `last_usable_pool_at`.
+  available after compatibility work is exhausted, no
+  compatibility-actionable global references remain, and no global discovery
+  work is queued, in progress, or currently retryable for the selected
+  moodboards. Set `last_insufficient_at`; do not update `last_usable_pool_at`.
 - `pool_failed`: an infrastructure or provider failure prevents pool build from
   making progress and no retryable queue work remains.
 
@@ -1300,7 +1329,7 @@ Inputs:
 - clone ID
 - clone reference images or Soul metadata needed for compatibility review
 - selected active user moodboard slugs
-- active global references for those moodboard slugs
+- active global references and compatibility state for those moodboard slugs
 
 Compatibility checks:
 
@@ -1314,11 +1343,25 @@ The compatibility prompt should reject references that conflict strongly with
 body proportions, hair length, or facial hair. If those are acceptable, gender
 differences should not be used as a rejection reason.
 
+Clone compatibility candidate predicate:
+
+- A global reference is compatibility-actionable for a clone when it is active,
+  belongs to one of the user's current selected active moodboard slugs, and is
+  not terminally rejected or terminally failed for that
+  `clone_id + global_reference_id`.
+- Actionable compatibility work exists when at least one selected global
+  reference has no compatibility row, has `status = 'queued'`, has
+  `status = 'accepted'` but the clone-scoped `visual_references` row is missing,
+  or has `status = 'failed'` with a non-null `next_retry_at` that is due now.
+- `clone_visual_reference_compatibility.status = 'rejected'` is terminal for that
+  clone/reference pair. `failed` with `next_retry_at IS NULL` is also terminal
+  for v1 unless a later repair job explicitly resets it.
+
 If the global library cannot supply enough candidates for pool build:
 
 1. Determine whether selected moodboard slugs have at least
-   `global_refs_for_pool_min` active global references in aggregate that have
-   not already been rejected for this clone.
+   `global_refs_for_pool_min` compatibility-actionable global references in
+   aggregate.
 2. Enqueue `EnsureGlobalMoodboardLibrary` for selected slugs below
    `global_refs_per_moodboard_target`.
 3. If at least one selected slug has an active, queued, reused, or newly created
@@ -1328,19 +1371,23 @@ If the global library cannot supply enough candidates for pool build:
 4. Stop clone compatibility work only for pool runs that entered
    `waiting_for_global_library`.
 5. If every missing slug is exhausted or retry-gated, do not insert waiting
-   rows. Attempt partial compatibility when at least one active global reference
-   exists. If zero active references exist, insert `insufficient` passive wakeup
-   rows into `clone_pool_waiting_moodboards` for selected slugs that lacked
-   supply, then mark the pool run `insufficient_refs`.
-6. When global discovery finalizes, re-check global active reference counts and
-   enqueue a wakeup that resumes the same current pool run when possible,
-   including pools tracked by passive `insufficient` rows.
+   rows. Attempt partial compatibility when at least one
+   compatibility-actionable global reference exists. If no
+   compatibility-actionable global references exist, insert `insufficient`
+   passive wakeup rows into `clone_pool_waiting_moodboards` for selected slugs
+   that could become viable when new global references arrive, then mark the
+   pool run `insufficient_refs`.
+6. When global discovery finalizes, re-check active global reference and
+   compatibility-actionable counts, then enqueue a wakeup that resumes the same
+   current pool run when possible, including pools tracked by passive
+   `insufficient` rows.
 
-If no more global discovery work is possible but at least one active global
-reference exists for selected moodboards, attempt compatibility with that smaller
-candidate set and allow `partial_pool_ready`. If zero active references exist and
-no global discovery work is queued or retryable, mark the pool run
-`insufficient_refs`.
+If no more global discovery work is possible but at least one
+compatibility-actionable global reference exists for selected moodboards, attempt
+compatibility with that smaller candidate set and allow `partial_pool_ready`. If
+no compatibility-actionable global references exist and no global discovery work
+is queued or retryable, write passive `insufficient` wakeup rows and mark the
+pool run `insufficient_refs`.
 
 If the selected moodboards have enough candidates to attempt compatibility but
 one or more slugs are still below `global_refs_per_moodboard_target`, enqueue
@@ -1545,6 +1592,8 @@ Unit and domain tests should cover:
 - Reels search is used for owner-handle discovery
 - Reels thumbnails are not stored as production references
 - global search state rotates moodboard search terms, pages, and date windows
+- `EnsureGlobalMoodboardLibrary` bootstraps missing search-state rows from
+  active moodboard definition search queries before exhaustion checks
 - global handle selection prefers fresh and high-yield handles
 - global handle selection cools down repeated failures and repeated zero-yield
   handles
@@ -1581,6 +1630,8 @@ Unit and domain tests should cover:
   `candidate_status = 'source_unavailable'` and search continues
 - candidate terminal states use `candidate_status`, Kimi review progress uses
   `review_status`, and Seedream cleanup progress uses `cleanup_status`
+- retryable candidate work is defined from `candidate_status`,
+  `review_status`, `cleanup_status`, attempt counts, and next retry timestamps
 - cleanup retries are capped and failed candidates do not block replacements
 - only cleaned images are cached to R2
 - saving moodboards enqueues global discovery for selected underfilled slugs
@@ -1596,11 +1647,12 @@ Unit and domain tests should cover:
   `next_retry_at`
 - clone pool build enqueues global discovery and marks
   `waiting_for_global_library` when selected moodboards have fewer than
-  `global_refs_for_pool_min` active not-yet-rejected global references
+  `global_refs_for_pool_min` compatibility-actionable global references
 - clone pool build does not wait when `EnsureGlobalMoodboardLibrary` no-ops
   because every missing slug is exhausted or retry-gated
 - clone pool build inserts passive `insufficient` wakeup rows when it marks a
-  zero-supply pool `insufficient_refs`
+  terminal pool `insufficient_refs` that could become viable when selected slugs
+  gain new refs
 - clone pool waiting wakeups use `clone_pool_waiting_moodboards` indexes, not
   JSON scans
 - `clone_pool_waiting_moodboards` enforces
@@ -1608,13 +1660,15 @@ Unit and domain tests should cover:
 - `clone_pool_waiting_moodboards` rows transition to `resumed`,
   `insufficient`, or `superseded` under the specified conditions
 - clone pool build proceeds while top-up discovery runs when selected moodboards
-  are below target but have enough active refs to attempt compatibility
+  are below target but have enough compatibility-actionable refs to attempt
+  compatibility
 - clone pool build attempts partial compatibility when discovery is exhausted
-  but at least one active global reference exists for selected moodboards
+  but at least one compatibility-actionable global reference exists for selected
+  moodboards
 - `FinalizeGlobalMoodboardLibrary` resumes tracked ready clone pools or marks
   them insufficient when no references remain possible
 - `FinalizeGlobalMoodboardLibrary` wakes passive insufficient clone pools when
-  later impacted or cross-routed slugs gain active references
+  later impacted or cross-routed slugs gain compatibility-actionable references
 - `FinalizeGlobalMoodboardLibrary` wakeups resume the same current nonstale pool
   run instead of creating a fresh run
 - stale global messages cannot create active global references or reusable
