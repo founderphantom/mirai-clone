@@ -1199,6 +1199,11 @@ Idempotent queue reservations:
   - `clone:<pool_run_id>:finalize`
 - `ReviewGlobalVisualCandidates` is a batch selector message. Its reservation
   key is batch-shaped, not candidate-shaped.
+- Review batch selection must derive candidate IDs from
+  `global_visual_candidate_discoveries.run_id = run_id` plus eligible candidate
+  status. Do not select a run's candidates only from
+  `global_visual_reference_candidates.first_seen_run_id` or `last_seen_run_id`,
+  because duplicates can be rediscovered through later run audit rows.
 - Before calling Kimi, the review handler must atomically claim candidate rows
   for that `run_id` by setting `review_status = 'reviewing'`,
   `review_run_id`, `review_claim_id`, and `review_locked_until`, or by an
