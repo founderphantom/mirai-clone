@@ -10,6 +10,11 @@ use mirai_product_worker::domain::blitz::{
     filter_synthetic_terms, select_visual_references, FreshnessDecision, HumanPresenceReview,
     Influence, SwipeMetadata, VisualReferenceForSelection,
 };
+use mirai_product_worker::domain::clone_reference_pool::{
+    clone_inspiration_pool_id, clone_pool_run_is_reusable, clone_visual_reference_id,
+    compatibility_action_for, select_balanced_compatibility_wave, CompatibilityAction,
+    GlobalReferenceForClonePool,
+};
 use mirai_product_worker::domain::entitlements::{can_create_clone, Entitlements};
 use mirai_product_worker::domain::global_reference::{
     accept_global_visual_review, global_visual_review_tags, instagram_source_image_key,
@@ -262,6 +267,137 @@ fn clone_pool_messages_serialize_with_pool_run_only_after_kickoff() {
 
     assert_eq!(downstream["type"], json!("validate_clone_compatibility"));
     assert_eq!(downstream["poolRunId"], json!("pool_run_1"));
+}
+
+#[test]
+fn clone_pool_run_reuse_requires_current_hash_active_status_and_freshness() {
+    assert!(clone_pool_run_is_reusable(
+        "queued",
+        true,
+        Some("2026-05-18T10:10:00Z"),
+        "2026-05-18T10:20:00Z",
+        30
+    ));
+    assert!(clone_pool_run_is_reusable(
+        "waiting_for_global_library",
+        true,
+        Some("2026-05-18T10:00:00Z"),
+        "2026-05-18T10:20:00Z",
+        30
+    ));
+    assert!(clone_pool_run_is_reusable(
+        "compatibility_reviewing",
+        true,
+        Some("2026-05-18T10:20:00Z"),
+        "2026-05-18T10:20:00Z",
+        30
+    ));
+    assert!(!clone_pool_run_is_reusable(
+        "pool_ready",
+        true,
+        Some("2026-05-18T10:20:00Z"),
+        "2026-05-18T10:20:00Z",
+        30
+    ));
+    assert!(!clone_pool_run_is_reusable(
+        "queued",
+        false,
+        Some("2026-05-18T10:20:00Z"),
+        "2026-05-18T10:20:00Z",
+        30
+    ));
+    assert!(!clone_pool_run_is_reusable(
+        "queued",
+        true,
+        Some("2026-05-18T09:40:00Z"),
+        "2026-05-18T10:20:00Z",
+        30
+    ));
+}
+
+#[test]
+fn compatibility_action_distinguishes_new_retry_terminal_and_repair_cases() {
+    assert_eq!(
+        compatibility_action_for(None, None, false, "2026-05-18T10:20:00Z"),
+        CompatibilityAction::EnqueueReview
+    );
+    assert_eq!(
+        compatibility_action_for(Some("queued"), None, false, "2026-05-18T10:20:00Z"),
+        CompatibilityAction::EnqueueReview
+    );
+    assert_eq!(
+        compatibility_action_for(Some("accepted"), None, false, "2026-05-18T10:20:00Z"),
+        CompatibilityAction::RepairMissingVisualReference
+    );
+    assert_eq!(
+        compatibility_action_for(Some("accepted"), None, true, "2026-05-18T10:20:00Z"),
+        CompatibilityAction::Skip
+    );
+    assert_eq!(
+        compatibility_action_for(
+            Some("failed"),
+            Some("2026-05-18T10:10:00Z"),
+            false,
+            "2026-05-18T10:20:00Z"
+        ),
+        CompatibilityAction::EnqueueReview
+    );
+    assert_eq!(
+        compatibility_action_for(
+            Some("failed"),
+            Some("2026-05-18T11:00:00Z"),
+            false,
+            "2026-05-18T10:20:00Z"
+        ),
+        CompatibilityAction::Skip
+    );
+    assert_eq!(
+        compatibility_action_for(Some("rejected"), None, false, "2026-05-18T10:20:00Z"),
+        CompatibilityAction::Skip
+    );
+}
+
+#[test]
+fn clone_reference_ids_are_deterministic_by_clone_and_global_reference() {
+    let first = clone_visual_reference_id("clone_1", "global_ref_1");
+    let second = clone_visual_reference_id("clone_1", "global_ref_1");
+
+    assert_eq!(first, second);
+    assert!(first.starts_with("visual_ref_"));
+    assert_ne!(first, clone_visual_reference_id("clone_2", "global_ref_1"));
+
+    let pool_id = clone_inspiration_pool_id("clone_1", &first);
+    assert_eq!(pool_id, clone_inspiration_pool_id("clone_1", &first));
+    assert!(pool_id.starts_with("inspiration_pool_"));
+}
+
+#[test]
+fn compatibility_wave_selection_balances_selected_moodboards() {
+    let refs = vec![
+        GlobalReferenceForClonePool::new("ref_a1", "slug-a", 0.95, 0),
+        GlobalReferenceForClonePool::new("ref_a2", "slug-a", 0.94, 0),
+        GlobalReferenceForClonePool::new("ref_a3", "slug-a", 0.93, 0),
+        GlobalReferenceForClonePool::new("ref_b1", "slug-b", 0.70, 0),
+        GlobalReferenceForClonePool::new("ref_c1", "slug-c", 0.80, 0),
+    ];
+
+    let selected = select_balanced_compatibility_wave(
+        refs,
+        &[
+            "slug-a".to_string(),
+            "slug-b".to_string(),
+            "slug-c".to_string(),
+        ],
+        4,
+    );
+
+    assert_eq!(
+        selected
+            .iter()
+            .map(|reference| reference.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ref_a1", "ref_b1", "ref_c1", "ref_a2"]
+    );
 }
 
 #[test]

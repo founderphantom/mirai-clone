@@ -1,4 +1,5 @@
 pub mod blitz;
+pub mod clone_reference_pool;
 pub mod entitlements;
 pub mod global_reference;
 pub mod idempotency;
