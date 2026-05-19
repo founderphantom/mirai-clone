@@ -164,10 +164,13 @@ Validation:
 - maximum selected moodboards: `10`
 - duplicates are removed after trimming IDs
 - selected moodboards must belong to the authenticated user
+- only active global moodboard definitions count toward validation and save
+  output; disabled selected rows are ignored for the 1-10 count and derived
+  state until re-enabled
 
 After saving selected moodboards, the route should:
 
-1. Resolve selected moodboard slugs.
+1. Resolve active selected moodboard slugs.
 2. Count active global references for each selected slug.
 3. Enqueue `EnsureGlobalMoodboardLibrary` for every selected slug below
    `global_refs_per_moodboard_target`.
@@ -257,6 +260,13 @@ whether a clone pool build has enough global candidates in aggregate across all
 selected moodboard slugs to attempt compatibility. It is not a per-slug minimum.
 Blitz pool readiness uses `batch_size`.
 
+`global_refs_per_moodboard_min_ready` is a per-slug starvation threshold for
+priority and source-relaxation decisions. It is not a library-ready threshold.
+When a moodboard is below this count, scheduler and demand-triggered top-ups
+should use higher priority and may allow otherwise overused handles if no fresher
+handles are available. When it is at or above this count but below
+`global_refs_per_moodboard_target`, top-up discovery is normal priority.
+
 If one selected moodboard has all available references and other selected
 moodboards have none, clone pool build can still proceed when the aggregate
 candidate count meets `global_refs_for_pool_min`. The empty or underfilled slugs
@@ -323,19 +333,19 @@ Handle rotation:
 Exhaustion gating:
 
 - `EnsureGlobalMoodboardLibrary` must check for eligible source work before
-  creating a new run after `insufficient_refs`.
+  creating a new run after `insufficient_refs` or `underfilled_exhausted`.
 - Eligible work exists when at least one selected search term/page/date-window
   row in `global_moodboard_search_state` has `next_eligible_at IS NULL OR
   next_eligible_at <= now`, or at least one handle row in
   `global_moodboard_handles` has `cooldown_until IS NULL OR cooldown_until <=
   now`.
-- When a global run reaches `insufficient_refs`, set
+- When a global run reaches `insufficient_refs` or `underfilled_exhausted`, set
   `global_moodboard_reference_state.next_retry_at` to the earliest eligible
   search/handle time. If no source can produce another attempt, set it to
   `now + global_insufficient_retry_after_hours`.
 - Scheduler and demand-triggered `EnsureGlobalMoodboardLibrary` must no-op while
-  `status = 'insufficient_refs'`, the library is still below target, and
-  `next_retry_at` is in the future.
+  `status IN ('insufficient_refs', 'underfilled_exhausted')`, the library is
+  still below target, and `next_retry_at` is in the future.
 - Source/provider failures should set source-specific retry times using
   `global_source_failure_retry_after_hours` unless the provider supplies a more
   specific retry-after signal.
@@ -357,8 +367,9 @@ instagram:<post-id-or-shortcode>:<image-index-or-child-media-id>
   post can be rediscovered through another account path.
 - Required uniqueness: `UNIQUE(platform, source_image_key)`.
 - If the same source image is later rediscovered through another moodboard, do
-  not insert a duplicate raw candidate. Append the later discovery to
-  `metadata_json.discoveredMoodboardSlugs`.
+  not insert a duplicate raw candidate. Insert a row into
+  `global_visual_candidate_discoveries` and update candidate discovery metadata
+  such as `metadata_json.discoveredMoodboardSlugs` and `last_seen_run_id`.
 - One cleaned global reference can be assigned to exactly one primary
   `assigned_moodboard_slug` from Kimi. If later review strongly routes it
   elsewhere, update assignment only through an explicit audit transition.
@@ -394,6 +405,9 @@ Normalized fields:
 - `source_moodboard_slug`
 - `assigned_moodboard_slug`
 - `discovered_via`
+- `first_seen_run_id`
+- `last_seen_run_id`
+- `metadata_json`
 - `raw_json`
 
 Reject candidate normalization if:
@@ -597,6 +611,11 @@ Recommended schema:
   - disabled definitions stay in `global_moodboard_definitions` for history but
     are hidden from new selection and excluded from future pool builds unless
     already referenced by queued generation work
+  - disabled definitions do not count toward the 1-10 selection requirement,
+    selected moodboard hash, global discovery, or clone pool build
+  - existing user `moodboards.selected = 1` rows for disabled definitions may be
+    retained for history, but they are treated as inactive until the definition
+    is re-enabled
 - `global_moodboard_source_runs`
   - one row per global discovery run
   - stores moodboard slug, reason, status, selected search terms, counts, error,
@@ -609,16 +628,28 @@ Recommended schema:
 - `global_visual_reference_candidates`
   - global candidate and review records
   - `source_image_key TEXT NOT NULL`
+  - `first_seen_run_id`
+  - `last_seen_run_id`
+  - `metadata_json TEXT NOT NULL DEFAULT '{}'`
   - stores source metadata, Kimi review, cleanup status, and cleanup attempts
   - uniqueness by `platform, source_image_key`
   - stores source moodboard slug for discovery audit
   - stores assigned moodboard slug after Kimi routing
   - rejected, source-unavailable, cleanup-failed, and review-failed states live
     here
+- `global_visual_candidate_discoveries`
+  - run-level discovery audit for global candidates
+  - fields: `candidate_id`, `run_id`, `moodboard_slug`, `source_id`,
+    `discovered_via`, `source_handle`, `created_at`
+  - required uniqueness:
+    `UNIQUE(candidate_id, run_id, moodboard_slug, source_id)`
+  - used for per-run counts, duplicate rediscovery audit, and stale-run
+    filtering
 - `global_moodboard_references`
   - cleaned, reusable global references for a moodboard
   - references `global_visual_reference_candidates.id`
   - references global `media_assets.id`
+  - required uniqueness: `UNIQUE(candidate_id)` and `UNIQUE(media_asset_id)`
   - stores Kimi visual tags and Soul2 quality scores
   - status values: `active`, `disabled`, `deleted`
 - `clone_visual_reference_compatibility`
@@ -648,6 +679,13 @@ Recommended schema:
   - remains clone-scoped for Blitz
   - references clone-scoped `visual_references`
   - must not point directly at `global_moodboard_references`
+- `queue_message_reservations`
+  - generic idempotency table for queue nudges that can be replayed
+  - fields: `queue_name`, `message_kind`, `dedupe_key`, optional `run_id`,
+    optional `pool_run_id`, `status`, `created_at`, `updated_at`, `expires_at`
+  - required uniqueness: `UNIQUE(queue_name, message_kind, dedupe_key)`
+  - terminal or expired rows may be replaced only after the handler decides the
+    work is eligible again
 
 Storage key shape for cleaned global references:
 
@@ -711,6 +749,7 @@ The migration must rebuild or recreate:
 - `global_moodboard_search_state`
 - `global_moodboard_handles`
 - `global_visual_reference_candidates`
+- `global_visual_candidate_discoveries`
 - `global_moodboard_references`
 - `clone_visual_reference_compatibility`
 - `clone_pool_waiting_moodboards`
@@ -728,6 +767,8 @@ The migration must rebuild or recreate:
   - stores global supply status per moodboard slug
 - `clone_reference_state` and `clone_pool_runs`
   - create clone-scoped pool status and pool-run token tables
+- `queue_message_reservations`
+  - create idempotent queue nudge reservations
 - dependent indexes and foreign keys for all rebuilt tables
 
 Do not preserve clone-owned candidate rows from failed local test clones unless
@@ -755,9 +796,11 @@ Global messages:
 User messages:
 
 - No user-scoped queue message is required in v1. Moodboard save updates
-  canonical `moodboards.selected`, rebuilds `user_reference_state`, triggers
-  underfilled global discovery, and kicks clone pool build synchronously in the
-  route handler before returning.
+  canonical `moodboards.selected`, rebuilds `user_reference_state`, and reserves
+  or enqueues `EnsureGlobalMoodboardLibrary` and `BuildCloneReferencePool`
+  kickoff messages before returning. It must not run ScrapeCreators, Workers AI,
+  Seedream, image fetch, R2 writes, or compatibility provider calls inside the
+  request.
 
 Clone-scoped messages:
 
@@ -787,7 +830,7 @@ Rules:
   moodboard hash still matches, and the run is not stale.
 - Duplicate kickoff messages for a nonstale active pool run must not create
   another run. They may enqueue missing downstream nudges only through
-  idempotent message reservation.
+  `queue_message_reservations`.
 - `BuildCloneReferencePool` and `RefreshPool` create a new `clone_pool_runs` row
   only when there is no reusable nonstale active run, then store it as
   `clone_reference_state.current_pool_run_id`, and pass that `pool_run_id` to
@@ -798,12 +841,28 @@ Rules:
   updating global-visible status.
 - Queue messages from stale global runs must be acked after recording
   `stale_run` or equivalent audit state.
+- Queue messages from stale global runs must not insert or activate
+  `global_moodboard_references`, must not create reusable global `media_assets`,
+  and must not advance a candidate into a generation-ready state. They may write
+  audit-only candidate discovery metadata.
 - Clone-scoped handlers must never run Instagram discovery directly.
+- Queue messages from stale clone pool runs must not insert Blitz-ready
+  `visual_references`, must not insert `user_inspiration_pool` rows, and must
+  not transition compatibility rows to `accepted` or `rejected`. They may record
+  audit-only stale attempt metadata, or a nonterminal `failed` row with
+  `last_error_code = 'stale_pool_run'`.
 - If selected moodboards do not have enough active global references to attempt
   compatibility, clone-scoped handlers enqueue `EnsureGlobalMoodboardLibrary`
-  for underfilled slugs, mark the clone pool run
-  `waiting_for_global_library`, and defer or retry pool build after the global
-  library changes.
+  for underfilled slugs. They may mark the clone pool run
+  `waiting_for_global_library` only when at least one selected slug has an
+  active, queued, or newly created global discovery run that is not blocked by
+  `next_retry_at`.
+- If `EnsureGlobalMoodboardLibrary` no-ops because every missing slug is
+  exhausted or retry-gated, the clone pool run must not enter
+  `waiting_for_global_library`. If at least one active global reference exists
+  for selected moodboards, attempt compatibility with the smaller candidate set
+  and allow `partial_pool_ready`. If zero active references exist and no global
+  discovery work is queued or retryable, mark the pool run `insufficient_refs`.
 - If global discovery is exhausted, selected moodboards have fewer than
   `global_refs_for_pool_min` active references, and at least one active global
   reference exists, clone pool build should attempt compatibility with the
@@ -815,24 +874,50 @@ Rules:
   pool work. After a current global run finishes, it must inspect ready,
   nonfailed clones in `waiting_for_global_library` for users who selected that
   moodboard slug through `clone_pool_waiting_moodboards`, not by scanning JSON,
-  and create/enqueue fresh `BuildCloneReferencePool` messages when the global
+  and reserve/enqueue `BuildCloneReferencePool` wakeup messages when the global
   library has at least one active reference for the current selected moodboards.
+  The wakeup resumes the existing current pool run when it is still nonstale,
+  current, and has the same selected moodboard hash; it supersedes only when the
+  waiting run is stale, no longer current, or selection changed.
 - If `FinalizeGlobalMoodboardLibrary` finds waiting ready clones but the global
   library still has zero active references for selected moodboards and no
-  retryable global discovery work remains, it should mark those current pool
+  currently retryable global discovery work remains, including when all missing
+  slugs are blocked by future `next_retry_at`, it should mark those current pool
   runs `insufficient_refs` rather than waiting forever.
 - `clone_pool_waiting_moodboards` transition rules:
   - insert `waiting` rows when a current clone pool run enters
     `waiting_for_global_library`
-  - mark rows `resumed` when `FinalizeGlobalMoodboardLibrary` enqueues a fresh
-    `BuildCloneReferencePool` for that clone
-  - mark rows `insufficient` when discovery is exhausted and no global
-    references are available for the selected moodboards
+  - mark rows `resumed` when `FinalizeGlobalMoodboardLibrary` reserves/enqueues
+    a wakeup and the kickoff handler continues the same current pool run
+  - mark rows `insufficient` when discovery is exhausted or retry-gated and no
+    global references are available for the selected moodboards
   - mark rows `superseded` when `clone_reference_state.current_pool_run_id` no
     longer equals the row's `pool_run_id`, the clone is no longer ready, or the
     selected moodboard hash has changed
 - Workers AI, ScrapeCreators, Seedream, image fetch, R2, and D1 failures must
   not panic the Worker.
+
+Idempotent queue reservations:
+
+- All queue nudges that may be emitted by duplicate kickoff/finalize messages
+  must reserve a row in `queue_message_reservations` before enqueueing.
+- Use `UNIQUE(queue_name, message_kind, dedupe_key)` to collapse duplicates.
+- Suggested dedupe keys:
+  - `global:ensure:<moodboard_slug>`
+  - `global:<run_id>:discover:<moodboard_slug>:<term>:<date_window>:<page>`
+  - `global:<run_id>:profile:<moodboard_slug>:<handle>:<related_depth>`
+  - `global:<run_id>:posts:<moodboard_slug>:<handle>:<page>:<next_max_id>`
+  - `global:<run_id>:post-detail:<source_url>`
+  - `global:<run_id>:review:<candidate_id>`
+  - `global:<run_id>:cleanup:<candidate_id>`
+  - `global:<run_id>:finalize:<moodboard_slug>`
+  - `clone:<pool_run_id>:compat:<global_reference_id>`
+  - `clone:<pool_run_id>:finalize`
+- Global source fetch idempotency also uses the existing source/search/handle
+  uniqueness rules. Reference creation idempotency uses
+  `UNIQUE(platform, source_image_key)`, `global_visual_candidate_discoveries`
+  uniqueness, and `global_moodboard_references` uniqueness on `candidate_id`
+  and `media_asset_id`.
 - Per-candidate failures are recorded and do not fail the whole discovery run.
 - Per-source failures are recorded and do not fail the whole discovery run
   unless no sources succeed.
@@ -921,7 +1006,8 @@ Recommended status storage:
 Status values:
 
 - global discovery: `queued`, `scraping`, `reviewing`, `cleaning`,
-  `library_ready`, `underfilled`, `insufficient_refs`, `discovery_failed`
+  `library_ready`, `underfilled`, `underfilled_exhausted`,
+  `insufficient_refs`, `discovery_failed`
 - clone pool: `queued`, `waiting_for_global_library`,
   `compatibility_reviewing`, `pool_ready`, `insufficient_refs`,
   `partial_pool_ready`, `pool_failed`
@@ -933,9 +1019,15 @@ Readiness thresholds:
   `global_refs_per_moodboard_target` active cleaned global references.
   Set `last_ready_at` and `last_successful_refresh_at`.
 - `underfilled`: the moodboard has at least one active cleaned global reference,
-  but fewer than `global_refs_per_moodboard_target`.
+  but fewer than `global_refs_per_moodboard_target`, and eligible source or
+  retryable candidate work still exists now.
   Set `last_underfilled_at` and `last_successful_refresh_at`; do not update
   `last_ready_at`.
+- `underfilled_exhausted`: the moodboard has at least one active cleaned global
+  reference, fewer than `global_refs_per_moodboard_target`, and all configured
+  source, candidate, and cleanup work is exhausted or cooldown-gated.
+  Set `last_underfilled_at`, `last_successful_refresh_at`, and
+  `next_retry_at`; do not update `last_ready_at`.
 - `insufficient_refs`: global discovery has exhausted configured sources,
   retryable candidate work, and cleanup retries, and the moodboard has zero
   active cleaned references.
@@ -957,10 +1049,10 @@ Readiness thresholds:
 - `waiting_for_global_library`: the selected moodboards have fewer than
   `global_refs_for_pool_min` active not-yet-rejected global references for this
   clone, and one or more selected moodboards have an active or queued global
-  discovery run.
+  discovery run that is not blocked by `next_retry_at`.
 - `insufficient_refs`: no compatible active clone-scoped references are
   available after compatibility work is exhausted, and no global discovery work
-  is queued or in progress for the selected moodboards.
+  is queued, in progress, or currently retryable for the selected moodboards.
   Set `last_insufficient_at`; do not update `last_usable_pool_at`.
 - `pool_failed`: an infrastructure or provider failure prevents pool build from
   making progress and no retryable queue work remains.
@@ -968,9 +1060,12 @@ Readiness thresholds:
 ## Selection State, Run Tokens, and Staleness
 
 `selected_moodboard_hash` must be deterministic: SHA-256 of the JSON array of
-selected moodboard slugs sorted lexicographically, encoded with no extra fields.
-Clone pool builds must use the user's current selected moodboard slugs, not a
-stale snapshot from an older selection.
+active selected moodboard slugs sorted lexicographically, encoded with no extra
+fields. Disabled global moodboard definitions are excluded from the selected
+slug set before validating the 1-10 selection requirement, computing the hash,
+enqueueing global discovery, or building clone pools. Clone pool builds must use
+the user's current active selected moodboard slugs, not a stale snapshot from an
+older selection.
 
 `moodboards.selected` is the canonical source of truth for user moodboard
 selection. `user_reference_state.selected_moodboard_ids_json`,
@@ -989,27 +1084,34 @@ Global run behavior:
   not stale.
 - Duplicate `EnsureGlobalMoodboardLibrary` messages for a nonstale active run
   must not create another run. They may enqueue missing downstream nudges only
-  through idempotent source/message reservation.
-- If the current status is `insufficient_refs`, the library is below target, and
+  through `queue_message_reservations`; source fetch duplication is also
+  blocked by search-state, handle, and candidate uniqueness.
+- The `next_retry_at` gate has highest precedence in v1.
+  `EnsureGlobalMoodboardLibrary` has no force flag. Waiting clone pools,
+  scheduler runs, and user-demand kickoff messages cannot override the gate.
+- If the current status is `insufficient_refs` or `underfilled_exhausted`, the
+  library is below target, and
   `global_moodboard_reference_state.next_retry_at` is in the future,
   `EnsureGlobalMoodboardLibrary` must no-op after recording a skipped/blocked
   audit event.
 - `EnsureGlobalMoodboardLibrary` creates a new run when there is no nonstale
-  active current run and the global library is below target, stale, explicitly
-  requested by a waiting clone, or the previous run is terminal.
+  active current run, `next_retry_at` is null or in the past, and the global
+  library is below target, stale, or the previous run is terminal.
 - `EnsureGlobalMoodboardLibrary` supersedes a stale active run by creating a new
   run and moving `global_moodboard_reference_state.current_run_id` to the new
   run.
 - Creating a new run stores its ID as
   `global_moodboard_reference_state.current_run_id`.
 - When a stale active run is superseded, old messages may finish per-candidate
-  audit writes but must not update current global-visible status.
+  audit writes but must not update current global-visible status, insert active
+  `global_moodboard_references`, or create reusable global `media_assets`.
 - Downstream global messages update global-visible status only when their
   `run_id` still matches `global_moodboard_reference_state.current_run_id` for
   that moodboard slug.
 - If a newer global run supersedes an older run, old messages may finish
   per-candidate audit writes, but they must not mark the current global library
-  `library_ready`, `underfilled`, `insufficient_refs`, or `discovery_failed`.
+  `library_ready`, `underfilled`, `underfilled_exhausted`,
+  `insufficient_refs`, or `discovery_failed`.
 
 Clone pool behavior:
 
@@ -1019,7 +1121,7 @@ Clone pool behavior:
   selected moodboard hash still matches, and that run is not stale.
 - Duplicate clone pool kickoff messages for a reusable active run must not
   create another run. They may enqueue missing downstream nudges only through
-  idempotent message reservation.
+  `queue_message_reservations`.
 - `BuildCloneReferencePool` and `RefreshPool` create a new `clone_pool_runs` row
   only when no reusable active run exists, then store its ID as
   `clone_reference_state.current_pool_run_id`.
@@ -1030,7 +1132,8 @@ Clone pool behavior:
   still running, old messages may finish per-reference compatibility audit
   writes, but they must not mark the current clone pool `pool_ready`,
   `partial_pool_ready`, `waiting_for_global_library`, `insufficient_refs`, or
-  `pool_failed`.
+  `pool_failed`, and they must not insert active clone-scoped
+  `visual_references` or `user_inspiration_pool` rows.
 
 ## Clone-Specific Pool Build
 
@@ -1070,13 +1173,17 @@ If the global library cannot supply enough candidates for pool build:
    not already been rejected for this clone.
 2. Enqueue `EnsureGlobalMoodboardLibrary` for selected slugs below
    `global_refs_per_moodboard_target`.
-3. Insert `waiting` rows into `clone_pool_waiting_moodboards` for the selected
-   slugs that need global supply.
-4. Mark the current clone pool run `waiting_for_global_library`.
-5. Stop clone compatibility work until global discovery finalizes or the pool
-   run is superseded.
+3. If at least one selected slug has an active, queued, reused, or newly created
+   global discovery run that is not blocked by `next_retry_at`, insert
+   `waiting` rows into `clone_pool_waiting_moodboards` for those slugs and mark
+   the current clone pool run `waiting_for_global_library`.
+4. Stop clone compatibility work only for pool runs that entered
+   `waiting_for_global_library`.
+5. If every missing slug is exhausted or retry-gated, do not insert waiting
+   rows. Attempt partial compatibility when at least one active global reference
+   exists, otherwise mark the pool run `insufficient_refs`.
 6. When global discovery finalizes, re-check global active reference counts and
-   enqueue a fresh clone pool run if references are available.
+   enqueue a wakeup that resumes the same current pool run when possible.
 
 If no more global discovery work is possible but at least one active global
 reference exists for selected moodboards, attempt compatibility with that smaller
@@ -1253,13 +1360,16 @@ Unit and domain tests should cover:
 - saving moodboards does not require a clone
 - moodboard selection accepts 1-10 and rejects 0 or 11+
 - selected moodboards must belong to the authenticated user
+- disabled global moodboard definitions do not count toward selection
+  validation, selected hash, discovery, or clone pool build
 - failed clone retries preserve selected moodboards
 - frontend allows moodboard selection without an active clone
 - frontend accepts 1-10 selected moodboards, not exactly 5
 - `EnsureGlobalMoodboardLibrary` has no input `runId` and creates or reuses the
   current global run before enqueueing downstream messages
 - duplicate `EnsureGlobalMoodboardLibrary` messages reuse nonstale active runs
-  and supersede terminal or stale runs
+  and create replacement runs for terminal or stale runs only when
+  `next_retry_at` is not in the future
 - global discovery queue messages serialize without `userId` or `cloneId`
 - `BuildCloneReferencePool` and `RefreshPool` serialize without `poolRunId` and
   create the clone pool run before downstream work
@@ -1274,6 +1384,8 @@ Unit and domain tests should cover:
 - disabled global moodboard definitions are hidden from new selection and
   excluded from future pool builds
 - global discovery source params do not include user or clone identifiers
+- `global_refs_per_moodboard_min_ready` drives starvation priority and handle
+  relaxation, not library-ready status
 - Reels search is used for owner-handle discovery
 - Reels thumbnails are not stored as production references
 - global search state rotates moodboard search terms, pages, and date windows
@@ -1291,6 +1403,8 @@ Unit and domain tests should cover:
   `source_handle`
 - duplicate rediscovery appends audit metadata instead of inserting duplicate
   candidates
+- duplicate rediscovery writes `global_visual_candidate_discoveries` rows tied
+  to the current run
 - Kimi review accepts only one likely adult with safe content
 - Kimi review rejects moodboards, screenshots, product shots, tutorials, generic
   images, no-human images, multi-human images, minors, and unsafe images
@@ -1306,11 +1420,20 @@ Unit and domain tests should cover:
 - cleanup retries are capped and failed candidates do not block replacements
 - only cleaned images are cached to R2
 - saving moodboards enqueues global discovery for selected underfilled slugs
+- moodboard save only updates state and enqueues/reserves kickoff messages; it
+  does not run external provider work in the request
 - `global_refs_for_pool_min` is aggregate across selected moodboard slugs, not
   per slug
+- `underfilled_exhausted` sets `next_retry_at` when a moodboard has some refs
+  but no currently eligible source work
+- scheduler and demand-triggered `EnsureGlobalMoodboardLibrary` no-op while
+  `insufficient_refs` or `underfilled_exhausted` is blocked by future
+  `next_retry_at`
 - clone pool build enqueues global discovery and marks
   `waiting_for_global_library` when selected moodboards have fewer than
   `global_refs_for_pool_min` active not-yet-rejected global references
+- clone pool build does not wait when `EnsureGlobalMoodboardLibrary` no-ops
+  because every missing slug is exhausted or retry-gated
 - clone pool waiting wakeups use `clone_pool_waiting_moodboards` indexes, not
   JSON scans
 - `clone_pool_waiting_moodboards` enforces
@@ -1323,6 +1446,13 @@ Unit and domain tests should cover:
   but at least one active global reference exists for selected moodboards
 - `FinalizeGlobalMoodboardLibrary` resumes waiting ready clone pools or marks
   them insufficient when no references remain possible
+- `FinalizeGlobalMoodboardLibrary` wakeups resume the same current nonstale pool
+  run instead of creating a fresh run
+- stale global messages cannot create active global references or reusable
+  global media assets
+- stale clone pool messages cannot create active clone-scoped visual references
+  or user inspiration rows
+- duplicate queue nudges are collapsed by `queue_message_reservations`
 - clone compatibility checks body proportions, hair length, and facial hair
 - clone compatibility does not reject only because of gender
 - clone compatibility retry state records `attempt_count`, last error, and
