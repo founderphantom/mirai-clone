@@ -389,6 +389,30 @@ fn visual_reference_storage_key_uses_expected_shape() {
 }
 
 #[test]
+fn global_visual_reference_storage_key_uses_moodboard_and_reference_id() {
+    assert_eq!(
+        mirai_product_worker::services::visual_reference_cache::global_visual_reference_storage_key(
+            "flash/editorial",
+            "gref_1",
+            "image/webp",
+        ),
+        "global-moodboard-references/flash-editorial/gref_1/cleaned.webp"
+    );
+}
+
+#[test]
+fn global_visual_reference_cache_sql_uses_global_media_asset_policy() {
+    let source = include_str!("../src/services/visual_reference_cache.rs");
+
+    assert!(source.contains("pub async fn cache_cleaned_global_moodboard_reference"));
+    assert!(source.contains("user_id = 'global'"));
+    assert!(source.contains("clone_id"));
+    assert!(source.contains("json!(Option::<String>::None)"));
+    assert!(source.contains("\"globalReferenceId\""));
+    assert!(source.contains("\"moodboardSlug\""));
+}
+
+#[test]
 fn visual_reference_cache_accepts_static_image_content_types() {
     assert!(supported_visual_reference_content_type("image/jpeg"));
     assert!(supported_visual_reference_content_type(

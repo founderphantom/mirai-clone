@@ -37,6 +37,19 @@ pub fn visual_reference_storage_key(
     )
 }
 
+pub fn global_visual_reference_storage_key(
+    moodboard_slug: &str,
+    global_reference_id: &str,
+    content_type: &str,
+) -> String {
+    format!(
+        "global-moodboard-references/{}/{}/cleaned.{}",
+        safe_segment(moodboard_slug),
+        safe_segment(global_reference_id),
+        normalize_extension(content_type)
+    )
+}
+
 pub fn supported_visual_reference_content_type(content_type: &str) -> bool {
     matches!(
         content_type
@@ -115,6 +128,88 @@ pub async fn cache_approved_visual_reference(
             json!(sha256_hex.clone()),
             json!(json!({
                 "visualReferenceId": visual_reference_id,
+                "cleanedImageUrl": cleaned_image_url
+            })
+            .to_string()),
+            json!(now),
+        ],
+    )
+    .await?;
+
+    Ok(CachedVisualReference {
+        media_asset_id,
+        storage_key,
+        content_type,
+        byte_size,
+        sha256_hex,
+    })
+}
+
+pub async fn cache_cleaned_global_moodboard_reference(
+    db: &D1Database,
+    env: &Env,
+    moodboard_slug: &str,
+    global_reference_id: &str,
+    cleaned_image_url: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> WorkerResult<CachedVisualReference> {
+    let (bytes, content_type) = fetch_visual_reference_image(cleaned_image_url).await?;
+    let byte_size = bytes.len();
+    let sha256_hex = sha256_hex(&bytes);
+    let media_asset_id = global_visual_reference_media_asset_id(moodboard_slug, global_reference_id);
+    let storage_key =
+        global_visual_reference_storage_key(moodboard_slug, global_reference_id, &content_type);
+
+    env.bucket("MEDIA")?
+        .put(storage_key.clone(), bytes)
+        .http_metadata(HttpMetadata {
+            content_type: Some(content_type.clone()),
+            content_language: None,
+            content_disposition: None,
+            content_encoding: None,
+            cache_control: None,
+            cache_expiry: None,
+        })
+        .execute()
+        .await?;
+
+    let now: String = js_sys::Date::new_0().to_iso_string().into();
+    db::exec(
+        db,
+        r#"
+        -- Global media assets use user_id = 'global' and clone_id = NULL.
+        INSERT OR IGNORE INTO media_assets (
+          id,
+          user_id,
+          clone_id,
+          kind,
+          source,
+          storage_key,
+          content_type,
+          bytes,
+          width,
+          height,
+          remote_url,
+          sha256,
+          metadata_json,
+          created_at
+        )
+        VALUES (?, 'global', ?, 'global_visual_reference', 'instagram', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        vec![
+            json!(media_asset_id.clone()),
+            json!(Option::<String>::None),
+            json!(storage_key.clone()),
+            json!(content_type.clone()),
+            json!(byte_size),
+            json!(width),
+            json!(height),
+            json!(cleaned_image_url),
+            json!(sha256_hex.clone()),
+            json!(json!({
+                "globalReferenceId": global_reference_id,
+                "moodboardSlug": moodboard_slug,
                 "cleanedImageUrl": cleaned_image_url
             })
             .to_string()),
@@ -242,6 +337,18 @@ fn visual_reference_media_asset_id(
     update_hash_part(&mut hasher, visual_reference_id);
     let digest = hasher.finalize();
     format!("media_visual_{}", &hex::encode(digest)[..24])
+}
+
+fn global_visual_reference_media_asset_id(
+    moodboard_slug: &str,
+    global_reference_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    update_hash_part(&mut hasher, "global");
+    update_hash_part(&mut hasher, moodboard_slug);
+    update_hash_part(&mut hasher, global_reference_id);
+    let digest = hasher.finalize();
+    format!("media_global_visual_{}", &hex::encode(digest)[..24])
 }
 
 fn update_hash_part(hasher: &mut Sha256, value: &str) {
