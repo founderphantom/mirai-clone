@@ -330,6 +330,89 @@ fn reference_pipeline_queue_handler_owns_global_messages_only_in_part_two() {
 }
 
 #[test]
+fn global_review_batch_selects_candidates_through_discovery_audit_rows() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    assert!(source.contains("FROM global_visual_candidate_discoveries gcd"));
+    assert!(source.contains("gcd.run_id = ?"));
+    assert!(source.contains("gvc.review_status = 'queued'"));
+    assert!(source.contains("gvc.review_status = 'failed'"));
+    assert!(source.contains("review_attempt_count < ?"));
+    assert!(!source.contains("gvc.first_seen_run_id = ?"));
+    assert!(!source.contains("gvc.last_seen_run_id = ?"));
+}
+
+#[test]
+fn global_review_claim_and_write_are_run_current_and_claim_guarded() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    assert!(source.contains("review_status = 'reviewing'"));
+    assert!(source.contains("review_run_id = ?"));
+    assert!(source.contains("review_claim_id = ?"));
+    assert!(source.contains("review_locked_until = ?"));
+    assert!(source.contains("global_moodboard_reference_state"));
+    assert!(source.contains("current_run_id = ?"));
+    assert!(source.contains("AND review_claim_id = ?"));
+    assert!(source.contains("cleanup_status = 'queued'"));
+}
+
+#[test]
+fn global_review_failed_write_is_current_run_and_claim_guarded() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let failed_sql = source
+        .split("fn mark_global_candidate_review_failed_sql()")
+        .nth(1)
+        .and_then(|section| section.split("async fn upsert_global_handle").next())
+        .expect("failed review sql section");
+
+    assert!(failed_sql.contains("global_moodboard_reference_state"));
+    assert!(failed_sql.contains("current_run_id = ?"));
+    assert!(failed_sql.contains("AND review_claim_id = ?"));
+}
+
+#[test]
+fn global_review_batch_dedupes_candidates_discovered_by_multiple_audit_rows() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let select_sql = source
+        .split("fn select_global_candidates_for_review_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn claim_global_candidate_for_review_sql").next())
+        .expect("global review selection sql section");
+
+    assert!(
+        select_sql.contains("SELECT DISTINCT") || select_sql.contains("GROUP BY gvc.id"),
+        "{select_sql}"
+    );
+}
+
+#[test]
+fn global_review_claim_revalidates_failed_retry_budget_and_timing() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let claim_sql = source
+        .split("fn claim_global_candidate_for_review_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn mark_global_candidate_review_approved_sql").next())
+        .expect("global review claim sql section");
+
+    assert!(claim_sql.contains("review_status = 'failed'"));
+    assert!(claim_sql.contains("review_attempt_count < ?"));
+    assert!(claim_sql.contains("review_next_retry_at IS NULL OR review_next_retry_at <= ?"));
+}
+
+#[test]
+fn global_review_rechecks_current_run_after_claim_before_ai_call() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let after_claim = source
+        .split("if changed_rows(&claim_result)? == 0")
+        .nth(1)
+        .expect("claim result guard");
+    let before_ai_call = after_claim
+        .split("let review = match run_vision_json::<GlobalVisualReferenceReview>")
+        .next()
+        .expect("ai call section");
+
+    assert!(before_ai_call.contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
+}
+
+#[test]
 fn reference_pipeline_source_fetch_rechecks_current_run_after_provider_calls() {
     let source = include_str!("../src/queues/reference_pipeline.rs");
 

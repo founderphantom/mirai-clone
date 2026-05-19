@@ -1,6 +1,10 @@
 use crate::db;
-use crate::domain::global_reference::instagram_source_image_key;
+use crate::ai::workers_ai::{global_visual_reference_review_prompt, run_vision_json};
+use crate::domain::global_reference::{
+    accept_global_visual_review, instagram_source_image_key, GlobalVisualReferenceReview,
+};
 use crate::domain::moodboards::default_moodboards;
+use crate::domain::visual_reference::MoodboardBrief;
 use crate::instagram_references::{
     build_instagram_post_url, build_instagram_profile_url,
     build_instagram_reels_search_url_with_date_window, build_instagram_user_posts_url,
@@ -139,8 +143,12 @@ async fn handle_message(
             )
             .await
         }
-        ReferencePipelineMessage::ReviewGlobalVisualCandidates { .. }
-        | ReferencePipelineMessage::CleanupGlobalMoodboardReference { .. }
+        ReferencePipelineMessage::ReviewGlobalVisualCandidates {
+            moodboard_slug,
+            run_id,
+            limit,
+        } => review_global_visual_candidates(db, env, &moodboard_slug, &run_id, limit).await,
+        ReferencePipelineMessage::CleanupGlobalMoodboardReference { .. }
         | ReferencePipelineMessage::FinalizeGlobalMoodboardLibrary { .. } => {
             global_review_cleanup_and_finalize_are_enabled_in_tasks_11_to_13();
             Ok(())
@@ -661,6 +669,188 @@ async fn fetch_global_instagram_post_detail(
         .await
 }
 
+async fn review_global_visual_candidates(
+    db: &D1Database,
+    env: &Env,
+    moodboard_slug: &str,
+    run_id: &str,
+    limit: u32,
+) -> WorkerResult<()> {
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+
+    let active_moodboards = load_active_global_moodboard_briefs(db).await?;
+    let configured_limit = config_value_u32(db, "instagram_candidate_review_limit", 80).await?;
+    let review_limit = if limit == 0 {
+        configured_limit
+    } else {
+        limit.min(configured_limit)
+    }
+    .max(1);
+    let review_retry_limit =
+        config_value_u32(db, "visual_reference_review_retry_limit", 2)
+            .await?
+            .max(1);
+    let now = now_iso_string();
+    let candidates = db::all::<GlobalVisualCandidateReviewRow>(
+        db,
+        select_global_candidates_for_review_sql(),
+        vec![
+            json!(run_id),
+            json!(moodboard_slug),
+            json!(review_retry_limit),
+            json!(now),
+            json!(now),
+            json!(review_retry_limit),
+            json!(review_limit),
+        ],
+    )
+    .await?;
+    let ai = env.ai("AI")?;
+
+    for candidate in candidates {
+        let _observed_attempt_count = candidate.review_attempt_count;
+        if !global_run_is_current(db, moodboard_slug, run_id).await? {
+            return Ok(());
+        }
+
+        let claim_id = new_global_review_claim_id();
+        let locked_until = retry_after_minutes(15);
+        let claim_result = db::run(
+            db,
+            claim_global_candidate_for_review_sql(),
+            vec![
+                json!(run_id),
+                json!(claim_id),
+                json!(locked_until),
+                json!(now_iso_string()),
+                json!(candidate.id),
+                json!(review_retry_limit),
+                json!(now_iso_string()),
+                json!(now_iso_string()),
+                json!(review_retry_limit),
+                json!(moodboard_slug),
+                json!(run_id),
+            ],
+        )
+        .await?;
+        if changed_rows(&claim_result)? == 0 {
+            continue;
+        }
+        if !global_run_is_current(db, moodboard_slug, run_id).await? {
+            return Ok(());
+        }
+
+        let source_handle = candidate.source_handle.as_deref().unwrap_or("");
+        let prompt = global_visual_reference_review_prompt(
+            &active_moodboards,
+            &candidate.platform,
+            source_handle,
+            candidate.source_caption.as_deref(),
+            candidate.like_count,
+            candidate.comment_count,
+            candidate.source_published_at.as_deref(),
+        );
+        let review = match run_vision_json::<GlobalVisualReferenceReview>(
+            &ai,
+            &prompt,
+            &candidate.image_url,
+        )
+        .await
+        {
+            Ok(review) => review,
+            Err(error) => {
+                let code = queue_error_code(&error.to_string());
+                db::exec(
+                    db,
+                    mark_global_candidate_review_failed_sql(),
+                    vec![
+                        json!(review_retry_limit),
+                        json!(code),
+                        json!(compact_error_detail(&error.to_string())),
+                        json!(review_retry_limit),
+                        json!(retry_after_minutes(15)),
+                        json!(now_iso_string()),
+                        json!(candidate.id),
+                        json!(run_id),
+                        json!(claim_id),
+                        json!(moodboard_slug),
+                        json!(run_id),
+                    ],
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        let review_json = serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string());
+        match accept_global_visual_review(&review, &active_moodboards) {
+            Ok(accepted) => {
+                let write_now = now_iso_string();
+                let result = db::run(
+                    db,
+                    mark_global_candidate_review_approved_sql(),
+                    vec![
+                        json!(accepted.moodboard_slug),
+                        json!(review_json),
+                        json!(write_now),
+                        json!(write_now),
+                        json!(candidate.id),
+                        json!(run_id),
+                        json!(claim_id),
+                        json!(moodboard_slug),
+                        json!(run_id),
+                    ],
+                )
+                .await?;
+                if changed_rows(&result)? > 0 {
+                    env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
+                        .send(ReferencePipelineMessage::CleanupGlobalMoodboardReference {
+                            moodboard_slug: moodboard_slug.to_string(),
+                            run_id: run_id.to_string(),
+                            candidate_id: candidate.id,
+                        })
+                        .await?;
+                }
+            }
+            Err(_) => {
+                let write_now = now_iso_string();
+                db::exec(
+                    db,
+                    mark_global_candidate_review_rejected_sql(),
+                    vec![
+                        json!(review_json),
+                        json!(write_now),
+                        json!(write_now),
+                        json!(candidate.id),
+                        json!(run_id),
+                        json!(claim_id),
+                        json!(moodboard_slug),
+                        json!(run_id),
+                    ],
+                )
+                .await?;
+            }
+        }
+    }
+
+    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        return Ok(());
+    }
+    if global_review_has_eligible_rows(db, moodboard_slug, run_id, review_retry_limit).await? {
+        enqueue_review_global_visual_candidates(env, moodboard_slug, run_id, review_limit).await
+    } else {
+        enqueue_finalize_global_moodboard_library(
+            env,
+            moodboard_slug,
+            run_id,
+            "visual_candidate_review_completed",
+        )
+        .await
+    }
+}
+
 fn global_review_cleanup_and_finalize_are_enabled_in_tasks_11_to_13() {}
 
 fn clone_pool_messages_are_enabled_in_part_three() {}
@@ -714,7 +904,7 @@ async fn load_active_global_moodboard_definition(
     db::first(
         db,
         r#"
-        SELECT slug, title, search_queries_json
+        SELECT slug, title, vibe_summary, search_queries_json
         FROM global_moodboard_definitions
         WHERE slug = ?
           AND status = 'active'
@@ -723,6 +913,33 @@ async fn load_active_global_moodboard_definition(
         vec![json!(moodboard_slug)],
     )
     .await
+}
+
+async fn load_active_global_moodboard_briefs(
+    db: &D1Database,
+) -> WorkerResult<Vec<MoodboardBrief>> {
+    let rows = db::all::<GlobalMoodboardDefinitionRow>(
+        db,
+        r#"
+        SELECT slug, title, vibe_summary, search_queries_json
+        FROM global_moodboard_definitions
+        WHERE status = 'active'
+        ORDER BY sort_order ASC, slug ASC
+        "#,
+        vec![],
+    )
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| MoodboardBrief {
+            id: format!("global_moodboard_{}", row.slug),
+            slug: row.slug,
+            title: row.title,
+            vibe_summary: row.vibe_summary,
+            search_queries: serde_json::from_str(&row.search_queries_json).unwrap_or_default(),
+        })
+        .collect())
 }
 
 async fn ensure_global_reference_state(
@@ -957,6 +1174,155 @@ async fn select_global_handle_work(
         vec![json!(moodboard_slug), json!(now), json!(limit)],
     )
     .await
+}
+
+fn select_global_candidates_for_review_sql() -> &'static str {
+    r#"
+    SELECT DISTINCT
+      gvc.id,
+      gvc.platform,
+      gvc.source_handle,
+      gvc.source_caption,
+      gvc.source_published_at,
+      gvc.like_count,
+      gvc.comment_count,
+      gvc.image_url,
+      gvc.review_attempt_count
+    FROM global_visual_candidate_discoveries gcd
+    JOIN global_visual_reference_candidates gvc ON gvc.id = gcd.candidate_id
+    WHERE gcd.run_id = ?
+      AND gcd.moodboard_slug = ?
+      AND gvc.candidate_status = 'active'
+      AND (
+        gvc.review_status = 'queued'
+        OR (
+          gvc.review_status = 'failed'
+          AND gvc.review_attempt_count < ?
+          AND (gvc.review_next_retry_at IS NULL OR gvc.review_next_retry_at <= ?)
+        )
+        OR (
+          gvc.review_status = 'reviewing'
+          AND gvc.review_locked_until IS NOT NULL
+          AND gvc.review_locked_until <= ?
+          AND gvc.review_attempt_count < ?
+        )
+      )
+    ORDER BY
+      gvc.review_attempt_count ASC,
+      COALESCE(gvc.like_count, 0) DESC,
+      COALESCE(gvc.comment_count, 0) DESC,
+      gvc.created_at ASC
+    LIMIT ?
+    "#
+}
+
+fn claim_global_candidate_for_review_sql() -> &'static str {
+    r#"
+    UPDATE global_visual_reference_candidates
+    SET review_status = 'reviewing',
+        review_run_id = ?,
+        review_claim_id = ?,
+        review_locked_until = ?,
+        review_attempt_count = review_attempt_count + 1,
+        updated_at = ?
+    WHERE id = ?
+      AND candidate_status = 'active'
+      AND (
+        review_status = 'queued'
+        OR (
+          review_status = 'failed'
+          AND review_attempt_count < ?
+          AND (review_next_retry_at IS NULL OR review_next_retry_at <= ?)
+        )
+        OR (
+          review_status = 'reviewing'
+          AND review_locked_until IS NOT NULL
+          AND review_locked_until <= ?
+          AND review_attempt_count < ?
+        )
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn mark_global_candidate_review_approved_sql() -> &'static str {
+    r#"
+    UPDATE global_visual_reference_candidates
+    SET review_status = 'approved',
+        assigned_moodboard_slug = ?,
+        cleanup_status = 'queued',
+        review_json = ?,
+        review_error_code = NULL,
+        review_error_message = NULL,
+        review_next_retry_at = NULL,
+        review_claim_id = NULL,
+        review_locked_until = NULL,
+        reviewed_at = ?,
+        updated_at = ?
+    WHERE id = ?
+      AND review_status = 'reviewing'
+      AND review_run_id = ?
+      AND review_claim_id = ?
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn mark_global_candidate_review_rejected_sql() -> &'static str {
+    r#"
+    UPDATE global_visual_reference_candidates
+    SET review_status = 'rejected',
+        cleanup_status = 'not_required',
+        review_json = ?,
+        review_next_retry_at = NULL,
+        review_claim_id = NULL,
+        review_locked_until = NULL,
+        reviewed_at = ?,
+        updated_at = ?
+    WHERE id = ?
+      AND review_status = 'reviewing'
+      AND review_run_id = ?
+      AND review_claim_id = ?
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
+}
+
+fn mark_global_candidate_review_failed_sql() -> &'static str {
+    r#"
+    UPDATE global_visual_reference_candidates
+    SET review_status = 'failed',
+        candidate_status = CASE WHEN review_attempt_count >= ? THEN 'review_failed' ELSE candidate_status END,
+        review_error_code = ?,
+        review_error_message = ?,
+        review_next_retry_at = CASE WHEN review_attempt_count >= ? THEN NULL ELSE ? END,
+        review_claim_id = NULL,
+        review_locked_until = NULL,
+        updated_at = ?
+    WHERE id = ?
+      AND review_status = 'reviewing'
+      AND review_run_id = ?
+      AND review_claim_id = ?
+      AND EXISTS (
+        SELECT 1
+        FROM global_moodboard_reference_state
+        WHERE moodboard_slug = ?
+          AND current_run_id = ?
+      )
+    "#
 }
 
 async fn upsert_global_handle(
@@ -1341,6 +1707,30 @@ async fn active_global_reference_count(db: &D1Database, moodboard_slug: &str) ->
     Ok(row.map(|row| row.count).unwrap_or(0))
 }
 
+async fn global_review_has_eligible_rows(
+    db: &D1Database,
+    moodboard_slug: &str,
+    run_id: &str,
+    review_retry_limit: u32,
+) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    let rows = db::all::<GlobalVisualCandidateReviewRow>(
+        db,
+        select_global_candidates_for_review_sql(),
+        vec![
+            json!(run_id),
+            json!(moodboard_slug),
+            json!(review_retry_limit),
+            json!(now),
+            json!(now),
+            json!(review_retry_limit),
+            json!(1),
+        ],
+    )
+    .await?;
+    Ok(!rows.is_empty())
+}
+
 async fn config_value_u32(db: &D1Database, key: &str, default: u32) -> WorkerResult<u32> {
     let row = db::first::<ConfigValueRow>(
         db,
@@ -1412,6 +1802,27 @@ fn retry_after_iso(hours: u32) -> String {
     let date = js_sys::Date::new_0();
     date.set_time(date.get_time() + (hours as f64 * 60.0 * 60.0 * 1000.0));
     date.to_iso_string().into()
+}
+
+fn retry_after_minutes(minutes: u32) -> String {
+    let date = js_sys::Date::new_0();
+    date.set_time(date.get_time() + (minutes as f64 * 60.0 * 1000.0));
+    date.to_iso_string().into()
+}
+
+fn queue_error_code(error: &str) -> &'static str {
+    if crate::ai::workers_ai::is_workers_ai_upstream_timeout(&error.to_ascii_lowercase()) {
+        "ai_upstream_timeout"
+    } else {
+        "global_visual_review_failed"
+    }
+}
+
+fn changed_rows(result: &worker::D1Result) -> WorkerResult<usize> {
+    Ok(result
+        .meta()?
+        .and_then(|meta| meta.changes)
+        .unwrap_or_default())
 }
 
 fn compact_error_detail(error: &str) -> String {
@@ -1544,6 +1955,10 @@ fn new_global_run_id() -> String {
     format!("global_run_{}", uuid::Uuid::new_v4().simple())
 }
 
+fn new_global_review_claim_id() -> String {
+    format!("global_review_claim_{}", uuid::Uuid::new_v4().simple())
+}
+
 fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
 }
@@ -1552,6 +1967,7 @@ fn now_iso_string() -> String {
 struct GlobalMoodboardDefinitionRow {
     slug: String,
     title: String,
+    vibe_summary: String,
     search_queries_json: String,
 }
 
@@ -1584,6 +2000,19 @@ struct GlobalHandleWorkRow {
     handle: String,
     discovered_via: String,
     related_depth: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobalVisualCandidateReviewRow {
+    id: String,
+    platform: String,
+    source_handle: Option<String>,
+    source_caption: Option<String>,
+    source_published_at: Option<String>,
+    like_count: Option<u64>,
+    comment_count: Option<u64>,
+    image_url: String,
+    review_attempt_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
