@@ -61,7 +61,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
   const moodboards = state?.moodboards ?? [];
   const starters = state?.starters ?? [];
   const clone = activeClone ?? state?.activeClone ?? null;
-  const canPickMoodboards = Boolean(clone?.id);
+  const canPickMoodboards = canPickMoodboardSelection(moodboards.length);
 
   useEffect(() => {
     let ignore = false;
@@ -90,7 +90,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         setHarvest(response.job);
         if (response.clone) {
           setActiveClone(response.clone);
-          await ensureMoodboards(response.clone.id);
+          await ensureMoodboards();
         }
         if (terminalHarvestStatus(response.job.status)) await refreshState();
       } catch {
@@ -121,7 +121,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         body: form
       });
       setActiveClone(response.clone);
-      await ensureMoodboards(response.clone.id);
+      await ensureMoodboards();
       setMode("moodboards");
       setNotice("Reference photos saved. Your Soul is waiting for the creation script.");
       track("onboarding_upload_created", { cloneId: response.clone.id });
@@ -141,7 +141,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
         body: JSON.stringify({ starterId: starter.id })
       });
       setActiveClone(response.clone);
-      await ensureMoodboards(response.clone.id);
+      await ensureMoodboards();
       setMode("moodboards");
       setNotice(`${starter.name} is adopted. You can swap to your own Instagram or uploads later.`);
       track("onboarding_starter_adopted", { starterId: starter.id });
@@ -152,10 +152,10 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
     }
   }
 
-  async function ensureMoodboards(cloneId: string) {
+  async function ensureMoodboards() {
     const response = await api<{ moodboards: Moodboard[] }>("/api/onboarding/moodboards/generate", {
       method: "POST",
-      body: JSON.stringify({ cloneId })
+      body: JSON.stringify({})
     });
     setState((current) => current ? { ...current, moodboards: response.moodboards } : current);
     setSelectedMoodboards(response.moodboards.filter((moodboard) => moodboard.selected).map((moodboard) => moodboard.id));
@@ -163,13 +163,13 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
   }
 
   async function submitMoodboards() {
-    if (!clone) return;
+    if (!canSubmitMoodboardSelection(selectedMoodboards.length)) return;
     setBusy(true);
     setError("");
     try {
       await api("/api/onboarding/moodboards", {
         method: "POST",
-        body: JSON.stringify({ cloneId: clone.id, moodboardIds: selectedMoodboards })
+        body: JSON.stringify({ moodboardIds: selectedMoodboards })
       });
       track("onboarding_moodboards_selected", { count: selectedMoodboards.length });
       await onCreated();
@@ -182,11 +182,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
   }
 
   function toggleMoodboard(id: string) {
-    setSelectedMoodboards((current) => {
-      if (current.includes(id)) return current.filter((value) => value !== id);
-      if (current.length >= 5) return current;
-      return [...current, id];
-    });
+    setSelectedMoodboards((current) => nextMoodboardSelection(current, id));
   }
 
   return (
@@ -207,7 +203,7 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
           <img className="onboarding-hero-main" src="/landing/clone-y2k-cafe.jpg" alt="" />
           <img className="onboarding-hero-float" src="/landing/clone-tokyo-neon.jpg" alt="" />
           <div className="onboarding-hero-status">
-            <span>{selectedMoodboards.length}/5</span>
+            <span>{selectedMoodboards.length}/10</span>
             <small>moodboards selected</small>
           </div>
         </div>
@@ -294,10 +290,10 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
           <div className="onboarding-card-header">
             <div>
               <WandSparkles size={24} />
-              <h2>Choose 5 moodboards</h2>
+              <h2>Choose moodboards</h2>
               <p>Defines style and creative direction</p>
             </div>
-            <span>{selectedMoodboards.length}/5</span>
+            <span>{selectedMoodboards.length}/10</span>
           </div>
           <div className="moodboard-grid onboarding-moodboard-grid">
             {moodboards.map((moodboard) => {
@@ -324,9 +320,9 @@ export function OnboardingScreen({ onCreated }: { onCreated: () => Promise<void>
               );
             })}
           </div>
-          <button className="primary" disabled={busy || selectedMoodboards.length !== 5} onClick={submitMoodboards}>
+          <button className="primary" disabled={busy || !canSubmitMoodboardSelection(selectedMoodboards.length)} onClick={submitMoodboards}>
             {busy ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-            Save 5 moodboards
+            Save moodboards
           </button>
         </motion.section>
       )}
@@ -356,6 +352,20 @@ function fallbackStarterImage(index: number) {
 
 function sourceTabClass(mode: OnboardingMode, tab: OnboardingMode, imageClass: string) {
   return `source-tab ${imageClass}${mode === tab ? " active" : ""}`;
+}
+
+export function canSubmitMoodboardSelection(count: number) {
+  return count >= 1 && count <= 10;
+}
+
+export function canPickMoodboardSelection(moodboardCount: number) {
+  return moodboardCount > 0;
+}
+
+export function nextMoodboardSelection(current: string[], id: string) {
+  if (current.includes(id)) return current.filter((value) => value !== id);
+  if (current.length >= 10) return current;
+  return [...current, id];
 }
 
 function HarvestProgress({ job }: { job: InstagramHarvestJob }) {
