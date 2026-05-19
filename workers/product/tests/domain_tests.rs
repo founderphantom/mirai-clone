@@ -1482,6 +1482,29 @@ fn generation_guidance_includes_scores_and_excludes_source_text() {
 }
 
 #[test]
+fn part_three_clone_pool_plan_surface_is_implemented() {
+    let clone_pool = include_str!("../src/services/clone_reference_pool.rs");
+    let reference_queue = include_str!("../src/queues/reference_pipeline.rs");
+    let blitz = include_str!("../src/services/blitz.rs");
+    let generation = include_str!("../src/queues/generation.rs");
+
+    for required in [
+        "build_or_refresh_clone_pool",
+        "validate_clone_compatibility",
+        "finalize_clone_reference_pool",
+        "insert_clone_visual_reference_for_accepted_global_reference",
+        "clone_visual_reference_compatibility",
+        "user_inspiration_pool",
+    ] {
+        assert!(clone_pool.contains(required), "{required}");
+    }
+    assert!(reference_queue.contains("ReferencePipelineMessage::ValidateCloneCompatibility"));
+    assert!(reference_queue.contains("ReferencePipelineMessage::FinalizeCloneReferencePool"));
+    assert!(blitz.contains("REFERENCE_PIPELINE_QUEUE"));
+    assert!(generation.contains("ma.user_id = 'global'"));
+}
+
+#[test]
 fn candidate_ranking_prefers_static_configured_recent_engaged_images() {
     let candidates = vec![
         ranking_candidate(
