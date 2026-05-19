@@ -176,7 +176,9 @@ After saving selected moodboards, the route should:
 Being below `global_refs_per_moodboard_target` is a top-up trigger, not always a
 blocking condition. Clone pool build should continue when the selected
 moodboards can provide at least `global_refs_for_pool_min` active global
-references that have not already been rejected for that clone.
+references in aggregate that have not already been rejected for that clone.
+Moodboard diversity is still enforced later by Blitz selection caps when enough
+compatible references exist.
 
 Frontend scope:
 
@@ -245,8 +247,16 @@ Default global discovery caps should remain configurable:
 `clone_compatibility_reference_limit` controls how many clone identity/reference
 images are sent into a compatibility review. It is not the number of global
 references required for a Blitz batch. `global_refs_for_pool_min` controls
-whether a clone pool build has enough global candidates to attempt compatibility.
+whether a clone pool build has enough global candidates in aggregate across all
+selected moodboard slugs to attempt compatibility. It is not a per-slug minimum.
 Blitz pool readiness uses `batch_size`.
+
+If one selected moodboard has all available references and other selected
+moodboards have none, clone pool build can still proceed when the aggregate
+candidate count meets `global_refs_for_pool_min`. The empty or underfilled slugs
+should still enqueue global top-up discovery. Diversity caps later prevent
+overusing one moodboard when other compatible references exist, but they must not
+block a usable partial pool when global supply is uneven.
 
 ## Source Rotation and De-Dupe
 
@@ -418,21 +428,67 @@ Routing behavior:
 
 Kimi output should include:
 
-- decision
-- best moodboard slug
-- human and safety fields
-- Soul2 reference-quality scores
-- pose
-- scene
-- lighting
-- framing
-- camera feel
-- styling direction
-- color palette
-- fashion/culture cues
-- composition notes
-- rejection reason
-- short reason
+- `decision`: `"approved"` or `"rejected"`
+- `bestMoodboardSlug`: app moodboard slug
+- `humanCount`: non-negative integer
+- `adultLikely`: boolean
+- `ageUnclear`: boolean
+- `minorLikely`: boolean
+- `youthCoded`: boolean
+- `explicit`: boolean
+- `unsafe`: boolean
+- `isMoodboard`: boolean
+- `isScreenshot`: boolean
+- `isProductShot`: boolean
+- `isTutorial`: boolean
+- `isGeneric`: boolean
+- `instagramPostWorthy`: boolean
+- `editorialCompositionScore`: number from `0` to `1`
+- `realPoseAngleScore`: number from `0` to `1`
+- `fashionCultureCueScore`: number from `0` to `1`
+- `lightingColorDirectionScore`: number from `0` to `1`
+- `moodboardFitScore`: number from `0` to `1`
+- `overallReferenceScore`: number from `0` to `1`
+- `pose`: short string
+- `scene`: short string
+- `lighting`: short string
+- `framing`: short string
+- `cameraFeel`: short string
+- `stylingDirection`: short string
+- `colorPalette`: string array
+- `fashionCultureCues`: string array
+- `compositionNotes`: string
+- `rejectionReason`: string or null
+- `reason`: short string
+
+Acceptance thresholds:
+
+- hard safety and person-count requirements must pass
+- `decision` must be `"approved"`
+- `bestMoodboardSlug` must match an active app moodboard slug
+- `moodboardFitScore >= 0.72`
+- `overallReferenceScore >= 0.70`
+- at least two of `editorialCompositionScore`, `realPoseAngleScore`,
+  `fashionCultureCueScore`, and `lightingColorDirectionScore` must be `>= 0.62`
+
+Recommended SQL columns on `global_moodboard_references`:
+
+- `editorial_composition_score REAL NOT NULL DEFAULT 0`
+- `real_pose_angle_score REAL NOT NULL DEFAULT 0`
+- `fashion_culture_cue_score REAL NOT NULL DEFAULT 0`
+- `lighting_color_direction_score REAL NOT NULL DEFAULT 0`
+- `moodboard_fit_score REAL NOT NULL DEFAULT 0`
+- `overall_reference_score REAL NOT NULL DEFAULT 0`
+- `pose TEXT`
+- `scene TEXT`
+- `lighting TEXT`
+- `framing TEXT`
+- `camera_feel TEXT`
+- `styling_direction TEXT`
+- `color_palette_json TEXT NOT NULL DEFAULT '[]'`
+- `fashion_culture_cues_json TEXT NOT NULL DEFAULT '[]'`
+- `composition_notes TEXT`
+- `review_json TEXT NOT NULL DEFAULT '{}'`
 
 ## Seedream Text Cleanup
 
@@ -459,6 +515,13 @@ Rules:
   continue searching for replacements.
 - Only cleaned images are cached in R2.
 - Raw source images are not cached as reusable references.
+- If Kimi or Seedream cannot fetch the external source image because the URL is
+  expired, returns `403`, returns `404`, times out repeatedly, or no longer
+  serves image content, mark the candidate `source_unavailable` and continue
+  searching for replacements.
+- Do not enable ScrapeCreators `download_media=true` as an automatic retry in
+  v1. If source URL expiry becomes common, revisit that as a costed product
+  decision.
 
 ## Storage Model
 
@@ -466,15 +529,23 @@ Recommended schema:
 
 - `moodboards`
   - user-owned selection rows
+  - canonical source of truth for whether a user selected a moodboard
   - `id TEXT PRIMARY KEY`
   - `user_id TEXT NOT NULL`
   - `slug TEXT NOT NULL`
+  - `selected INTEGER NOT NULL DEFAULT 0`
   - no required `clone_id`
   - `UNIQUE(user_id, slug)`
 - `global_moodboard_definitions`
   - app-owned moodboard catalog
   - `slug TEXT PRIMARY KEY`
   - title, vibe summary, search queries, sort order, active status
+  - definitions are synced into each user's `moodboards` rows lazily during
+    `GET /api/onboarding/state` and moodboard save
+  - new active definitions create unselected user rows
+  - disabled definitions stay in `global_moodboard_definitions` for history but
+    are hidden from new selection and excluded from future pool builds unless
+    already referenced by queued generation work
 - `global_moodboard_source_runs`
   - one row per global discovery run
   - stores moodboard slug, reason, status, selected search terms, counts, error,
@@ -491,7 +562,8 @@ Recommended schema:
   - uniqueness by `platform, source_image_key`
   - stores source moodboard slug for discovery audit
   - stores assigned moodboard slug after Kimi routing
-  - rejected, cleanup-failed, and review-failed states live here
+  - rejected, source-unavailable, cleanup-failed, and review-failed states live
+    here
 - `global_moodboard_references`
   - cleaned, reusable global references for a moodboard
   - references `global_visual_reference_candidates.id`
@@ -502,9 +574,18 @@ Recommended schema:
   - mandatory table for clone/reference compatibility attempts
   - stores one row per `clone_id + global_reference_id`
   - status values: `queued`, `accepted`, `rejected`, `failed`
+  - retry fields: `attempt_count`, `last_error_code`, `last_error_message`,
+    `next_retry_at`, `last_attempted_at`, `accepted_at`, `rejected_at`
   - stores body-proportion, hair-length, and facial-hair decisions
   - incompatible references are recorded here and must not become Blitz-ready
     `visual_references`
+- `clone_pool_waiting_moodboards`
+  - indexed wakeup table for clone pools waiting on global moodboard supply
+  - one row per `pool_run_id + moodboard_slug`
+  - fields: `user_id`, `clone_id`, `pool_run_id`, `moodboard_slug`, `status`,
+    `created_at`, `resolved_at`
+  - indexes: `(moodboard_slug, status)`, `(clone_id, pool_run_id)`, and
+    `(user_id, status)`
 - `visual_references`
   - clone-scoped Blitz-ready references
   - `user_id TEXT NOT NULL`
@@ -522,18 +603,27 @@ Storage key shape for cleaned global references:
 global-moodboard-references/<moodboard-slug>/<global-reference-id>/cleaned.<ext>
 ```
 
-`media_assets` options for global references:
+`media_assets` policy for global references:
 
-- Preferred v1: allow global media assets with `user_id = 'global'` and
-  `clone_id = NULL`, then create clone-scoped `visual_references` that point to
-  the global asset only after compatibility acceptance.
-- Alternative if strict user ownership must remain unchanged: create a
-  user-owned pointer/copy `media_assets` row when a global reference passes clone
-  compatibility, while reusing the same R2 storage key.
+- v1 must allow global media assets with `user_id = 'global'` and
+  `clone_id = NULL`
+- clone-scoped `visual_references` point to the global media asset only after
+  compatibility acceptance
+- do not create user-owned pointer/copy `media_assets` rows in v1
 
 Generation loaders must enforce that clone-scoped `visual_references` were
 created by compatibility acceptance for the requested user's clone before using
-any global asset.
+any global asset. Loader joins must allow `media_assets.user_id = 'global'` only
+when all of these are true:
+
+- requested `user_id` owns `visual_references.clone_id`
+- `visual_references.user_id` equals requested `user_id`
+- `visual_references.global_reference_id` points to an active
+  `global_moodboard_references` row
+- `clone_visual_reference_compatibility` has `status = 'accepted'` for the same
+  `clone_id + global_reference_id`
+- `media_assets.id = global_moodboard_references.media_asset_id`
+- `media_assets.clone_id IS NULL`
 
 The existing `niche_cluster` field can keep mirroring `moodboard_slug` in
 clone-scoped `visual_references` until Blitz naming is cleaned up.
@@ -570,6 +660,7 @@ The migration must rebuild or recreate:
 - `global_visual_reference_candidates`
 - `global_moodboard_references`
 - `clone_visual_reference_compatibility`
+- `clone_pool_waiting_moodboards`
 - `visual_references`
   - keep `clone_id NOT NULL`
   - add `global_reference_id`
@@ -578,7 +669,8 @@ The migration must rebuild or recreate:
   - rebuild FKs and uniqueness so clone-scoped pool rows point at
     clone-scoped `visual_references`
 - `user_reference_state`
-  - stores user selected moodboard IDs and selected moodboard hash
+  - stores derived selected moodboard IDs, slugs, and selected moodboard hash
+    rebuilt from canonical `moodboards.selected`
 - `global_moodboard_reference_state`
   - stores global supply status per moodboard slug
 - `clone_reference_state` and `clone_pool_runs`
@@ -594,7 +686,7 @@ Split queue messages into global discovery and clone-scoped pool build.
 
 Global messages:
 
-- `EnsureGlobalMoodboardLibrary { moodboard_slug, run_id, reason }`
+- `EnsureGlobalMoodboardLibrary { moodboard_slug, reason }`
 - `DiscoverGlobalInstagramHandles { moodboard_slug, run_id, search_term,
   date_window, page }`
 - `FetchGlobalInstagramProfile { moodboard_slug, run_id, handle,
@@ -623,8 +715,12 @@ Rules:
 
 - Global discovery messages must not require `user_id` or `clone_id`.
 - Global source reservation params must not include `userId` or `cloneId`.
-- `EnsureGlobalMoodboardLibrary` creates or refreshes the
-  `global_moodboard_source_runs` row before enqueueing downstream work.
+- `EnsureGlobalMoodboardLibrary` is the only global message that does not carry
+  a `run_id`.
+- `EnsureGlobalMoodboardLibrary` creates or reuses the current
+  `global_moodboard_source_runs` row before enqueueing downstream work, stores
+  the selected run ID as `global_moodboard_reference_state.current_run_id`, and
+  passes that `run_id` to every downstream global message.
 - Every downstream global message must carry the same global `run_id`.
 - Global handlers must verify the run is still current for that moodboard before
   updating global-visible status.
@@ -646,9 +742,9 @@ Rules:
 - `FinalizeGlobalMoodboardLibrary` is responsible for resuming deferred clone
   pool work. After a current global run finishes, it must inspect ready,
   nonfailed clones in `waiting_for_global_library` for users who selected that
-  moodboard slug and create/enqueue fresh `BuildCloneReferencePool` messages
-  when the global library has at least one active reference for the current
-  selected moodboards.
+  moodboard slug through `clone_pool_waiting_moodboards`, not by scanning JSON,
+  and create/enqueue fresh `BuildCloneReferencePool` messages when the global
+  library has at least one active reference for the current selected moodboards.
 - If `FinalizeGlobalMoodboardLibrary` finds waiting ready clones but the global
   library still has zero active references for selected moodboards and no
   retryable global discovery work remains, it should mark those current pool
@@ -692,6 +788,7 @@ Recommended status storage:
   - `selected_moodboard_ids_json`
   - `selected_moodboard_slugs_json`
   - `selected_moodboard_hash`
+  - derived cache rebuilt from canonical `moodboards.selected` rows
   - timestamps
 - `clone_reference_state`
   - `user_id`
@@ -700,7 +797,7 @@ Recommended status storage:
   - `selected_moodboard_hash`
   - `status`
   - compatibility counts
-  - waiting moodboard slugs
+  - optional waiting moodboard slugs snapshot for diagnostics only
   - timestamps
 - `clone_pool_runs`
   - `id`
@@ -711,11 +808,15 @@ Recommended status storage:
   - `selected_moodboard_ids_snapshot_json`
   - `selected_moodboard_slugs_snapshot_json`
   - `selected_moodboard_hash`
-  - waiting moodboard slugs
+  - optional waiting moodboard slugs snapshot for diagnostics only
   - compatibility counts
   - `error_code`
   - `error_message`
   - timestamps
+- `clone_pool_waiting_moodboards`
+  - canonical wakeup index for waiting clone pools by moodboard slug
+  - queried by `FinalizeGlobalMoodboardLibrary`
+  - status values: `waiting`, `resumed`, `insufficient`, `superseded`
 
 Status values:
 
@@ -755,12 +856,21 @@ Readiness thresholds:
 - `pool_failed`: an infrastructure or provider failure prevents pool build from
   making progress and no retryable queue work remains.
 
-## Run Tokens and Staleness
+## Selection State, Run Tokens, and Staleness
 
 `selected_moodboard_hash` must be deterministic: SHA-256 of the JSON array of
 selected moodboard slugs sorted lexicographically, encoded with no extra fields.
 Clone pool builds must use the user's current selected moodboard slugs, not a
 stale snapshot from an older selection.
+
+`moodboards.selected` is the canonical source of truth for user moodboard
+selection. `user_reference_state.selected_moodboard_ids_json`,
+`user_reference_state.selected_moodboard_slugs_json`, and
+`user_reference_state.selected_moodboard_hash` are derived cache fields for fast
+reads and run-token comparisons. Moodboard save must update the selected rows and
+the derived `user_reference_state` row in the same transaction or in one
+idempotent write sequence that can be safely replayed. If the cache is missing
+or suspected stale, rebuild it from `moodboards.selected`.
 
 Global run behavior:
 
@@ -820,13 +930,16 @@ differences should not be used as a rejection reason.
 If the global library cannot supply enough candidates for pool build:
 
 1. Determine whether selected moodboard slugs have at least
-   `global_refs_for_pool_min` active global references that have not already
-   been rejected for this clone.
-2. Enqueue `EnsureGlobalMoodboardLibrary` for those slugs.
-3. Mark the current clone pool run `waiting_for_global_library`.
-4. Stop clone compatibility work until global discovery finalizes or the pool
+   `global_refs_for_pool_min` active global references in aggregate that have
+   not already been rejected for this clone.
+2. Enqueue `EnsureGlobalMoodboardLibrary` for selected slugs below
+   `global_refs_per_moodboard_target`.
+3. Insert `waiting` rows into `clone_pool_waiting_moodboards` for the selected
+   slugs that need global supply.
+4. Mark the current clone pool run `waiting_for_global_library`.
+5. Stop clone compatibility work until global discovery finalizes or the pool
    run is superseded.
-5. When global discovery finalizes, re-check global active reference counts and
+6. When global discovery finalizes, re-check global active reference counts and
    enqueue a fresh clone pool run if references are available.
 
 If no more global discovery work is possible but at least one active global
@@ -845,11 +958,29 @@ Outputs:
 - insert only compatible rows into clone-scoped `visual_references`
 - copy or reference Kimi visual tags from `global_moodboard_references`
 - set `visual_references.media_asset_id` to the compatible cleaned reference
-  asset or user-owned pointer asset
+  asset where `media_assets.user_id = 'global'` and `media_assets.clone_id IS NULL`
 - set `visual_references.clone_id` to the target clone
 - mark incompatible rows in `clone_visual_reference_compatibility` so the same
   clone/reference pair is not retried repeatedly and never appears in Blitz
   selection
+
+Compatibility retry transitions:
+
+- missing row -> insert `queued` with `attempt_count = 0`
+- `queued` -> provider call starts by incrementing `attempt_count` and setting
+  `last_attempted_at`
+- provider success and compatibility accepted -> `accepted`, set `accepted_at`,
+  clear retry error fields
+- provider success and compatibility rejected -> `rejected`, set `rejected_at`,
+  clear retry error fields
+- retryable provider/infrastructure failure with attempts remaining -> `failed`,
+  set `last_error_code`, `last_error_message`, and `next_retry_at`
+- nonretryable failure or attempts exhausted -> `failed`, set
+  `next_retry_at = NULL`
+- pool builders may retry only `failed` rows whose `next_retry_at` is not null
+  and is in the past
+- `rejected` and `accepted` rows are terminal for that `clone_id +
+  global_reference_id`
 
 Idempotency:
 
@@ -955,9 +1086,11 @@ Generation and Blitz loaders must enforce ownership before using a reference:
 - `visual_references.user_id` equals requested `user_id`
 - `visual_references.clone_id` equals requested clone ID
 - `visual_references.global_reference_id` points to an active global reference
-- `visual_references` was created after accepted clone compatibility
-- `media_assets` points to the cleaned global asset or an authorized user-owned
-  pointer/copy asset
+- `clone_visual_reference_compatibility.status = 'accepted'` for the same
+  `clone_id + global_reference_id`
+- `media_assets.id = global_moodboard_references.media_asset_id`
+- `media_assets.user_id = 'global'`
+- `media_assets.clone_id IS NULL`
 
 ## Failed Clone Retry Behavior
 
@@ -987,9 +1120,17 @@ Unit and domain tests should cover:
 - failed clone retries preserve selected moodboards
 - frontend allows moodboard selection without an active clone
 - frontend accepts 1-10 selected moodboards, not exactly 5
+- `EnsureGlobalMoodboardLibrary` has no input `runId` and creates or reuses the
+  current global run before enqueueing downstream messages
 - global discovery queue messages serialize without `userId` or `cloneId`
 - clone-scoped pool messages serialize with `userId`, `cloneId`, and
   `poolRunId`
+- `moodboards.selected` is canonical selection state and `user_reference_state`
+  is rebuilt from it as a derived cache
+- global moodboard definitions sync new active definitions into existing users
+  as unselected rows
+- disabled global moodboard definitions are hidden from new selection and
+  excluded from future pool builds
 - global discovery source params do not include user or clone identifiers
 - Reels search is used for owner-handle discovery
 - Reels thumbnails are not stored as production references
@@ -1013,16 +1154,23 @@ Unit and domain tests should cover:
   images, no-human images, multi-human images, minors, and unsafe images
 - Kimi scoring stores editorial composition, pose/angle, fashion/culture,
   lighting/color, moodboard fit, and overall reference scores
+- Kimi review requires the exact Soul2 score fields and acceptance thresholds
 - Kimi review does not hard reject solely because one Soul2 quality score is
   moderate when overall reference value is acceptable
 - off-style but strong images are assigned to another app moodboard
 - Seedream cleanup prompt matches the exact text-only prompt
+- expired or forbidden external source image URLs mark candidates
+  `source_unavailable` and search continues
 - cleanup retries are capped and failed candidates do not block replacements
 - only cleaned images are cached to R2
 - saving moodboards enqueues global discovery for selected underfilled slugs
+- `global_refs_for_pool_min` is aggregate across selected moodboard slugs, not
+  per slug
 - clone pool build enqueues global discovery and marks
   `waiting_for_global_library` when selected moodboards have fewer than
   `global_refs_for_pool_min` active not-yet-rejected global references
+- clone pool waiting wakeups use `clone_pool_waiting_moodboards` indexes, not
+  JSON scans
 - clone pool build proceeds while top-up discovery runs when selected moodboards
   are below target but have enough active refs to attempt compatibility
 - clone pool build attempts partial compatibility when discovery is exhausted
@@ -1031,6 +1179,8 @@ Unit and domain tests should cover:
   them insufficient when no references remain possible
 - clone compatibility checks body proportions, hair length, and facial hair
 - clone compatibility does not reject only because of gender
+- clone compatibility retry state records `attempt_count`, last error, and
+  `next_retry_at`, and retries only eligible failed rows
 - incompatible global references are written to
   `clone_visual_reference_compatibility`, not to Blitz-ready
   `visual_references`
@@ -1042,6 +1192,8 @@ Unit and domain tests should cover:
   generation jobs
 - generation and Blitz reference loading enforce clone ownership and accepted
   compatibility before using a global reference
+- generation loaders permit `media_assets.user_id = 'global'` only through an
+  active global reference and accepted clone compatibility
 - Blitz selection still reads clone-scoped `visual_references` by `clone_id`
 - Workers AI, ScrapeCreators, Seedream, image fetch, R2, and D1 failures map to
   recorded failure states, not queue panics
