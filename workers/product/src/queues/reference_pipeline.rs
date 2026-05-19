@@ -171,9 +171,22 @@ async fn handle_message(
             run_id,
             reason,
         } => finalize_global_moodboard_library(db, env, &moodboard_slug, &run_id, &reason).await,
-        ReferencePipelineMessage::BuildCloneReferencePool { .. }
-        | ReferencePipelineMessage::RefreshPool { .. }
-        | ReferencePipelineMessage::ValidateCloneCompatibility { .. }
+        ReferencePipelineMessage::BuildCloneReferencePool {
+            user_id,
+            clone_id,
+            reason,
+        }
+        | ReferencePipelineMessage::RefreshPool {
+            user_id,
+            clone_id,
+            reason,
+        } => {
+            crate::services::clone_reference_pool::build_or_refresh_clone_pool(
+                db, env, &user_id, &clone_id, &reason,
+            )
+            .await
+        }
+        ReferencePipelineMessage::ValidateCloneCompatibility { .. }
         | ReferencePipelineMessage::FinalizeCloneReferencePool { .. } => {
             clone_pool_messages_are_enabled_in_part_three();
             Ok(())

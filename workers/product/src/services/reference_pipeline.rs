@@ -27,13 +27,8 @@ pub async fn enqueue_after_moodboard_save(
     user_id: &str,
     selected_slugs: &[String],
 ) -> WorkerResult<()> {
-    enqueue_global_topups_for_underfilled_slugs(
-        db,
-        env,
-        selected_slugs,
-        "onboarding_selection",
-    )
-    .await?;
+    enqueue_global_topups_for_underfilled_slugs(db, env, selected_slugs, "onboarding_selection")
+        .await?;
 
     if let Some(clone) = load_ready_active_clone(db, user_id).await? {
         env.queue(REFERENCE_QUEUE_NAME)?

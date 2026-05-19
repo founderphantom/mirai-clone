@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod blitz;
+pub mod clone_reference_pool;
 pub mod clones;
 pub mod generation_usage;
 pub mod global_reference_discovery;

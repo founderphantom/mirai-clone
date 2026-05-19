@@ -401,6 +401,81 @@ fn compatibility_wave_selection_balances_selected_moodboards() {
 }
 
 #[test]
+fn clone_pool_service_uses_reference_pipeline_queue_and_current_selection() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("REFERENCE_PIPELINE_QUEUE"));
+    assert!(source.contains("ReferencePipelineMessage::ValidateCloneCompatibility"));
+    assert!(source.contains("load_current_selected_moodboard_snapshot_sql"));
+    assert!(source.contains("FROM moodboards mb"));
+    assert!(source.contains("INNER JOIN global_moodboard_definitions gmd"));
+    assert!(source.contains("mb.selected = 1"));
+    assert!(source.contains("gmd.status = 'active'"));
+    assert!(source.contains("ORDER BY mb.slug ASC"));
+}
+
+#[test]
+fn clone_pool_kickoff_reuses_current_nonstale_run_by_hash() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("clone_pool_run_is_reusable"));
+    assert!(source.contains("clone_pool_run_stale_after_minutes"));
+    assert!(source.contains("current_pool_run_id"));
+    assert!(source.contains("selected_moodboard_hash"));
+    assert!(source.contains("waiting_for_global_library"));
+    assert!(source.contains("compatibility_reviewing"));
+}
+
+#[test]
+fn clone_pool_candidate_query_uses_global_refs_and_terminal_compatibility_rules() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("FROM global_moodboard_references gmr"));
+    assert!(source.contains("LEFT JOIN clone_visual_reference_compatibility cvr"));
+    assert!(source.contains("LEFT JOIN visual_references vr"));
+    assert!(source.contains("gmr.status = 'active'"));
+    assert!(source.contains("gmr.moodboard_slug IN"));
+    assert!(source.contains("cvr.status IS NULL"));
+    assert!(source.contains("cvr.status = 'queued'"));
+    assert!(source.contains("cvr.status = 'accepted' AND vr.id IS NULL"));
+    assert!(source.contains("cvr.status = 'failed'"));
+    assert!(source.contains("cvr.next_retry_at <= ?"));
+    assert!(!source.contains("download_media=true"));
+}
+
+#[test]
+fn clone_pool_queue_reservations_retry_unsent_and_dedupe_enqueued_only() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("ON CONFLICT(queue_name, message_kind, dedupe_key) DO UPDATE SET"));
+    assert!(source.contains("WHERE queue_message_reservations.status = 'failed'"));
+    assert!(source.contains("queue_message_reservations.status = 'reserved'"));
+    assert!(source.contains("queue_message_reservations.expires_at <= excluded.created_at"));
+    assert!(!source.contains("queue_message_reservations.status <> 'enqueued'"));
+    assert!(source.contains("mark_reserved_reference_pipeline_message_failed_sql"));
+    assert!(source.contains("if let Err(error) = env.queue(\"REFERENCE_PIPELINE_QUEUE\")?.send(message).await"));
+    assert!(source.contains("mark_reserved_reference_pipeline_message_failed"));
+    assert!(source.contains("return Err(error);"));
+    assert!(!source.contains("INSERT OR IGNORE INTO queue_message_reservations"));
+}
+
+#[test]
+fn clone_pool_kickoff_claims_random_run_through_reusable_state_guard() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let create_body = source
+        .split("async fn create_clone_pool_run(")
+        .nth(1)
+        .and_then(|section| section.split("async fn load_actionable_global_references").next())
+        .expect("create clone pool run section");
+
+    assert!(source.contains("fn claim_clone_reference_state_for_run_sql()"));
+    assert!(source.contains("status NOT IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"));
+    assert!(source.contains("clone_reference_state.updated_at <= ?"));
+    assert!(source.contains("load_current_pool_run_sql"));
+    assert!(source.contains("mark_unclaimed_clone_pool_run_superseded_sql"));
+    assert!(create_body.contains("Uuid::new_v4"));
+    assert!(create_body.contains("claim_clone_reference_state_for_run_sql"));
+    assert!(create_body.contains("if claimed_pool_run_id != pool_run_id"));
+    assert!(!source.contains("fn deterministic_clone_pool_run_id("));
+}
+
+#[test]
 fn onboarding_moodboard_queries_are_user_scoped_not_clone_scoped() {
     let source = include_str!("../src/routes/onboarding.rs");
 
