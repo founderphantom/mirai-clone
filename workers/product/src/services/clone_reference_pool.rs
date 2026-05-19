@@ -5,11 +5,12 @@ use crate::domain::clone_reference_pool::{
 };
 use crate::domain::moodboards::selected_moodboard_hash;
 use crate::queues::messages::ReferencePipelineMessage;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 use wasm_bindgen::JsValue;
-use worker::{D1Database, Env, Result as WorkerResult};
+use worker::{D1Database, Env, Error, Result as WorkerResult};
 
 const REFERENCE_QUEUE_NAME: &str = "REFERENCE_PIPELINE_QUEUE";
 const REFERENCE_QUEUE_STORAGE_NAME: &str = "mirai-reference-pipeline";
@@ -55,6 +56,29 @@ struct GlobalReferenceActionableRow {
 #[derive(Debug, Deserialize)]
 struct CountRow {
     count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttemptCountRow {
+    attempt_count: u32,
+}
+
+#[derive(Debug)]
+struct CompatibilityClaim {
+    attempt_count: u32,
+    claim_expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobalReferenceCompatibilityRow {
+    storage_key: String,
+    content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloneReferenceImageRow {
+    storage_key: String,
+    content_type: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -262,6 +286,210 @@ fn mark_unclaimed_clone_pool_run_superseded_sql() -> &'static str {
     "#
 }
 
+fn current_pool_run_allows_side_effects_sql() -> &'static str {
+    r#"
+    SELECT 1 AS count
+    FROM clone_reference_state crs
+    INNER JOIN clone_pool_runs cpr
+      ON cpr.id = crs.current_pool_run_id
+     AND cpr.clone_id = crs.clone_id
+    WHERE crs.user_id = ?
+      AND crs.clone_id = ?
+      AND crs.current_pool_run_id = ?
+      AND cpr.id = ?
+      AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+    LIMIT 1
+    "#
+}
+
+fn load_global_reference_for_compatibility_sql() -> &'static str {
+    r#"
+    SELECT gmr.id, gmr.media_asset_id, ma.storage_key, ma.content_type,
+           gmr.moodboard_slug, gmr.image_width, gmr.image_height
+    FROM global_moodboard_references gmr
+    INNER JOIN media_assets ma
+      ON ma.id = gmr.media_asset_id
+     AND ma.user_id = 'global'
+     AND ma.clone_id IS NULL
+     AND ma.deleted_at IS NULL
+     AND ma.storage_key IS NOT NULL
+     AND TRIM(ma.storage_key) <> ''
+    WHERE gmr.id = ?
+      AND gmr.status = 'active'
+    LIMIT 1
+    "#
+}
+
+fn load_clone_reference_image_urls_sql() -> &'static str {
+    r#"
+    SELECT ma.storage_key, ma.content_type
+    FROM clone_reference_assets cra
+    INNER JOIN media_assets ma
+      ON ma.id = cra.media_asset_id
+     AND ma.deleted_at IS NULL
+     AND ma.storage_key IS NOT NULL
+     AND TRIM(ma.storage_key) <> ''
+    WHERE cra.user_id = ?
+      AND cra.clone_id = ?
+      AND cra.training_selected = 1
+      AND cra.eligibility_status = 'accepted'
+    ORDER BY cra.sort_order ASC, cra.created_at ASC
+    LIMIT ?
+    "#
+}
+
+// clone_visual_reference_compatibility has UNIQUE(clone_id, global_reference_id).
+fn insert_or_claim_clone_compatibility_sql() -> &'static str {
+    r#"
+    INSERT INTO clone_visual_reference_compatibility (
+      id, clone_id, global_reference_id, status, attempt_count,
+      last_attempted_at, created_at, updated_at
+    )
+    VALUES (?, ?, ?, 'queued', 0, NULL, ?, ?)
+    ON CONFLICT(clone_id, global_reference_id) DO UPDATE SET
+      updated_at = excluded.updated_at
+    WHERE clone_visual_reference_compatibility.status = 'queued'
+       OR clone_visual_reference_compatibility.status = 'failed'
+         AND clone_visual_reference_compatibility.attempt_count < ?
+         AND clone_visual_reference_compatibility.next_retry_at <= ?
+    "#
+}
+
+fn increment_clone_compatibility_attempt_sql() -> &'static str {
+    r#"
+    UPDATE clone_visual_reference_compatibility
+    SET status = 'failed',
+        attempt_count = attempt_count + 1,
+        last_attempted_at = ?,
+        next_retry_at = ?,
+        updated_at = ?
+    WHERE clone_id = ?
+      AND global_reference_id = ?
+      AND attempt_count < ?
+      AND (
+        status = 'queued'
+        OR status = 'failed'
+          AND next_retry_at <= ?
+      )
+    "#
+}
+
+fn load_claimed_clone_compatibility_attempt_sql() -> &'static str {
+    r#"
+    SELECT attempt_count
+    FROM clone_visual_reference_compatibility
+    WHERE clone_id = ?
+      AND global_reference_id = ?
+      AND status = 'failed'
+      AND next_retry_at = ?
+    LIMIT 1
+    "#
+}
+
+fn mark_clone_compatibility_accepted_sql() -> &'static str {
+    r#"
+    UPDATE clone_visual_reference_compatibility
+    SET status = 'accepted',
+        body_proportions_compatible = ?,
+        hair_length_compatible = ?,
+        facial_hair_compatible = ?,
+        review_json = ?,
+        last_error_code = NULL,
+        last_error_message = NULL,
+        next_retry_at = NULL,
+        accepted_at = ?,
+        updated_at = ?
+    WHERE clone_id = ?
+      AND global_reference_id = ?
+      AND attempt_count = ?
+      AND next_retry_at = ?
+      AND status = 'failed'
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_runs cpr
+          ON cpr.id = crs.current_pool_run_id
+         AND cpr.clone_id = crs.clone_id
+        WHERE crs.user_id = ?
+          AND crs.clone_id = clone_visual_reference_compatibility.clone_id
+          AND crs.current_pool_run_id = ?
+          AND cpr.id = ?
+          AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      )
+    "#
+}
+
+fn mark_clone_compatibility_rejected_sql() -> &'static str {
+    r#"
+    UPDATE clone_visual_reference_compatibility
+    SET status = 'rejected',
+        body_proportions_compatible = ?,
+        hair_length_compatible = ?,
+        facial_hair_compatible = ?,
+        review_json = ?,
+        last_error_code = NULL,
+        last_error_message = NULL,
+        next_retry_at = NULL,
+        rejected_at = ?,
+        updated_at = ?
+    WHERE clone_id = ?
+      AND global_reference_id = ?
+      AND attempt_count = ?
+      AND next_retry_at = ?
+      AND status = 'failed'
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_runs cpr
+          ON cpr.id = crs.current_pool_run_id
+         AND cpr.clone_id = crs.clone_id
+        WHERE crs.user_id = ?
+          AND crs.clone_id = clone_visual_reference_compatibility.clone_id
+          AND crs.current_pool_run_id = ?
+          AND cpr.id = ?
+          AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      )
+    "#
+}
+
+fn mark_clone_compatibility_failed_sql() -> &'static str {
+    r#"
+    UPDATE clone_visual_reference_compatibility
+    SET status = 'failed',
+        last_error_code = ?,
+        last_error_message = ?,
+        next_retry_at = CASE WHEN attempt_count >= ? THEN NULL ELSE ? END,
+        updated_at = ?
+    WHERE clone_id = ?
+      AND global_reference_id = ?
+      AND attempt_count = ?
+      AND next_retry_at = ?
+      AND status = 'failed'
+      AND EXISTS (
+        SELECT 1
+        FROM clone_reference_state crs
+        INNER JOIN clone_pool_runs cpr
+          ON cpr.id = crs.current_pool_run_id
+         AND cpr.clone_id = crs.clone_id
+        WHERE crs.user_id = ?
+          AND crs.clone_id = clone_visual_reference_compatibility.clone_id
+          AND crs.current_pool_run_id = ?
+          AND cpr.id = ?
+          AND cpr.status IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')
+      )
+    "#
+}
+
+fn insert_compatibility_attempt_audit_sql() -> &'static str {
+    r#"
+    INSERT INTO clone_reference_compatibility_attempts (
+      id, pool_run_id, clone_id, global_reference_id, status,
+      error_code, error_message, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    "#
+}
+
 pub async fn build_or_refresh_clone_pool(
     db: &D1Database,
     env: &Env,
@@ -380,6 +608,325 @@ pub async fn build_or_refresh_clone_pool(
         &pool_run_id,
         "wave_scheduled",
         &now,
+    )
+    .await
+}
+
+pub async fn validate_clone_compatibility(
+    db: &D1Database,
+    env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+    global_reference_id: &str,
+) -> WorkerResult<()> {
+    let now = now_iso_string();
+    if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+        insert_compatibility_attempt_audit(
+            db,
+            pool_run_id,
+            clone_id,
+            global_reference_id,
+            "stale_pool_message",
+            Some("stale_pool_message"),
+            Some("Pool run is no longer current for this clone."),
+            &now,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let retry_limit = config_value_u32(db, "visual_reference_compatibility_retry_limit", 2).await?;
+    let clone_reference_limit =
+        config_value_u32(db, "clone_compatibility_reference_limit", 4).await?;
+    let Some(compatibility_claim) =
+        claim_clone_compatibility(db, clone_id, global_reference_id, retry_limit, &now).await?
+    else {
+        return enqueue_finalize_clone_pool(
+            db,
+            env,
+            user_id,
+            clone_id,
+            pool_run_id,
+            "clone_compatibility_claim_skipped",
+            &now,
+        )
+        .await;
+    };
+
+    if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+        return Ok(());
+    }
+
+    let Some(global_reference) =
+        load_global_reference_for_compatibility(db, global_reference_id).await?
+    else {
+        if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+            return Ok(());
+        }
+        if mark_clone_compatibility_failed(
+            db,
+            user_id,
+            clone_id,
+            pool_run_id,
+            global_reference_id,
+            &compatibility_claim,
+            retry_limit,
+            "global_reference_unavailable",
+            "Global reference was not active or had no global media asset.",
+            &now,
+        )
+        .await?
+        {
+            insert_compatibility_attempt_audit(
+                db,
+                pool_run_id,
+                clone_id,
+                global_reference_id,
+                "failed",
+                Some("global_reference_unavailable"),
+                Some("Global reference was not active or had no global media asset."),
+                &now,
+            )
+            .await?;
+        }
+        return enqueue_finalize_clone_pool(
+            db,
+            env,
+            user_id,
+            clone_id,
+            pool_run_id,
+            "global_reference_unavailable",
+            &now,
+        )
+        .await;
+    };
+
+    let image_urls = match compatibility_image_urls(
+        db,
+        env,
+        user_id,
+        clone_id,
+        &global_reference.storage_key,
+        global_reference.content_type.as_deref(),
+        clone_reference_limit,
+    )
+    .await
+    {
+        Ok(image_urls) => image_urls,
+        Err(error) => {
+            let detail = compact_error_detail(&error.to_string());
+            let code = compatibility_image_error_code(&detail);
+            if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+                return Ok(());
+            }
+            if mark_clone_compatibility_failed(
+                db,
+                user_id,
+                clone_id,
+                pool_run_id,
+                global_reference_id,
+                &compatibility_claim,
+                retry_limit,
+                code,
+                &detail,
+                &now,
+            )
+            .await?
+            {
+                insert_compatibility_attempt_audit(
+                    db,
+                    pool_run_id,
+                    clone_id,
+                    global_reference_id,
+                    "failed",
+                    Some(code),
+                    Some(&detail),
+                    &now,
+                )
+                .await?;
+            }
+            return enqueue_finalize_clone_pool(
+                db,
+                env,
+                user_id,
+                clone_id,
+                pool_run_id,
+                "compatibility_image_load_failed",
+                &now,
+            )
+            .await;
+        }
+    };
+    if image_urls.len() <= 1 {
+        if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+            return Ok(());
+        }
+        if mark_clone_compatibility_failed(
+            db,
+            user_id,
+            clone_id,
+            pool_run_id,
+            global_reference_id,
+            &compatibility_claim,
+            retry_limit,
+            "clone_compatibility_reference_missing",
+            "No clone reference images were available.",
+            &now,
+        )
+        .await?
+        {
+            insert_compatibility_attempt_audit(
+                db,
+                pool_run_id,
+                clone_id,
+                global_reference_id,
+                "failed",
+                Some("clone_compatibility_reference_missing"),
+                Some("No clone reference images were available."),
+                &now,
+            )
+            .await?;
+        }
+        return enqueue_finalize_clone_pool(
+            db,
+            env,
+            user_id,
+            clone_id,
+            pool_run_id,
+            "clone_reference_missing",
+            &now,
+        )
+        .await;
+    }
+
+    let prompt =
+        crate::ai::workers_ai::clone_compatibility_prompt(image_urls.len().saturating_sub(1));
+    let review = match env.ai("AI") {
+        Ok(ai) => {
+            crate::ai::workers_ai::run_multi_vision_json::<
+                crate::ai::workers_ai::CloneCompatibilityReview,
+            >(&ai, &prompt, &image_urls)
+            .await
+        }
+        Err(error) => Err(error),
+    };
+
+    if !current_pool_run_allows_side_effects(db, user_id, clone_id, pool_run_id).await? {
+        insert_compatibility_attempt_audit(
+            db,
+            pool_run_id,
+            clone_id,
+            global_reference_id,
+            "stale_pool_message",
+            Some("stale_pool_message"),
+            Some("Pool run became stale before compatibility write."),
+            &now_iso_string(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let write_now = now_iso_string();
+    match review {
+        Ok(review) => {
+            let review_json = serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string());
+            match crate::domain::visual_reference::accept_clone_compatibility(&review) {
+                Ok(()) => {
+                    if mark_clone_compatibility_accepted(
+                        db,
+                        user_id,
+                        clone_id,
+                        pool_run_id,
+                        global_reference_id,
+                        &compatibility_claim,
+                        &review,
+                        &review_json,
+                        &write_now,
+                    )
+                    .await?
+                    {
+                        insert_compatibility_attempt_audit(
+                            db,
+                            pool_run_id,
+                            clone_id,
+                            global_reference_id,
+                            "accepted",
+                            None,
+                            None,
+                            &write_now,
+                        )
+                        .await?;
+                    }
+                }
+                Err(reason) => {
+                    if mark_clone_compatibility_rejected(
+                        db,
+                        user_id,
+                        clone_id,
+                        pool_run_id,
+                        global_reference_id,
+                        &compatibility_claim,
+                        &review,
+                        &review_json,
+                        &write_now,
+                    )
+                    .await?
+                    {
+                        insert_compatibility_attempt_audit(
+                            db,
+                            pool_run_id,
+                            clone_id,
+                            global_reference_id,
+                            "rejected",
+                            Some(reason),
+                            Some(reason),
+                            &write_now,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            let detail = compact_error_detail(&error.to_string());
+            if mark_clone_compatibility_failed(
+                db,
+                user_id,
+                clone_id,
+                pool_run_id,
+                global_reference_id,
+                &compatibility_claim,
+                retry_limit,
+                "provider_error",
+                &detail,
+                &write_now,
+            )
+            .await?
+            {
+                insert_compatibility_attempt_audit(
+                    db,
+                    pool_run_id,
+                    clone_id,
+                    global_reference_id,
+                    "failed",
+                    Some("provider_error"),
+                    Some(&detail),
+                    &write_now,
+                )
+                .await?;
+            }
+        }
+    }
+
+    enqueue_finalize_clone_pool(
+        db,
+        env,
+        user_id,
+        clone_id,
+        pool_run_id,
+        "compatibility_result",
+        &write_now,
     )
     .await
 }
@@ -674,6 +1221,298 @@ async fn mark_unclaimed_clone_pool_run_superseded(
     .await
 }
 
+async fn current_pool_run_allows_side_effects(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+) -> WorkerResult<bool> {
+    let row = db::first::<CountRow>(
+        db,
+        current_pool_run_allows_side_effects_sql(),
+        vec![
+            json!(user_id),
+            json!(clone_id),
+            json!(pool_run_id),
+            json!(pool_run_id),
+        ],
+    )
+    .await?;
+    Ok(row.map(|row| row.count > 0).unwrap_or_default())
+}
+
+async fn load_global_reference_for_compatibility(
+    db: &D1Database,
+    global_reference_id: &str,
+) -> WorkerResult<Option<GlobalReferenceCompatibilityRow>> {
+    db::first(
+        db,
+        load_global_reference_for_compatibility_sql(),
+        vec![json!(global_reference_id)],
+    )
+    .await
+}
+
+async fn claim_clone_compatibility(
+    db: &D1Database,
+    clone_id: &str,
+    global_reference_id: &str,
+    retry_limit: u32,
+    now: &str,
+) -> WorkerResult<Option<CompatibilityClaim>> {
+    let compatibility_id = format!("clone_compatibility_{}", Uuid::new_v4().simple());
+    let claim_expires_at = add_minutes_iso(now, 10);
+    db::exec(
+        db,
+        insert_or_claim_clone_compatibility_sql(),
+        vec![
+            json!(compatibility_id),
+            json!(clone_id),
+            json!(global_reference_id),
+            json!(now),
+            json!(now),
+            json!(retry_limit.max(1)),
+            json!(now),
+        ],
+    )
+    .await?;
+    let result = db::run(
+        db,
+        increment_clone_compatibility_attempt_sql(),
+        vec![
+            json!(now),
+            json!(claim_expires_at),
+            json!(now),
+            json!(clone_id),
+            json!(global_reference_id),
+            json!(retry_limit.max(1)),
+            json!(now),
+        ],
+    )
+    .await?;
+    if changed_rows(&result)? == 0 {
+        return Ok(None);
+    }
+
+    Ok(db::first::<AttemptCountRow>(
+        db,
+        load_claimed_clone_compatibility_attempt_sql(),
+        vec![
+            json!(clone_id),
+            json!(global_reference_id),
+            json!(claim_expires_at.clone()),
+        ],
+    )
+    .await?
+    .map(|row| CompatibilityClaim {
+        attempt_count: row.attempt_count,
+        claim_expires_at,
+    }))
+}
+
+async fn compatibility_image_urls(
+    db: &D1Database,
+    env: &Env,
+    user_id: &str,
+    clone_id: &str,
+    global_storage_key: &str,
+    global_content_type: Option<&str>,
+    clone_reference_limit: u32,
+) -> WorkerResult<Vec<String>> {
+    let mut image_urls =
+        vec![media_storage_data_url(env, global_storage_key, global_content_type).await?];
+
+    let rows = db::all::<CloneReferenceImageRow>(
+        db,
+        load_clone_reference_image_urls_sql(),
+        vec![
+            json!(user_id),
+            json!(clone_id),
+            json!(clone_reference_limit),
+        ],
+    )
+    .await?;
+    for row in rows {
+        image_urls.push(
+            media_storage_data_url(env, &row.storage_key, row.content_type.as_deref()).await?,
+        );
+    }
+
+    Ok(image_urls)
+}
+
+async fn media_storage_data_url(
+    env: &Env,
+    storage_key: &str,
+    content_type: Option<&str>,
+) -> WorkerResult<String> {
+    let object = env
+        .bucket("MEDIA")?
+        .get(storage_key.to_string())
+        .execute()
+        .await?
+        .ok_or_else(|| Error::RustError("compatibility_media_missing".to_string()))?;
+    let body = object
+        .body()
+        .ok_or_else(|| Error::RustError("compatibility_media_body_missing".to_string()))?;
+    let bytes = body.bytes().await?;
+    let content_type = normalized_image_content_type(content_type);
+    Ok(format!(
+        "data:{};base64,{}",
+        content_type,
+        BASE64_STANDARD.encode(bytes)
+    ))
+}
+
+fn normalized_image_content_type(content_type: Option<&str>) -> String {
+    content_type
+        .unwrap_or("image/jpeg")
+        .split(';')
+        .next()
+        .unwrap_or("image/jpeg")
+        .trim()
+        .to_string()
+}
+
+fn compatibility_image_error_code(error: &str) -> &'static str {
+    if error.contains("compatibility_media_missing")
+        || error.contains("compatibility_media_body_missing")
+    {
+        "compatibility_media_missing"
+    } else {
+        "compatibility_image_load_failed"
+    }
+}
+
+async fn mark_clone_compatibility_accepted(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+    global_reference_id: &str,
+    claim: &CompatibilityClaim,
+    review: &crate::ai::workers_ai::CloneCompatibilityReview,
+    review_json: &str,
+    now: &str,
+) -> WorkerResult<bool> {
+    let result = db::run(
+        db,
+        mark_clone_compatibility_accepted_sql(),
+        vec![
+            json!(review.body_proportions_compatible),
+            json!(review.hair_length_compatible),
+            json!(review.facial_hair_compatible),
+            json!(review_json),
+            json!(now),
+            json!(now),
+            json!(clone_id),
+            json!(global_reference_id),
+            json!(claim.attempt_count),
+            json!(claim.claim_expires_at),
+            json!(user_id),
+            json!(pool_run_id),
+            json!(pool_run_id),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+async fn mark_clone_compatibility_rejected(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+    global_reference_id: &str,
+    claim: &CompatibilityClaim,
+    review: &crate::ai::workers_ai::CloneCompatibilityReview,
+    review_json: &str,
+    now: &str,
+) -> WorkerResult<bool> {
+    let result = db::run(
+        db,
+        mark_clone_compatibility_rejected_sql(),
+        vec![
+            json!(review.body_proportions_compatible),
+            json!(review.hair_length_compatible),
+            json!(review.facial_hair_compatible),
+            json!(review_json),
+            json!(now),
+            json!(now),
+            json!(clone_id),
+            json!(global_reference_id),
+            json!(claim.attempt_count),
+            json!(claim.claim_expires_at),
+            json!(user_id),
+            json!(pool_run_id),
+            json!(pool_run_id),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+async fn mark_clone_compatibility_failed(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+    pool_run_id: &str,
+    global_reference_id: &str,
+    claim: &CompatibilityClaim,
+    retry_limit: u32,
+    error_code: &str,
+    error_message: &str,
+    now: &str,
+) -> WorkerResult<bool> {
+    let result = db::run(
+        db,
+        mark_clone_compatibility_failed_sql(),
+        vec![
+            json!(error_code),
+            json!(compact_error_detail(error_message)),
+            json!(retry_limit.max(1)),
+            json!(add_minutes_iso(now, 10)),
+            json!(now),
+            json!(clone_id),
+            json!(global_reference_id),
+            json!(claim.attempt_count),
+            json!(claim.claim_expires_at),
+            json!(user_id),
+            json!(pool_run_id),
+            json!(pool_run_id),
+        ],
+    )
+    .await?;
+    Ok(changed_rows(&result)? > 0)
+}
+
+async fn insert_compatibility_attempt_audit(
+    db: &D1Database,
+    pool_run_id: &str,
+    clone_id: &str,
+    global_reference_id: &str,
+    status: &str,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        insert_compatibility_attempt_audit_sql(),
+        vec![
+            json!(format!("clone_compat_attempt_{}", Uuid::new_v4().simple())),
+            json!(pool_run_id),
+            json!(clone_id),
+            json!(global_reference_id),
+            json!(status),
+            json!(error_code),
+            json!(error_message.map(compact_error_detail)),
+            json!(now),
+        ],
+    )
+    .await
+}
+
 async fn enqueue_global_topups_for_underfilled_selected_slugs(
     db: &D1Database,
     env: &Env,
@@ -831,6 +1670,12 @@ fn add_minutes_iso(now: &str, minutes: i64) -> String {
     let date = js_sys::Date::new(&JsValue::from_f64(timestamp));
     date.set_time(date.get_time() + (minutes as f64 * 60_000.0));
     date.to_iso_string().into()
+}
+
+fn compact_error_detail(error: &str) -> String {
+    const MAX_ERROR_DETAIL_CHARS: usize = 500;
+    let compact = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(MAX_ERROR_DETAIL_CHARS).collect()
 }
 
 async fn enqueue_finalize_clone_pool(

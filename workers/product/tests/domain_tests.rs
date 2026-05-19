@@ -441,6 +441,172 @@ fn clone_pool_candidate_query_uses_global_refs_and_terminal_compatibility_rules(
 }
 
 #[test]
+fn clone_compatibility_handler_is_current_pool_guarded_and_audited() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("current_pool_run_allows_side_effects_sql"));
+    assert!(source.contains("clone_reference_state"));
+    assert!(source.contains("current_pool_run_id = ?"));
+    assert!(source.contains("clone_reference_compatibility_attempts"));
+    assert!(source.contains("insert_compatibility_attempt_audit_sql"));
+    assert!(source.contains("stale_pool_message"));
+    assert!(source.contains("clone_visual_reference_compatibility"));
+    assert!(source.contains("UNIQUE(clone_id, global_reference_id)"));
+}
+
+#[test]
+fn clone_compatibility_handler_writes_terminal_rejected_and_accepted_rows() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    assert!(source.contains("mark_clone_compatibility_accepted_sql"));
+    assert!(source.contains("status = 'accepted'"));
+    assert!(source.contains("accepted_at = ?"));
+    assert!(source.contains("mark_clone_compatibility_rejected_sql"));
+    assert!(source.contains("status = 'rejected'"));
+    assert!(source.contains("rejected_at = ?"));
+    assert!(source.contains("FinalizeCloneReferencePool"));
+}
+
+#[test]
+fn clone_compatibility_unavailable_global_reference_marks_failed_before_finalize() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let body =
+        reference_pipeline_function_body(source, "pub async fn validate_clone_compatibility");
+    let branch = body
+        .split("let Some(global_reference)")
+        .nth(1)
+        .and_then(|section| section.split("let image_urls").next())
+        .expect("global reference unavailable branch");
+
+    assert!(branch.contains("current_pool_run_allows_side_effects"));
+    let mark = branch
+        .find("mark_clone_compatibility_failed")
+        .expect("missing global reference should mark compatibility failed");
+    let audit = branch
+        .find("insert_compatibility_attempt_audit")
+        .expect("missing global reference should audit");
+    let finalize = branch
+        .find("enqueue_finalize_clone_pool")
+        .expect("missing global reference should finalize");
+
+    assert!(mark < audit);
+    assert!(audit < finalize);
+    assert!(branch.contains("global_reference_unavailable"));
+}
+
+#[test]
+fn clone_compatibility_media_load_errors_mark_failed_instead_of_queue_retry() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let body =
+        reference_pipeline_function_body(source, "pub async fn validate_clone_compatibility");
+    let media_branch = body
+        .split("Err(error) =>")
+        .nth(1)
+        .and_then(|section| section.split("if image_urls.len() <= 1").next())
+        .expect("media load branch");
+
+    assert!(body.contains("let image_urls = match compatibility_image_urls"));
+    assert!(body.contains("compatibility_image_load_failed"));
+    assert!(source.contains("compatibility_media_missing"));
+    assert!(media_branch.contains("mark_clone_compatibility_failed"));
+    assert!(media_branch.contains("insert_compatibility_attempt_audit"));
+    assert!(media_branch.contains("enqueue_finalize_clone_pool"));
+    assert!(!body.contains(".await?;\n    if image_urls.len() <= 1"));
+}
+
+#[test]
+fn clone_compatibility_terminal_writes_are_expected_attempt_guarded_and_audited_after_change() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let body =
+        reference_pipeline_function_body(source, "pub async fn validate_clone_compatibility");
+
+    assert!(source.contains("AND attempt_count = ?"));
+    assert!(source.contains("AND next_retry_at = ?"));
+    assert!(source.contains("load_claimed_clone_compatibility_attempt_sql"));
+    assert!(source.contains("WorkerResult<Option<CompatibilityClaim>>"));
+    assert!(source.contains("WorkerResult<bool>"));
+    assert!(body.contains("compatibility_claim"));
+    assert!(body.contains("if mark_clone_compatibility_accepted("));
+    assert!(body.contains("if mark_clone_compatibility_rejected("));
+    assert!(body.contains("if mark_clone_compatibility_failed("));
+    assert!(body.contains("insert_compatibility_attempt_audit"));
+}
+
+#[test]
+fn clone_compatibility_claim_uses_exclusive_retry_lease_token() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let insert_sql = source
+        .split("fn insert_or_claim_clone_compatibility_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn increment_clone_compatibility_attempt_sql")
+                .next()
+        })
+        .expect("clone compatibility insert sql");
+    let claim_sql = source
+        .split("fn increment_clone_compatibility_attempt_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn load_claimed_clone_compatibility_attempt_sql")
+                .next()
+        })
+        .expect("clone compatibility claim sql");
+
+    assert!(source.contains("CompatibilityClaim"));
+    assert!(source.contains("claim_expires_at"));
+    assert!(!insert_sql.contains("THEN 'queued'"));
+    assert!(!insert_sql.contains("status = CASE"));
+    assert!(claim_sql.contains("status = 'failed'"));
+    assert!(claim_sql.contains("next_retry_at = ?"));
+    assert!(claim_sql.contains("status = 'queued'"));
+    assert!(claim_sql.contains("next_retry_at <= ?"));
+    assert!(!claim_sql.contains("next_retry_at IS NULL OR next_retry_at <= ?"));
+
+    for marker in [
+        "fn mark_clone_compatibility_accepted_sql()",
+        "fn mark_clone_compatibility_rejected_sql()",
+        "fn mark_clone_compatibility_failed_sql()",
+    ] {
+        let sql = source
+            .split(marker)
+            .nth(1)
+            .and_then(|section| section.split("\"#\n}").next())
+            .expect(marker);
+        assert!(sql.contains("AND attempt_count = ?"), "{marker}");
+        assert!(sql.contains("AND next_retry_at = ?"), "{marker}");
+    }
+}
+
+#[test]
+fn clone_compatibility_pre_ai_failure_writes_recheck_current_pool() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let body =
+        reference_pipeline_function_body(source, "pub async fn validate_clone_compatibility");
+
+    assert!(body.matches("current_pool_run_allows_side_effects").count() >= 5);
+
+    for error_code in [
+        "global_reference_unavailable",
+        "compatibility_image_load_failed",
+        "clone_compatibility_reference_missing",
+    ] {
+        let prefix = body
+            .split(error_code)
+            .next()
+            .expect("error code should exist");
+        let recent_guard = prefix
+            .rsplit("current_pool_run_allows_side_effects")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            recent_guard.contains("mark_clone_compatibility_failed")
+                || prefix.contains("current_pool_run_allows_side_effects"),
+            "{error_code}"
+        );
+    }
+}
+
+#[test]
 fn clone_pool_queue_reservations_retry_unsent_and_dedupe_enqueued_only() {
     let source = include_str!("../src/services/clone_reference_pool.rs");
     assert!(source.contains("ON CONFLICT(queue_name, message_kind, dedupe_key) DO UPDATE SET"));
@@ -449,7 +615,9 @@ fn clone_pool_queue_reservations_retry_unsent_and_dedupe_enqueued_only() {
     assert!(source.contains("queue_message_reservations.expires_at <= excluded.created_at"));
     assert!(!source.contains("queue_message_reservations.status <> 'enqueued'"));
     assert!(source.contains("mark_reserved_reference_pipeline_message_failed_sql"));
-    assert!(source.contains("if let Err(error) = env.queue(\"REFERENCE_PIPELINE_QUEUE\")?.send(message).await"));
+    assert!(source.contains(
+        "if let Err(error) = env.queue(\"REFERENCE_PIPELINE_QUEUE\")?.send(message).await"
+    ));
     assert!(source.contains("mark_reserved_reference_pipeline_message_failed"));
     assert!(source.contains("return Err(error);"));
     assert!(!source.contains("INSERT OR IGNORE INTO queue_message_reservations"));
@@ -461,11 +629,17 @@ fn clone_pool_kickoff_claims_random_run_through_reusable_state_guard() {
     let create_body = source
         .split("async fn create_clone_pool_run(")
         .nth(1)
-        .and_then(|section| section.split("async fn load_actionable_global_references").next())
+        .and_then(|section| {
+            section
+                .split("async fn load_actionable_global_references")
+                .next()
+        })
         .expect("create clone pool run section");
 
     assert!(source.contains("fn claim_clone_reference_state_for_run_sql()"));
-    assert!(source.contains("status NOT IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"));
+    assert!(source.contains(
+        "status NOT IN ('queued', 'waiting_for_global_library', 'compatibility_reviewing')"
+    ));
     assert!(source.contains("clone_reference_state.updated_at <= ?"));
     assert!(source.contains("load_current_pool_run_sql"));
     assert!(source.contains("mark_unclaimed_clone_pool_run_superseded_sql"));
@@ -585,7 +759,11 @@ fn global_review_batch_dedupes_candidates_discovered_by_multiple_audit_rows() {
     let select_sql = source
         .split("fn select_global_candidates_for_review_sql()")
         .nth(1)
-        .and_then(|section| section.split("fn claim_global_candidate_for_review_sql").next())
+        .and_then(|section| {
+            section
+                .split("fn claim_global_candidate_for_review_sql")
+                .next()
+        })
         .expect("global review selection sql section");
 
     assert!(
@@ -600,7 +778,11 @@ fn global_review_claim_revalidates_failed_retry_budget_and_timing() {
     let claim_sql = source
         .split("fn claim_global_candidate_for_review_sql()")
         .nth(1)
-        .and_then(|section| section.split("fn mark_global_candidate_review_approved_sql").next())
+        .and_then(|section| {
+            section
+                .split("fn mark_global_candidate_review_approved_sql")
+                .next()
+        })
         .expect("global review claim sql section");
 
     assert!(claim_sql.contains("review_status = 'failed'"));
@@ -825,9 +1007,8 @@ fn global_finalization_recounts_discovery_and_cross_routed_assigned_slugs() {
 #[test]
 fn global_finalization_does_not_overwrite_cross_routed_slug_current_run() {
     let source = include_str!("../src/queues/reference_pipeline.rs");
-    assert!(source.contains(
-        "current_run_id = CASE WHEN moodboard_slug = ? THEN ? ELSE current_run_id END"
-    ));
+    assert!(source
+        .contains("current_run_id = CASE WHEN moodboard_slug = ? THEN ? ELSE current_run_id END"));
     assert!(source.contains("(moodboard_slug = ? AND current_run_id = ?)"));
     assert!(source.contains("moodboard_slug != ?"));
     assert!(source.contains("current_run_id IS NULL"));
@@ -842,7 +1023,11 @@ fn global_finalization_allows_recount_when_cross_routed_current_run_is_terminal(
     let update_sql = source
         .split("fn update_global_reference_state_after_recount_sql()")
         .nth(1)
-        .and_then(|section| section.split("fn select_global_candidates_for_review_sql").next())
+        .and_then(|section| {
+            section
+                .split("fn select_global_candidates_for_review_sql")
+                .next()
+        })
         .expect("global finalization state update sql");
 
     assert!(update_sql.contains("NOT EXISTS"));
@@ -949,8 +1134,9 @@ fn global_cleanup_rechecks_current_run_around_provider_side_effects() {
         .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
     assert!(body[upload_pos..seedream_pos]
         .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
-    assert!(body[seedream_pos..]
-        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
+    assert!(
+        body[seedream_pos..].contains("global_run_is_current(db, moodboard_slug, run_id).await?")
+    );
     assert!(complete_body[..cache_pos]
         .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
     assert!(complete_body[cache_pos..]
@@ -982,7 +1168,11 @@ fn global_cleanup_recovers_cleaned_candidate_without_reference() {
     let resume_claim_sql = source
         .split("fn claim_cleaned_global_candidate_for_reference_resume_sql()")
         .nth(1)
-        .and_then(|section| section.split("fn mark_global_candidate_cleanup_failed_sql").next())
+        .and_then(|section| {
+            section
+                .split("fn mark_global_candidate_cleanup_failed_sql")
+                .next()
+        })
         .expect("cleaned reference resume claim sql section");
 
     assert!(resume_sql.contains("cleanup_status = 'cleaned'"));
@@ -1007,12 +1197,20 @@ fn global_cleanup_completion_writes_are_lease_guarded() {
     let failed_sql = source
         .split("fn mark_global_candidate_cleanup_failed_sql()")
         .nth(1)
-        .and_then(|section| section.split("fn mark_global_candidate_cleanup_succeeded_sql").next())
+        .and_then(|section| {
+            section
+                .split("fn mark_global_candidate_cleanup_succeeded_sql")
+                .next()
+        })
         .expect("cleanup failed sql section");
     let succeeded_sql = source
         .split("fn mark_global_candidate_cleanup_succeeded_sql()")
         .nth(1)
-        .and_then(|section| section.split("fn insert_global_moodboard_reference_sql").next())
+        .and_then(|section| {
+            section
+                .split("fn insert_global_moodboard_reference_sql")
+                .next()
+        })
         .expect("cleanup succeeded sql section");
     let failed_where = failed_sql
         .split("WHERE id = ?")
@@ -1578,17 +1776,13 @@ fn global_source_rotation_sql_is_moodboard_scoped_not_user_or_clone_scoped() {
     }
 
     assert!(select_global_search_work_sql().contains("status IN ('active', 'cooldown')"));
-    assert!(
-        select_global_search_work_sql()
-            .contains("next_eligible_at IS NULL OR next_eligible_at <= ?")
-    );
+    assert!(select_global_search_work_sql()
+        .contains("next_eligible_at IS NULL OR next_eligible_at <= ?"));
     assert!(select_global_handle_work_sql().contains("accepted_count"));
     assert!(select_global_handle_work_sql().contains("last_fetched_at IS NULL DESC"));
     assert!(upsert_global_candidate_sql().contains("UNIQUE(platform, source_image_key)"));
-    assert!(
-        audit_global_candidate_discovery_sql()
-            .contains("UNIQUE(candidate_id, run_id, moodboard_slug, source_key)")
-    );
+    assert!(audit_global_candidate_discovery_sql()
+        .contains("UNIQUE(candidate_id, run_id, moodboard_slug, source_key)"));
 }
 
 #[test]
@@ -1597,7 +1791,10 @@ fn global_source_keys_are_unambiguous_and_normalized() {
     let reels_from_colon_window = source_key_for_reels_search("a", " B:C ", 1);
 
     assert_ne!(reels_from_colon_term, reels_from_colon_window);
-    assert_eq!(reels_from_colon_term, source_key_for_reels_search("a:b", "C", 1));
+    assert_eq!(
+        reels_from_colon_term,
+        source_key_for_reels_search("a:b", "C", 1)
+    );
     assert!(reels_from_colon_term.contains("a:b"));
     assert!(reels_from_colon_term.contains("c"));
     assert!(reels_from_colon_term.ends_with(":p=1"));
@@ -3698,9 +3895,19 @@ fn clone_compatibility_prompt_checks_only_body_hair_and_facial_hair() {
     assert!(lower.contains("body proportions"));
     assert!(lower.contains("hair length"));
     assert!(lower.contains("facial hair"));
-    assert!(!lower.contains("gender"));
+    assert!(lower.contains("gender is not a v1 compatibility signal"));
     assert!(!lower.contains("same clothing"));
     assert!(!lower.contains("same background"));
+}
+
+#[test]
+fn clone_compatibility_prompt_explicitly_ignores_gender() {
+    let prompt = clone_compatibility_prompt(4);
+    assert!(prompt.contains("Gender is not a v1 compatibility signal."));
+    assert!(prompt.contains("Do not reject because of perceived gender"));
+    assert!(prompt.contains("body proportions"));
+    assert!(prompt.contains("hair length"));
+    assert!(prompt.contains("facial hair"));
 }
 
 #[test]

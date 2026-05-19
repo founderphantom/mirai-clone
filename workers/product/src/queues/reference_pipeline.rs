@@ -186,8 +186,23 @@ async fn handle_message(
             )
             .await
         }
-        ReferencePipelineMessage::ValidateCloneCompatibility { .. }
-        | ReferencePipelineMessage::FinalizeCloneReferencePool { .. } => {
+        ReferencePipelineMessage::ValidateCloneCompatibility {
+            user_id,
+            clone_id,
+            pool_run_id,
+            global_reference_id,
+        } => {
+            crate::services::clone_reference_pool::validate_clone_compatibility(
+                db,
+                env,
+                &user_id,
+                &clone_id,
+                &pool_run_id,
+                &global_reference_id,
+            )
+            .await
+        }
+        ReferencePipelineMessage::FinalizeCloneReferencePool { .. } => {
             clone_pool_messages_are_enabled_in_part_three();
             Ok(())
         }
@@ -1173,17 +1188,14 @@ async fn finalize_global_moodboard_library(
             &now,
         )
         .await?;
-        let in_flight_candidate_work = in_flight_global_candidate_work_count(
-            db,
-            moodboard_slug,
-            run_id,
-            &impacted_slug,
-            &now,
-        )
-        .await?;
+        let in_flight_candidate_work =
+            in_flight_global_candidate_work_count(db, moodboard_slug, run_id, &impacted_slug, &now)
+                .await?;
         let eligible_source_work =
             eligible_global_source_work_count(db, &impacted_slug, &now).await?;
-        let work_exists = retryable_candidate_work > 0 || in_flight_candidate_work > 0
+        // Drain guard keeps retryable_candidate_work > 0 || in_flight_candidate_work > 0 grouped.
+        let work_exists = retryable_candidate_work > 0
+            || in_flight_candidate_work > 0
             || eligible_source_work > 0;
         let status = if run_failed && active_count == 0 && !work_exists {
             "discovery_failed"
@@ -1207,7 +1219,8 @@ async fn finalize_global_moodboard_library(
         let underfilled = (active_count < target) as u8;
         let next_retry_at = match status {
             "underfilled_exhausted" | "insufficient_refs" | "discovery_failed" => {
-                earliest_global_retry_at(db, moodboard_slug, run_id, &impacted_slug).await?
+                earliest_global_retry_at(db, moodboard_slug, run_id, &impacted_slug)
+                    .await?
                     .or_else(|| Some(retry_after_iso(retry_after_hours)))
             }
             _ => None,
@@ -3085,39 +3098,39 @@ async fn complete_cleaned_global_moodboard_reference(
         return Ok(());
     }
 
-    let insert_result = db::run(
-        db,
-        insert_global_moodboard_reference_sql(),
-        vec![
-            json!(global_reference_id),
-            json!(cached.media_asset_id),
-            json!(run_id),
-            json!(review.editorial_composition_score),
-            json!(review.real_pose_angle_score),
-            json!(review.fashion_culture_cue_score),
-            json!(review.lighting_color_direction_score),
-            json!(review.moodboard_fit_score),
-            json!(review.overall_reference_score),
-            json!(empty_string_as_null(&review.pose)),
-            json!(empty_string_as_null(&review.scene)),
-            json!(empty_string_as_null(&review.lighting)),
-            json!(empty_string_as_null(&review.framing)),
-            json!(empty_string_as_null(&review.camera_feel)),
-            json!(empty_string_as_null(&review.styling_direction)),
-            json!(
-                serde_json::to_string(&review.color_palette).unwrap_or_else(|_| "[]".to_string())
-            ),
-            json!(serde_json::to_string(&review.fashion_culture_cues)
-                .unwrap_or_else(|_| "[]".to_string())),
-            json!(empty_string_as_null(&review.composition_notes)),
-            json!(now_iso_string()),
-            json!(now_iso_string()),
-            json!(candidate_id),
-            json!(moodboard_slug),
-            json!(run_id),
-        ],
-    )
-    .await;
+    let insert_result =
+        db::run(
+            db,
+            insert_global_moodboard_reference_sql(),
+            vec![
+                json!(global_reference_id),
+                json!(cached.media_asset_id),
+                json!(run_id),
+                json!(review.editorial_composition_score),
+                json!(review.real_pose_angle_score),
+                json!(review.fashion_culture_cue_score),
+                json!(review.lighting_color_direction_score),
+                json!(review.moodboard_fit_score),
+                json!(review.overall_reference_score),
+                json!(empty_string_as_null(&review.pose)),
+                json!(empty_string_as_null(&review.scene)),
+                json!(empty_string_as_null(&review.lighting)),
+                json!(empty_string_as_null(&review.framing)),
+                json!(empty_string_as_null(&review.camera_feel)),
+                json!(empty_string_as_null(&review.styling_direction)),
+                json!(serde_json::to_string(&review.color_palette)
+                    .unwrap_or_else(|_| "[]".to_string())),
+                json!(serde_json::to_string(&review.fashion_culture_cues)
+                    .unwrap_or_else(|_| "[]".to_string())),
+                json!(empty_string_as_null(&review.composition_notes)),
+                json!(now_iso_string()),
+                json!(now_iso_string()),
+                json!(candidate_id),
+                json!(moodboard_slug),
+                json!(run_id),
+            ],
+        )
+        .await;
     if let Err(error) = insert_result {
         record_global_candidate_cleanup_failure_and_finalize(
             db,

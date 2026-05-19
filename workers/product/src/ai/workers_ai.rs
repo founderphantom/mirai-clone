@@ -548,6 +548,8 @@ Accept only if the cleaned candidate is physically compatible enough for Soul-ba
 - similar hair length
 - matching facial-hair presence or absence when facial hair is relevant
 
+Gender is not a v1 compatibility signal. Do not reject because of perceived gender, styling gender expression, makeup, clothing category, or presentation. Reject only when body proportions, hair length, or facial-hair presence strongly conflict with the clone references.
+
 Do not require the same face, identity, clothing, outfit, background, pose, lighting, camera, or scene. The clone identity comes from the Soul. This review is only a pre-generation compatibility gate for body proportions, hair length, and facial hair."#
     )
 }
