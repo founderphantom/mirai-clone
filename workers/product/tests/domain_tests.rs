@@ -156,6 +156,49 @@ fn visual_reference_pipeline_schema_has_required_columns_and_config() {
 }
 
 #[test]
+fn global_moodboard_reference_pipeline_schema_has_required_tables_and_constraints() {
+    let migration = include_str!(
+        "../../../config/d1/migrations/1009_global_moodboard_reference_pipeline.sql"
+    );
+
+    for table in [
+        "CREATE TABLE IF NOT EXISTS global_moodboard_definitions",
+        "CREATE TABLE IF NOT EXISTS global_moodboard_source_runs",
+        "CREATE TABLE IF NOT EXISTS global_moodboard_search_state",
+        "CREATE TABLE IF NOT EXISTS global_moodboard_handles",
+        "CREATE TABLE IF NOT EXISTS global_visual_reference_candidates",
+        "CREATE TABLE IF NOT EXISTS global_visual_candidate_discoveries",
+        "CREATE TABLE IF NOT EXISTS global_moodboard_references",
+        "CREATE TABLE IF NOT EXISTS clone_visual_reference_compatibility",
+        "CREATE TABLE IF NOT EXISTS clone_reference_compatibility_attempts",
+        "CREATE TABLE IF NOT EXISTS clone_pool_waiting_moodboards",
+        "CREATE TABLE IF NOT EXISTS user_reference_state",
+        "CREATE TABLE IF NOT EXISTS global_moodboard_reference_state",
+        "CREATE TABLE IF NOT EXISTS clone_reference_state",
+        "CREATE TABLE IF NOT EXISTS clone_pool_runs",
+        "CREATE TABLE IF NOT EXISTS queue_message_reservations",
+    ] {
+        assert!(migration.contains(table), "{table}");
+    }
+
+    assert!(migration.contains("clone_id TEXT"));
+    assert!(migration.contains("UNIQUE(user_id, slug)"));
+    assert!(migration.contains("source_image_key TEXT NOT NULL"));
+    assert!(migration.contains("review_json TEXT NOT NULL DEFAULT '{}'"));
+    assert!(migration.contains("cleanup_json TEXT NOT NULL DEFAULT '{}'"));
+    assert!(migration.contains("UNIQUE(platform, source_image_key)"));
+    assert!(migration.contains("UNIQUE(candidate_id, run_id, moodboard_slug, source_key)"));
+    assert!(migration.contains("UNIQUE(clone_id, global_reference_id)"));
+    assert!(migration.contains("UNIQUE(pool_run_id, moodboard_slug)"));
+    assert!(migration.contains("UNIQUE(queue_name, message_kind, dedupe_key)"));
+    assert!(migration.contains("global_refs_per_moodboard_target"));
+    assert!(migration.contains("clone_pool_compatibility_wave_size"));
+    assert!(migration.contains("PRAGMA defer_foreign_keys = true;"));
+    assert!(migration.contains("PRAGMA defer_foreign_keys = false;"));
+    assert!(!migration.contains("PRAGMA foreign_keys = OFF;"));
+}
+
+#[test]
 fn visual_reference_pipeline_append_migration_updates_existing_d1_databases() {
     let migration = include_str!(
         "../../../config/d1/migrations/1008_visual_reference_cleanup_compatibility.sql"
