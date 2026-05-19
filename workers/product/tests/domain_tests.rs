@@ -7449,6 +7449,39 @@ fn part_four_scheduler_wakeup_and_stale_guard_surface_is_implemented() {
 }
 
 #[test]
+fn part_four_reference_pipeline_plan_surface_is_implemented() {
+    let lib = include_str!("../src/lib.rs");
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let reservations = include_str!("../src/services/queue_reservations.rs");
+    let scheduler = include_str!("../src/services/global_reference_scheduler.rs");
+    let clone_pool = include_str!("../src/services/clone_reference_pool.rs");
+
+    for required in [
+        "enqueue_due_global_moodboard_libraries",
+        "scheduler_due_global_moodboard_libraries_sql",
+        "reservation_key_for_reference_message",
+        "mark_queue_message_handled",
+        "global_next_retry_gate_sql",
+        "current_global_run_guard_sql",
+        "wake_clone_pools_for_impacted_slug",
+        "clone_pool_wakeup_candidates_sql",
+        "insert_clone_pool_waiting_moodboard_sql",
+        "current_clone_pool_run_guard_sql",
+        "record_stale_clone_compatibility_attempt_sql",
+        "cancel_unstarted_pool_reservations",
+    ] {
+        assert!(
+            lib.contains(required)
+                || queue.contains(required)
+                || reservations.contains(required)
+                || scheduler.contains(required)
+                || clone_pool.contains(required),
+            "{required}"
+        );
+    }
+}
+
+#[test]
 fn failed_clone_retry_reuses_user_moodboards_without_copying_clone_references() {
     let onboarding = include_str!("../src/routes/onboarding.rs");
     let messages = include_str!("../src/queues/messages.rs");
