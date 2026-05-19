@@ -166,9 +166,12 @@ Validation:
 - maximum selected moodboards: `10`
 - duplicates are removed after trimming IDs
 - selected moodboards must belong to the authenticated user
-- only active global moodboard definitions count toward validation and save
-  output; disabled selected rows are ignored for the 1-10 count and derived
-  state until re-enabled
+- submitted moodboard IDs must resolve to active global moodboard definitions
+- requests that include a disabled or deleted global moodboard definition return
+  `400` with `disabled_moodboard` and leave the prior active selection unchanged
+- existing stored `selected = 1` rows for disabled definitions may be retained for
+  history, but they are ignored for the 1-10 count, response selected state,
+  selected moodboard hash, discovery, and clone pool build until re-enabled
 
 After saving selected moodboards, the route should:
 
@@ -219,6 +222,11 @@ Handle discovery rules:
   them.
 - Add previously successful global handles for the same Kimi-assigned
   moodboard, weighted by acceptance yield and freshness.
+- If a handle discovered under slug A produces an accepted reference Kimi assigns
+  to slug B, upsert or update a `global_moodboard_handles` row for B with
+  `discovered_via = 'cross_routed_acceptance'`, increment B's accepted/yield
+  counters, and keep A's source-state row for audit. Do not copy A-specific
+  failure cooldowns onto B.
 - Optionally add one-hop related profiles from `/v1/instagram/profile`, capped
   tightly and only when the profile is public.
 - Do not discover from profile pictures.
@@ -254,14 +262,20 @@ Default global discovery caps should remain configurable:
 - `visual_reference_cleanup_retry_limit`: `3`
 - `visual_reference_compatibility_retry_limit`: `2`
 - `clone_compatibility_reference_limit`: `4`
+- `clone_pool_global_reference_review_limit`: `40`
+- `clone_pool_compatibility_wave_size`: `10`
 - `batch_size`: `5`
 
 `clone_compatibility_reference_limit` controls how many clone identity/reference
-images are sent into a compatibility review. It is not the number of global
-references required for a Blitz batch. `global_refs_for_pool_min` controls
-whether a clone pool build has enough global candidates in aggregate across all
-selected moodboard slugs to attempt compatibility. It is not a per-slug minimum.
-Blitz pool readiness uses `batch_size`.
+images are sent into each compatibility review prompt. It is not the number of
+global references reviewed for a pool. `clone_pool_global_reference_review_limit`
+caps how many compatibility-actionable global references one pool run may review
+across all selected moodboards. `clone_pool_compatibility_wave_size` caps how many
+of those references are enqueued before the pool is re-finalized.
+`global_refs_for_pool_min` controls whether a clone pool build has enough global
+candidates in aggregate across all selected moodboard slugs to attempt
+compatibility. It is not a per-slug minimum. Blitz pool readiness uses
+`batch_size`.
 
 `global_refs_per_moodboard_min_ready` is a per-slug starvation threshold for
 priority and source-relaxation decisions. It is not a library-ready threshold.
@@ -316,11 +330,13 @@ Required source tracking:
   - one row per moodboard slug plus search term/date window/page
   - stores last run time, next eligible time, seen result count, and failure
     state
+  - status values: `active`, `cooldown`, `exhausted`, `disabled`
 - `global_moodboard_handles`
   - one row per moodboard slug plus normalized handle
   - stores discovery source, related depth, last fetched time, next cursor,
     accepted count, rejected count, fetch count, failure count, cooldown until,
     and status
+  - status values: `active`, `cooldown`, `exhausted`, `disabled`, `bad_source`
 
 Handle rotation:
 
@@ -342,14 +358,32 @@ Exhaustion gating:
   exhaustion.
 - `EnsureGlobalMoodboardLibrary` must check for eligible source work before
   creating a new run after `insufficient_refs` or `underfilled_exhausted`.
-- Eligible work exists when at least one selected search term/page/date-window
-  row in `global_moodboard_search_state` has `next_eligible_at IS NULL OR
+- Eligible source work exists when at least one selected
+  search-term/page/date-window row in `global_moodboard_search_state` has
+  `status IN ('active', 'cooldown')` and `next_eligible_at IS NULL OR
   next_eligible_at <= now`, or at least one handle row in
-  `global_moodboard_handles` has `cooldown_until IS NULL OR cooldown_until <=
-  now`.
-- Retryable candidate work exists when at least one candidate for the moodboard
-  has `candidate_status = 'active'` and one of these is true:
-  - `review_status IN ('queued', 'reviewing')`
+  `global_moodboard_handles` has `status IN ('active', 'cooldown')` and
+  `cooldown_until IS NULL OR cooldown_until <= now`.
+- Search rows with `status IN ('exhausted', 'disabled')` and handles with
+  `status IN ('exhausted', 'disabled', 'bad_source')` do not make a moodboard
+  eligible for new work. They become eligible again only through explicit
+  re-enable, repair, or a scheduled refresh that changes status and retry time.
+- Retryable candidate work is attributed by stage:
+  - Kimi review work before approval (`queued`, reclaimable `reviewing`, or
+    retryable `failed`) counts against `discovery_moodboard_slug`.
+  - Seedream cleanup work after Kimi approval counts against
+    `assigned_moodboard_slug`.
+  - Duplicate rediscovery audit rows do not make the rediscovering slug own
+    retryable candidate work unless the later Kimi assignment routes the
+    candidate to that slug.
+- Retryable candidate work exists for the attributed moodboard when at least one
+  candidate has `candidate_status = 'active'` and one of these is true:
+  - `review_status = 'queued'`
+  - `review_status = 'reviewing'`, `review_locked_until > now`, and
+    `review_run_id` belongs to the current nonstale source run for the discovery
+    moodboard
+  - `review_status = 'reviewing'`, the claim is expired or stale, review attempts
+    remain, and the candidate can be reclaimed now by a new nonstale review batch
   - `review_status = 'failed'`, `review_attempt_count` is below the review
     retry limit from `visual_reference_review_retry_limit`, and
     `review_next_retry_at IS NULL OR review_next_retry_at <= now`
@@ -437,12 +471,16 @@ Reject candidate normalization if:
 - no usable image URL exists
 - the URL is from a profile picture field
 - the post is private or cannot be mapped to a public post URL
-- the candidate duplicates an already seen `platform + source_image_key`
 - dimensions are too small for generation guidance
 - caption/source text contains synthetic-generation terms that suggest the
   source is an AI/prompt/render showcase
 - the media is a video, reel, or TV item and video thumbnail fallback is not
   explicitly enabled
+
+If normalization finds an already seen `platform + source_image_key`, do not
+create a new candidate and do not treat it as a rejected candidate. Append
+rediscovery audit metadata through `global_visual_candidate_discoveries`, update
+`last_seen_run_id`, and continue with other discovered images.
 
 ## Soul2-Oriented Kimi Visual Guardrail
 
@@ -570,11 +608,13 @@ Acceptance thresholds:
 
 Candidate review state:
 
-- Kimi approval sets `review_status = 'approved'` and keeps
-  `candidate_status = 'active'`.
-- Kimi rejection sets `review_status = 'rejected'` and keeps
-  `candidate_status = 'active'` so the rejection is available for audit and
-  learning but not reusable as a reference.
+- Kimi approval sets `review_status = 'approved'`, stores
+  `assigned_moodboard_slug = bestMoodboardSlug`, moves `cleanup_status` from
+  `not_required` to `queued`, and keeps `candidate_status = 'active'`.
+- Kimi rejection sets `review_status = 'rejected'`, leaves
+  `cleanup_status = 'not_required'`, and keeps `candidate_status = 'active'` so
+  the rejection is available for audit and learning but not reusable as a
+  reference.
 - Kimi infrastructure/provider failure with attempts remaining leaves
   `review_status = 'failed'` with retry metadata.
 - Kimi failure after retries are exhausted sets `review_status = 'failed'` and
@@ -628,6 +668,12 @@ Rules:
   expired, returns `403`, returns `404`, times out repeatedly, or no longer
   serves image content, set `candidate_status = 'source_unavailable'` and
   continue searching for replacements.
+- `cleanup_status = 'not_required'` is valid only before Kimi approval or for
+  candidates that will never become global references, such as rejected
+  candidates. Kimi approval must move cleanup to `queued`, `cleaning`, `cleaned`,
+  or `failed`.
+- A `global_moodboard_references` row may be created only from a candidate with
+  `review_status = 'approved'` and `cleanup_status = 'cleaned'`.
 - Do not enable ScrapeCreators `download_media=true` as an automatic retry in
   v1. If source URL expiry becomes common, revisit that as a costed product
   decision.
@@ -666,9 +712,11 @@ Recommended schema:
     `created_at`, `updated_at`, `started_at`, and `completed_at`
 - `global_moodboard_search_state`
   - tracks search term/page/date-window rotation per moodboard slug
+  - status values: `active`, `cooldown`, `exhausted`, `disabled`
 - `global_moodboard_handles`
   - tracks discovered handles, yield, usage, cursor, cooldown, and failure state
     per moodboard slug
+  - status values: `active`, `cooldown`, `exhausted`, `disabled`, `bad_source`
 - `global_visual_reference_candidates`
   - global candidate and review records
   - `platform TEXT NOT NULL`
@@ -699,6 +747,8 @@ Recommended schema:
     `failed`
   - cleanup status values: `not_required`, `queued`, `cleaning`, `cleaned`,
     `failed`
+  - `cleanup_status = 'not_required'` is valid only while the candidate is not
+    approved for reusable reference creation
   - `metadata_json TEXT NOT NULL DEFAULT '{}'`
   - stores source metadata, Kimi review, cleanup status, and cleanup attempts
   - uniqueness by `platform, source_image_key`
@@ -726,6 +776,8 @@ Recommended schema:
   - cleaned, reusable global references for a moodboard
   - references `global_visual_reference_candidates.id`
   - references global `media_assets.id`
+  - may be created only when the candidate has `review_status = 'approved'` and
+    `cleanup_status = 'cleaned'`
   - required uniqueness: `UNIQUE(candidate_id)` and `UNIQUE(media_asset_id)`
   - stores `moodboard_slug` as the Kimi-assigned moodboard slug
   - stores `source_run_id` and `discovery_moodboard_slug` for finalization,
@@ -758,9 +810,30 @@ Recommended schema:
     `(user_id, status)`
 - `visual_references`
   - clone-scoped Blitz-ready references
+  - `id TEXT PRIMARY KEY`
   - `user_id TEXT NOT NULL`
   - `clone_id TEXT NOT NULL`
-  - references `global_moodboard_references.id`
+  - `global_reference_id TEXT NOT NULL`
+  - `media_asset_id TEXT NOT NULL`
+  - `moodboard_slug TEXT NOT NULL`
+  - `niche_cluster TEXT` mirrors `moodboard_slug` until legacy Blitz naming is
+    removed
+  - `status TEXT NOT NULL DEFAULT 'active'`
+  - `source_platform TEXT`
+  - `source_image_key TEXT`
+  - `source_handle TEXT`
+  - `source_post_id TEXT`
+  - `source_post_code TEXT`
+  - `source_url TEXT`
+  - `usage_count INTEGER NOT NULL DEFAULT 0`
+  - `last_used_at TEXT`
+  - `created_at TEXT NOT NULL`
+  - `updated_at TEXT NOT NULL`
+  - references `global_moodboard_references.id` through `global_reference_id`
+  - references `media_assets.id` through `media_asset_id`
+  - required uniqueness: `UNIQUE(clone_id, global_reference_id)`
+  - indexes: `(user_id, clone_id, status)`, `(moodboard_slug, status)`, and
+    `(global_reference_id)`
   - stores only compatibility-accepted references and generation usage counters
 - `user_inspiration_pool`
   - remains clone-scoped for Blitz
@@ -834,6 +907,15 @@ The migration must rebuild or recreate:
 - `moodboards`
   - remove required `clone_id`
   - preserve user selection rows by `UNIQUE(user_id, slug)`
+  - collapse duplicate legacy rows by normalized `user_id + slug` before adding
+    uniqueness
+  - rebuilt `id` must use the deterministic moodboard ID helper for
+    `user_id + slug`, not whichever duplicate row happens to be read first
+  - merged `selected` is `1` when any duplicate row has `selected = 1`
+  - merged `created_at` is the earliest duplicate timestamp and `updated_at` is
+    the latest duplicate timestamp
+  - known slugs use the canonical `global_moodboard_definitions` metadata; unknown
+    legacy slugs are dropped from the rebuilt selection table
 - `global_moodboard_definitions`
   - create app-owned catalog rows from the current moodboard seeds
 - `discovery_sources`
@@ -855,6 +937,9 @@ The migration must rebuild or recreate:
 - `visual_references`
   - keep `clone_id NOT NULL`
   - add `global_reference_id`
+  - add explicit `media_asset_id`, `moodboard_slug`, `status`, source metadata,
+    usage counters, and timestamps described in the storage model
+  - enforce `UNIQUE(clone_id, global_reference_id)`
   - store only compatibility-accepted Blitz-ready rows
 - `user_inspiration_pool`
   - rebuild FKs and uniqueness so clone-scoped pool rows point at
@@ -1080,6 +1165,11 @@ Idempotent queue reservations:
   equivalent compare-and-swap status transition. Review results may be written
   only by the holder of the current nonexpired claim and only while the source
   run is still current for the discovery moodboard.
+- A candidate stuck in `reviewing` with an expired `review_locked_until` or a
+  stale `review_run_id` must not block exhaustion forever. The next review batch
+  may reclaim it if review attempts remain by writing a new claim, or mark it
+  `review_status = 'failed'` and `candidate_status = 'review_failed'` when retry
+  attempts are exhausted.
 - If review is later split into per-candidate queue messages, those messages may
   use `global:<run_id>:review:<candidate_id>`, but the batch-shaped
   `ReviewGlobalVisualCandidates` message must not use that key.
@@ -1357,6 +1447,26 @@ Clone compatibility candidate predicate:
   clone/reference pair. `failed` with `next_retry_at IS NULL` is also terminal
   for v1 unless a later repair job explicitly resets it.
 
+Per-pool compatibility fanout:
+
+- Each clone pool run selects at most
+  `clone_pool_global_reference_review_limit` compatibility-actionable global
+  references across all selected moodboards.
+- Selection is balanced across selected active moodboard slugs with round-robin
+  fill, then ranked by higher `overall_reference_score`, higher Soul2 score
+  diversity, underrepresented handles/sources, lower prior usage, and recency.
+- References with no compatibility row are preferred over due retry rows.
+  Accepted rows missing a clone-scoped `visual_references` row are repaired before
+  enqueueing new provider calls.
+- Compatibility messages are enqueued in waves of at most
+  `clone_pool_compatibility_wave_size`. After each wave finalizes, stop scheduling
+  additional compatibility calls for that pool when active compatible
+  clone-scoped references for the selected moodboards reach `batch_size`.
+- If a pool reaches `pool_ready`, unstarted reservations for later waves should
+  be cancelled or allowed to expire. Already in-flight compatibility messages may
+  finish only if the pool run is still current and nonstale, but no new work may
+  be scheduled beyond the per-pool cap.
+
 If the global library cannot supply enough candidates for pool build:
 
 1. Determine whether selected moodboard slugs have at least
@@ -1565,6 +1675,10 @@ Unit and domain tests should cover:
 - selected moodboards must belong to the authenticated user
 - disabled global moodboard definitions do not count toward selection
   validation, selected hash, discovery, or clone pool build
+- submitted disabled or deleted moodboard IDs are rejected instead of silently
+  saved as active selections
+- migration collapses duplicate legacy `moodboards` rows deterministically by
+  `user_id + slug`
 - failed clone retries preserve selected moodboards
 - frontend allows moodboard selection without an active clone
 - frontend accepts 1-10 selected moodboards, not exactly 5
@@ -1594,9 +1708,14 @@ Unit and domain tests should cover:
 - global search state rotates moodboard search terms, pages, and date windows
 - `EnsureGlobalMoodboardLibrary` bootstraps missing search-state rows from
   active moodboard definition search queries before exhaustion checks
+- source eligibility ignores exhausted or disabled search rows and exhausted,
+  disabled, or bad-source handle rows until an explicit retry or repair makes
+  them active again
 - global handle selection prefers fresh and high-yield handles
 - global handle selection cools down repeated failures and repeated zero-yield
   handles
+- cross-routed accepted references update handle learning for the Kimi-assigned
+  moodboard slug without copying source cooldowns from the discovery slug
 - overused handles are skipped unless the moodboard is starved
 - Instagram profile normalizer never emits profile pictures as candidates
 - user posts normalizer extracts static post image candidates
@@ -1610,6 +1729,8 @@ Unit and domain tests should cover:
   candidates
 - duplicate rediscovery writes `global_visual_candidate_discoveries` rows tied
   to the current run
+- duplicate rediscovery does not create a rejected candidate row or count as a
+  normalization failure
 - `global_visual_candidate_discoveries` uses non-null `source_key` for
   uniqueness and does not rely on nullable SQLite unique-index columns
 - candidate normalization and storage use `discovery_moodboard_slug`, not a
@@ -1625,6 +1746,8 @@ Unit and domain tests should cover:
 - off-style but strong images are assigned to another app moodboard
 - cross-routed approvals update the assigned moodboard slug's reference state
   and wake waiting or passive insufficient clone pools for that slug
+- Kimi approval stores `assigned_moodboard_slug` and queues cleanup before any
+  global reference can be created
 - Seedream cleanup prompt matches the exact text-only prompt
 - expired or forbidden external source image URLs set
   `candidate_status = 'source_unavailable'` and search continues
@@ -1632,7 +1755,13 @@ Unit and domain tests should cover:
   `review_status`, and Seedream cleanup progress uses `cleanup_status`
 - retryable candidate work is defined from `candidate_status`,
   `review_status`, `cleanup_status`, attempt counts, and next retry timestamps
+- retryable candidate work is attributed to `discovery_moodboard_slug` before
+  Kimi approval and to `assigned_moodboard_slug` during cleanup after approval
+- expired or stale `reviewing` claims are reclaimed or marked failed instead of
+  blocking exhaustion forever
 - cleanup retries are capped and failed candidates do not block replacements
+- `cleanup_status = 'not_required'` is never enough to create a global reference;
+  global references require approved review and cleaned media
 - only cleaned images are cached to R2
 - saving moodboards enqueues global discovery for selected underfilled slugs
 - moodboard save only updates state and enqueues/reserves kickoff messages; it
@@ -1669,8 +1798,10 @@ Unit and domain tests should cover:
   them insufficient when no references remain possible
 - `FinalizeGlobalMoodboardLibrary` wakes passive insufficient clone pools when
   later impacted or cross-routed slugs gain compatibility-actionable references
-- `FinalizeGlobalMoodboardLibrary` wakeups resume the same current nonstale pool
-  run instead of creating a fresh run
+- `FinalizeGlobalMoodboardLibrary` wakeups for active `waiting` rows resume the
+  same current nonstale pool run instead of creating a fresh run
+- `FinalizeGlobalMoodboardLibrary` wakeups for passive `insufficient` rows create
+  or reuse a replacement pool run when the old pool run is terminal
 - stale global messages cannot create active global references or reusable
   global media assets
 - stale clone pool messages cannot create active clone-scoped visual references
@@ -1688,12 +1819,20 @@ Unit and domain tests should cover:
   candidate-level review claims before Kimi calls
 - clone compatibility checks body proportions, hair length, and facial hair
 - clone compatibility does not reject only because of gender
+- clone compatibility reviews are capped per pool by
+  `clone_pool_global_reference_review_limit` and enqueued in waves of
+  `clone_pool_compatibility_wave_size`
+- clone pool build stops scheduling new compatibility waves once `pool_ready` is
+  reached
 - clone compatibility retry state records `attempt_count`, last error, and
   `next_retry_at`, and retries only eligible failed rows
 - incompatible global references are written to
   `clone_visual_reference_compatibility`, not to Blitz-ready
   `visual_references`
 - compatible global references create clone-scoped `visual_references`
+- clone-scoped `visual_references` include `media_asset_id`, status,
+  `moodboard_slug`, `global_reference_id`, source metadata, usage counters, and
+  uniqueness by `clone_id + global_reference_id`
 - incompatible global references are recorded and skipped for the same clone
 - deselected moodboards are excluded from future Blitz selection without
   changing generation eligibility
