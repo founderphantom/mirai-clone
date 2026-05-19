@@ -47,6 +47,85 @@ pub enum GenerationMessage {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ReferencePipelineMessage {
+    EnsureGlobalMoodboardLibrary {
+        moodboard_slug: String,
+        reason: String,
+    },
+    DiscoverGlobalInstagramHandles {
+        moodboard_slug: String,
+        run_id: String,
+        search_term: String,
+        date_window: String,
+        page: u32,
+    },
+    FetchGlobalInstagramProfile {
+        moodboard_slug: String,
+        run_id: String,
+        handle: String,
+        discovered_via: String,
+        related_depth: u8,
+    },
+    FetchGlobalInstagramPosts {
+        moodboard_slug: String,
+        run_id: String,
+        handle: String,
+        discovered_via: String,
+        next_max_id: Option<String>,
+        page: u8,
+    },
+    FetchGlobalInstagramPostDetail {
+        moodboard_slug: String,
+        run_id: String,
+        handle: String,
+        discovered_via: String,
+        source_url: String,
+    },
+    ReviewGlobalVisualCandidates {
+        moodboard_slug: String,
+        run_id: String,
+        limit: u32,
+    },
+    CleanupGlobalMoodboardReference {
+        moodboard_slug: String,
+        run_id: String,
+        candidate_id: String,
+    },
+    FinalizeGlobalMoodboardLibrary {
+        moodboard_slug: String,
+        run_id: String,
+        reason: String,
+    },
+    BuildCloneReferencePool {
+        user_id: String,
+        clone_id: String,
+        reason: String,
+    },
+    RefreshPool {
+        user_id: String,
+        clone_id: String,
+        reason: String,
+    },
+    ValidateCloneCompatibility {
+        user_id: String,
+        clone_id: String,
+        pool_run_id: String,
+        global_reference_id: String,
+    },
+    FinalizeCloneReferencePool {
+        user_id: String,
+        clone_id: String,
+        pool_run_id: String,
+        reason: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

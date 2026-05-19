@@ -33,6 +33,7 @@ use mirai_product_worker::instagram_references::{
     normalize_instagram_post_detail_with_policy, normalize_instagram_profile_related_handles,
     normalize_instagram_user_posts, InstagramFallbackPolicy,
 };
+use mirai_product_worker::queues::messages::ReferencePipelineMessage;
 use mirai_product_worker::routes::blitz::{
     map_blitz_service_error, parse_history_limit, read_required_query_param,
 };
@@ -199,6 +200,59 @@ fn global_moodboard_reference_pipeline_schema_has_required_tables_and_constraint
     assert!(migration.contains("PRAGMA defer_foreign_keys = true;"));
     assert!(migration.contains("PRAGMA defer_foreign_keys = false;"));
     assert!(!migration.contains("PRAGMA foreign_keys = OFF;"));
+}
+
+#[test]
+fn global_reference_messages_serialize_without_user_or_clone_scope() {
+    let ensure = serde_json::to_value(ReferencePipelineMessage::EnsureGlobalMoodboardLibrary {
+        moodboard_slug: "warm-ambient".to_string(),
+        reason: "onboarding_selection".to_string(),
+    })
+    .unwrap();
+
+    assert_eq!(ensure["type"], json!("ensure_global_moodboard_library"));
+    assert_eq!(ensure["moodboardSlug"], json!("warm-ambient"));
+    assert!(ensure.get("userId").is_none());
+    assert!(ensure.get("cloneId").is_none());
+    assert!(ensure.get("runId").is_none());
+
+    let cleanup = serde_json::to_value(ReferencePipelineMessage::CleanupGlobalMoodboardReference {
+        moodboard_slug: "warm-ambient".to_string(),
+        run_id: "global_run_1".to_string(),
+        candidate_id: "candidate_1".to_string(),
+    })
+    .unwrap();
+
+    assert_eq!(cleanup["type"], json!("cleanup_global_moodboard_reference"));
+    assert_eq!(cleanup["runId"], json!("global_run_1"));
+    assert!(cleanup.get("userId").is_none());
+    assert!(cleanup.get("cloneId").is_none());
+}
+
+#[test]
+fn clone_pool_messages_serialize_with_pool_run_only_after_kickoff() {
+    let kickoff = serde_json::to_value(ReferencePipelineMessage::BuildCloneReferencePool {
+        user_id: "user_1".to_string(),
+        clone_id: "clone_1".to_string(),
+        reason: "soul_ready".to_string(),
+    })
+    .unwrap();
+
+    assert_eq!(kickoff["type"], json!("build_clone_reference_pool"));
+    assert_eq!(kickoff["userId"], json!("user_1"));
+    assert_eq!(kickoff["cloneId"], json!("clone_1"));
+    assert!(kickoff.get("poolRunId").is_none());
+
+    let downstream = serde_json::to_value(ReferencePipelineMessage::ValidateCloneCompatibility {
+        user_id: "user_1".to_string(),
+        clone_id: "clone_1".to_string(),
+        pool_run_id: "pool_run_1".to_string(),
+        global_reference_id: "global_ref_1".to_string(),
+    })
+    .unwrap();
+
+    assert_eq!(downstream["type"], json!("validate_clone_compatibility"));
+    assert_eq!(downstream["poolRunId"], json!("pool_run_1"));
 }
 
 #[test]
