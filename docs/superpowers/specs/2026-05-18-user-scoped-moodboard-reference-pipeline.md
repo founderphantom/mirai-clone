@@ -689,6 +689,8 @@ Recommended schema:
   - `user_id TEXT NOT NULL`
   - `slug TEXT NOT NULL`
   - `selected INTEGER NOT NULL DEFAULT 0`
+  - `created_at TEXT NOT NULL`
+  - `updated_at TEXT NOT NULL`
   - no required `clone_id`
   - `UNIQUE(user_id, slug)`
 - `global_moodboard_definitions`
@@ -825,8 +827,26 @@ Recommended schema:
   - `source_post_id TEXT`
   - `source_post_code TEXT`
   - `source_url TEXT`
-  - `usage_count INTEGER NOT NULL DEFAULT 0`
-  - `last_used_at TEXT`
+  - `source_published_at TEXT`
+  - `image_width INTEGER`
+  - `image_height INTEGER`
+  - `moodboard_id TEXT`
+  - `human_presence_type TEXT NOT NULL DEFAULT 'person'`
+  - `human_presence_score REAL NOT NULL DEFAULT 1`
+  - `organic_photo_score REAL NOT NULL DEFAULT 1`
+  - `freshness_visual_score REAL NOT NULL DEFAULT 1`
+  - `visual_fit_score REAL NOT NULL DEFAULT 0`
+  - `pose TEXT`
+  - `scene TEXT`
+  - `lighting TEXT`
+  - `framing TEXT`
+  - `camera_feel TEXT`
+  - `styling_direction TEXT`
+  - `aesthetic_tags_json TEXT NOT NULL DEFAULT '[]'`
+  - `source_caption_removed INTEGER NOT NULL DEFAULT 1`
+  - `generation_use_count INTEGER NOT NULL DEFAULT 0`
+  - `last_used_batch_id TEXT`
+  - `last_liked_at TEXT`
   - `created_at TEXT NOT NULL`
   - `updated_at TEXT NOT NULL`
   - references `global_moodboard_references.id` through `global_reference_id`
@@ -835,6 +855,11 @@ Recommended schema:
   - indexes: `(user_id, clone_id, status)`, `(moodboard_slug, status)`, and
     `(global_reference_id)`
   - stores only compatibility-accepted references and generation usage counters
+  - preserve existing Blitz/generation column names
+    (`generation_use_count`, `last_used_batch_id`, `last_liked_at`,
+    `aesthetic_tags_json`, and score columns) in v1; do not introduce renamed
+    usage columns unless Blitz selection, generation completion, swipe updates,
+    and tests are migrated in the same implementation
 - `user_inspiration_pool`
   - remains clone-scoped for Blitz
   - references clone-scoped `visual_references`
@@ -892,9 +917,10 @@ D1 uses SQLite semantics and cannot cleanly drop a `NOT NULL` constraint from an
 existing column. The migration should rebuild affected tables instead of
 attempting in-place constraint removal.
 
-Because there are no production users, this migration can be a clean rebuild of
-the visual-reference surface. It should still be append-only and deterministic
-for local and preview databases.
+Because there are no production users, this migration can be a clean destructive
+rebuild of the visual-reference surface. It does not need a complex online
+backfill path. If local or preview rows are retained instead of dropped, use the
+deterministic merge rules below.
 
 Recommended migration name:
 
@@ -906,14 +932,18 @@ The migration must rebuild or recreate:
 
 - `moodboards`
   - remove required `clone_id`
-  - preserve user selection rows by `UNIQUE(user_id, slug)`
-  - collapse duplicate legacy rows by normalized `user_id + slug` before adding
-    uniqueness
+  - if retaining legacy rows, preserve user selection rows by
+    `UNIQUE(user_id, slug)`
+  - if retaining legacy rows, collapse duplicate legacy rows by normalized
+    `user_id + slug` before adding uniqueness
   - rebuilt `id` must use the deterministic moodboard ID helper for
     `user_id + slug`, not whichever duplicate row happens to be read first
   - merged `selected` is `1` when any duplicate row has `selected = 1`
-  - merged `created_at` is the earliest duplicate timestamp and `updated_at` is
-    the latest duplicate timestamp
+  - merged `created_at` is the earliest duplicate `created_at`, or the migration
+    timestamp when no legacy timestamp exists
+  - merged `updated_at` is the latest duplicate `updated_at` when that column is
+    present, otherwise the latest duplicate `created_at`, otherwise the migration
+    timestamp
   - known slugs use the canonical `global_moodboard_definitions` metadata; unknown
     legacy slugs are dropped from the rebuilt selection table
 - `global_moodboard_definitions`
@@ -976,6 +1006,16 @@ Global messages:
 - `ReviewGlobalVisualCandidates { moodboard_slug, run_id, limit }`
 - `CleanupGlobalMoodboardReference { moodboard_slug, run_id, candidate_id }`
 - `FinalizeGlobalMoodboardLibrary { moodboard_slug, run_id, reason }`
+
+For global messages, `moodboard_slug` and `run_id` identify the discovery/source
+run. This remains true for `CleanupGlobalMoodboardReference` even when Kimi
+cross-routes the candidate to a different `assigned_moodboard_slug`. Cleanup and
+finalization must verify currentness against the discovery slug/run, then load
+the candidate's `assigned_moodboard_slug` for global reference creation, storage
+key placement, assigned-slug counts, handle learning, state recounts, and clone
+pool wakeups. `FinalizeGlobalMoodboardLibrary` finalizes only the source run
+status for its `moodboard_slug`, but it must also recount and wake any assigned
+slugs impacted by candidates from that run.
 
 User messages:
 
@@ -1644,6 +1684,7 @@ Generation and Blitz loaders must enforce ownership before using a reference:
 - `visual_references.global_reference_id` points to an active global reference
 - `clone_visual_reference_compatibility.status = 'accepted'` for the same
   `clone_id + global_reference_id`
+- `visual_references.media_asset_id = global_moodboard_references.media_asset_id`
 - `media_assets.id = global_moodboard_references.media_asset_id`
 - `media_assets.user_id = 'global'`
 - `media_assets.clone_id IS NULL`
