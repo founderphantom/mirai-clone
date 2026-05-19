@@ -731,6 +731,84 @@ fn clone_pool_queue_reservations_retry_unsent_and_dedupe_enqueued_only() {
 }
 
 #[test]
+fn queue_reservation_service_defines_lifecycle_ttls_and_dedupe_keys() {
+    let source = include_str!("../src/services/queue_reservations.rs");
+    assert!(source.contains("queue_message_reservations"));
+    assert!(source.contains("status IN ('reserved', 'enqueued', 'handling', 'retrying')"));
+    assert!(source.contains("status = 'expired'"));
+    assert!(source.contains("status = 'cancelled'"));
+    for status in ["enqueued", "handling", "handled", "retrying", "failed"] {
+        assert!(source.contains(&format!("'{status}'")), "{status}");
+    }
+    assert!(source.contains("global:ensure:"));
+    assert!(source.contains("global:<run_id>:review-batch:<moodboard_slug>"));
+    assert!(source.contains("clone:<pool_run_id>:compat:<global_reference_id>"));
+    assert!(source.contains("ReservationTtl::FiveMinutes"));
+    assert!(source.contains("ReservationTtl::ReviewBatch"));
+    assert!(source.contains("ReservationTtl::GlobalRun"));
+    assert!(source.contains("ReservationTtl::ClonePool"));
+}
+
+#[test]
+fn reference_pipeline_handler_marks_reservations_handling_terminal_and_retrying() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let reservations = include_str!("../src/services/queue_reservations.rs");
+    assert!(source.contains("reservation_key_for_reference_message"));
+    assert!(source.contains("claim_queue_message_handling"));
+    assert!(source.contains("mark_queue_message_handled"));
+    assert!(source.contains("mark_queue_message_retrying"));
+    assert!(reservations.contains("mark_queue_message_failed"));
+    assert!(source.contains("message.retry()"));
+    assert!(source.contains("message.ack()"));
+}
+
+#[test]
+fn queue_reservation_claim_guards_terminal_and_duplicate_delivery_states() {
+    let source = include_str!("../src/services/queue_reservations.rs");
+    let handler = include_str!("../src/queues/reference_pipeline.rs");
+
+    assert!(source.contains("QueueHandlingOutcome"));
+    assert!(source.contains("AlreadyHandled"));
+    assert!(source.contains("insert_direct_handling_reservation_sql"));
+    assert!(source.contains("claim_queue_message_handling"));
+
+    let claim_sql = source
+        .split("fn claim_queue_message_handling_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn load_reservation_status_sql()").next())
+        .expect("claim handling sql");
+    assert!(claim_sql.contains("status = 'handling'"));
+    assert!(claim_sql.contains("status IN ('reserved', 'enqueued', 'retrying')"));
+    assert!(claim_sql.contains("expires_at > ?"));
+
+    let handled_sql = source
+        .split("fn mark_queue_message_handled_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn mark_queue_message_retrying_sql()").next())
+        .expect("mark handled sql");
+    assert!(handled_sql.contains("status = 'handling'"));
+    assert!(handled_sql.contains("expires_at > ?"));
+
+    let retrying_sql = source
+        .split("fn mark_queue_message_retrying_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn mark_queue_message_failed_sql()").next())
+        .expect("mark retrying sql");
+    assert!(retrying_sql.contains("status = 'handling'"));
+    assert!(retrying_sql.contains("expires_at > ?"));
+
+    let handle_batch = reference_pipeline_function_body(handler, "pub async fn handle_batch");
+    let already_handled_branch = handle_batch
+        .split("QueueHandlingOutcome::AlreadyHandled")
+        .nth(1)
+        .and_then(|section| section.split("QueueHandlingOutcome::Suppressed").next())
+        .expect("already handled branch");
+    assert!(already_handled_branch.contains("message.ack()"));
+    assert!(already_handled_branch.contains("continue;"));
+    assert!(!already_handled_branch.contains("handle_message"));
+}
+
+#[test]
 fn clone_pool_kickoff_claims_random_run_through_reusable_state_guard() {
     let source = include_str!("../src/services/clone_reference_pool.rs");
     let create_body = source

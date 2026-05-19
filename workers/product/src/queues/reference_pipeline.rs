@@ -25,6 +25,7 @@ use crate::services::global_reference_discovery::{
     select_global_handle_work_sql, select_global_search_work_sql, source_key_for_instagram_handle,
     source_key_for_reels_search, upsert_global_candidate_sql, upsert_global_handle_sql,
 };
+use crate::services::queue_reservations::QueueHandlingOutcome;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -39,10 +40,12 @@ const HIGGSFIELD_CLEANUP_MODEL_VAR: &str = "HIGGSFIELD_MCP_CLEANUP_MODEL";
 
 pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<()> {
     let db = env.d1("DB")?;
-    for raw_message in batch.raw_iter() {
-        let message =
-            match serde_wasm_bindgen::from_value::<ReferencePipelineMessage>(raw_message.body()) {
-                Ok(message) => message,
+    let config = load_reference_pipeline_lifecycle_config(&db).await?;
+
+    for message in batch.raw_iter() {
+        let parsed =
+            match serde_wasm_bindgen::from_value::<ReferencePipelineMessage>(message.body()) {
+                Ok(parsed) => parsed,
                 Err(error) => {
                     web_sys::console::error_1(
                         &format!(
@@ -50,18 +53,70 @@ pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<
                         )
                         .into(),
                     );
-                    raw_message.ack();
+                    message.ack();
                     continue;
                 }
             };
 
-        match handle_message(&db, &env, message).await {
-            Ok(()) => raw_message.ack(),
+        let now = crate::services::queue_reservations::now_iso_string();
+        let reservation =
+            crate::services::queue_reservations::reservation_key_for_reference_message(
+                &parsed,
+                config.global_discovery_run_stale_after_minutes,
+                config.clone_pool_run_stale_after_minutes,
+            );
+        match crate::services::queue_reservations::claim_queue_message_handling(
+            &db,
+            &reservation,
+            &now,
+        )
+        .await?
+        {
+            QueueHandlingOutcome::Claimed => {}
+            QueueHandlingOutcome::AlreadyHandled => {
+                message.ack();
+                continue;
+            }
+            QueueHandlingOutcome::Terminal => {
+                message.ack();
+                continue;
+            }
+            QueueHandlingOutcome::Suppressed => {
+                message.retry();
+                continue;
+            }
+        }
+
+        match handle_message(&db, &env, parsed).await {
+            Ok(()) => {
+                if crate::services::queue_reservations::mark_queue_message_handled(
+                    &db,
+                    &reservation,
+                    &crate::services::queue_reservations::now_iso_string(),
+                )
+                .await?
+                {
+                    message.ack();
+                } else {
+                    web_sys::console::error_1(
+                        &"reference pipeline queue message lost handling reservation before ack"
+                            .into(),
+                    );
+                    message.retry();
+                }
+            }
             Err(error) => {
+                let retry_now = crate::services::queue_reservations::now_iso_string();
+                let _ = crate::services::queue_reservations::mark_queue_message_retrying(
+                    &db,
+                    &reservation,
+                    &retry_now,
+                )
+                .await?;
                 web_sys::console::error_1(
                     &format!("reference pipeline queue message failed: {error}").into(),
                 );
-                raw_message.retry();
+                message.retry();
             }
         }
     }
@@ -2894,6 +2949,43 @@ async fn config_value_u32(db: &D1Database, key: &str, default: u32) -> WorkerRes
     .await?;
     Ok(row
         .and_then(|row| row.value.trim().parse::<u32>().ok())
+        .unwrap_or(default))
+}
+
+#[derive(Debug)]
+struct ReferencePipelineLifecycleConfig {
+    global_discovery_run_stale_after_minutes: i64,
+    clone_pool_run_stale_after_minutes: i64,
+}
+
+async fn load_reference_pipeline_lifecycle_config(
+    db: &D1Database,
+) -> WorkerResult<ReferencePipelineLifecycleConfig> {
+    Ok(ReferencePipelineLifecycleConfig {
+        global_discovery_run_stale_after_minutes: config_value_i64(
+            db,
+            "global_discovery_run_stale_after_minutes",
+            60,
+        )
+        .await?,
+        clone_pool_run_stale_after_minutes: config_value_i64(
+            db,
+            "clone_pool_run_stale_after_minutes",
+            30,
+        )
+        .await?,
+    })
+}
+
+async fn config_value_i64(db: &D1Database, key: &str, default: i64) -> WorkerResult<i64> {
+    let row = db::first::<ConfigValueRow>(
+        db,
+        "SELECT value FROM blitz_config WHERE key = ?",
+        vec![json!(key)],
+    )
+    .await?;
+    Ok(row
+        .and_then(|row| row.value.trim().parse::<i64>().ok())
         .unwrap_or(default))
 }
 

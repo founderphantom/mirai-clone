@@ -6,5 +6,6 @@ pub mod generation_usage;
 pub mod global_reference_discovery;
 pub mod media;
 pub mod provider_accounts;
+pub mod queue_reservations;
 pub mod reference_pipeline;
 pub mod visual_reference_cache;
