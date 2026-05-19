@@ -166,10 +166,11 @@ async fn handle_message(
             cleanup_global_moodboard_reference(db, env, &moodboard_slug, &run_id, &candidate_id)
                 .await
         }
-        ReferencePipelineMessage::FinalizeGlobalMoodboardLibrary { .. } => {
-            global_review_cleanup_and_finalize_are_enabled_in_tasks_11_to_13();
-            Ok(())
-        }
+        ReferencePipelineMessage::FinalizeGlobalMoodboardLibrary {
+            moodboard_slug,
+            run_id,
+            reason,
+        } => finalize_global_moodboard_library(db, env, &moodboard_slug, &run_id, &reason).await,
         ReferencePipelineMessage::BuildCloneReferencePool { .. }
         | ReferencePipelineMessage::RefreshPool { .. }
         | ReferencePipelineMessage::ValidateCloneCompatibility { .. }
@@ -1115,7 +1116,130 @@ async fn cleanup_global_moodboard_reference(
     .await
 }
 
-fn global_review_cleanup_and_finalize_are_enabled_in_tasks_11_to_13() {}
+async fn finalize_global_moodboard_library(
+    db: &D1Database,
+    _env: &Env,
+    moodboard_slug: &str,
+    run_id: &str,
+    reason: &str,
+) -> WorkerResult<()> {
+    let Some(source_run) =
+        load_current_global_source_run_for_finalize(db, moodboard_slug, run_id).await?
+    else {
+        return Ok(());
+    };
+
+    let now = now_iso_string();
+    let impacted_slugs = impacted_global_moodboard_slugs(db, moodboard_slug, run_id).await?;
+    let target = config_value_u32(db, "global_refs_per_moodboard_target", 25)
+        .await?
+        .max(1);
+    let review_retry_limit = config_value_u32(db, "visual_reference_review_retry_limit", 2)
+        .await?
+        .max(1);
+    let cleanup_retry_limit = config_value_u32(db, "visual_reference_cleanup_retry_limit", 3)
+        .await?
+        .max(1);
+    let retry_after_hours = config_value_u32(db, "global_insufficient_retry_after_hours", 6)
+        .await?
+        .max(1);
+    let run_failed = source_run.error_code.is_some();
+    let mut source_slug_work_exists = false;
+    let mut source_slug_status = "refreshing";
+
+    for impacted_slug in impacted_slugs {
+        ensure_global_reference_state(db, &impacted_slug, &now).await?;
+        let active_count = active_global_reference_count(db, &impacted_slug).await?;
+        let retryable_candidate_work = retryable_global_candidate_work_count(
+            db,
+            moodboard_slug,
+            run_id,
+            &impacted_slug,
+            review_retry_limit,
+            cleanup_retry_limit,
+            &now,
+        )
+        .await?;
+        let in_flight_candidate_work = in_flight_global_candidate_work_count(
+            db,
+            moodboard_slug,
+            run_id,
+            &impacted_slug,
+            &now,
+        )
+        .await?;
+        let eligible_source_work =
+            eligible_global_source_work_count(db, &impacted_slug, &now).await?;
+        let work_exists = retryable_candidate_work > 0 || in_flight_candidate_work > 0
+            || eligible_source_work > 0;
+        let status = if run_failed && active_count == 0 && !work_exists {
+            "discovery_failed"
+        } else if active_count >= target {
+            "library_ready"
+        } else if active_count > 0 && work_exists {
+            "underfilled"
+        } else if active_count > 0 {
+            "underfilled_exhausted"
+        } else if active_count == 0 && work_exists {
+            "refreshing"
+        } else if work_exists {
+            "refreshing"
+        } else {
+            "insufficient_refs"
+        };
+        if impacted_slug == moodboard_slug {
+            source_slug_work_exists = work_exists;
+            source_slug_status = status;
+        }
+        let underfilled = (active_count < target) as u8;
+        let next_retry_at = match status {
+            "underfilled_exhausted" | "insufficient_refs" | "discovery_failed" => {
+                earliest_global_retry_at(db, moodboard_slug, run_id, &impacted_slug).await?
+                    .or_else(|| Some(retry_after_iso(retry_after_hours)))
+            }
+            _ => None,
+        };
+        let has_successful_references = active_count > 0;
+
+        update_global_reference_state_after_recount(
+            db,
+            moodboard_slug,
+            run_id,
+            &impacted_slug,
+            active_count,
+            status,
+            underfilled,
+            next_retry_at.as_deref(),
+            has_successful_references,
+            status == "library_ready",
+            status == "underfilled" || status == "underfilled_exhausted",
+            status == "insufficient_refs" || status == "discovery_failed",
+            &now,
+        )
+        .await?;
+    }
+
+    if source_slug_work_exists {
+        return Ok(());
+    }
+    let source_run_terminal_status = if source_slug_status == "discovery_failed" {
+        "discovery_failed"
+    } else {
+        "completed"
+    };
+
+    complete_global_source_run_after_recount(
+        db,
+        moodboard_slug,
+        run_id,
+        source_run_terminal_status,
+        reason,
+        source_run.error_code.as_deref(),
+        source_run.error_message.as_deref(),
+        &now,
+    )
+    .await
+}
 
 fn clone_pool_messages_are_enabled_in_part_three() {}
 
@@ -1410,6 +1534,31 @@ async fn ensure_current_global_run_after_provider_fetch(
     global_run_is_current(db, moodboard_slug, run_id).await
 }
 
+async fn load_current_global_source_run_for_finalize(
+    db: &D1Database,
+    moodboard_slug: &str,
+    run_id: &str,
+) -> WorkerResult<Option<GlobalSourceRunFinalizeRow>> {
+    db::first(
+        db,
+        r#"
+        SELECT
+          run.error_code,
+          run.error_message
+        FROM global_moodboard_source_runs run
+        INNER JOIN global_moodboard_reference_state state
+          ON state.moodboard_slug = run.moodboard_slug
+        WHERE run.id = ?
+          AND run.moodboard_slug = ?
+          AND state.current_run_id = ?
+          AND run.status IN ('queued', 'refreshing')
+        LIMIT 1
+        "#,
+        vec![json!(run_id), json!(moodboard_slug), json!(run_id)],
+    )
+    .await
+}
+
 async fn select_global_search_work(
     db: &D1Database,
     moodboard_slug: &str,
@@ -1436,6 +1585,209 @@ async fn select_global_handle_work(
         vec![json!(moodboard_slug), json!(now), json!(limit)],
     )
     .await
+}
+
+fn impacted_global_moodboard_slugs_sql() -> &'static str {
+    r#"
+    SELECT DISTINCT moodboard_slug
+    FROM global_moodboard_references
+    WHERE source_run_id = ?
+    UNION
+    SELECT DISTINCT discovery_moodboard_slug AS moodboard_slug
+    FROM global_moodboard_references
+    WHERE source_run_id = ?
+      AND discovery_moodboard_slug = ?
+    UNION
+    SELECT ?
+    "#
+}
+
+fn active_global_reference_count_sql() -> &'static str {
+    r#"
+    SELECT COUNT(*) AS count
+    FROM global_moodboard_references
+    WHERE moodboard_slug = ?
+      AND status = 'active'
+    "#
+}
+
+fn retryable_global_candidate_work_sql() -> &'static str {
+    r#"
+    SELECT COUNT(*) AS count
+    FROM global_visual_candidate_discoveries gcd
+    JOIN global_visual_reference_candidates gvc ON gvc.id = gcd.candidate_id
+    WHERE (
+        (gcd.moodboard_slug = ? AND gcd.run_id = ?)
+        OR gvc.assigned_moodboard_slug = ?
+      )
+      AND gvc.candidate_status = 'active'
+      AND (
+        gvc.review_status = 'queued'
+        OR (
+          gvc.review_status = 'reviewing'
+          AND gvc.review_locked_until IS NOT NULL
+          AND gvc.review_locked_until <= ?
+          AND gvc.review_attempt_count < ?
+        )
+        OR (
+          gvc.review_status = 'failed'
+          AND gvc.review_attempt_count < ?
+          AND (gvc.review_next_retry_at IS NULL OR gvc.review_next_retry_at <= ?)
+        )
+        OR (
+          gvc.review_status = 'approved'
+          AND gvc.cleanup_status = 'queued'
+        )
+        OR (
+          gvc.review_status = 'approved'
+          AND gvc.cleanup_status = 'cleaning'
+          AND (gvc.cleanup_next_retry_at IS NULL OR gvc.cleanup_next_retry_at <= ?)
+        )
+        OR (
+          gvc.review_status = 'approved'
+          AND gvc.cleanup_status = 'failed'
+          AND gvc.cleanup_attempt_count < ?
+          AND (gvc.cleanup_next_retry_at IS NULL OR gvc.cleanup_next_retry_at <= ?)
+        )
+      )
+    "#
+}
+
+fn in_flight_global_candidate_work_sql() -> &'static str {
+    r#"
+    SELECT COUNT(DISTINCT gvc.id) AS count
+    FROM global_visual_candidate_discoveries gcd
+    JOIN global_visual_reference_candidates gvc ON gvc.id = gcd.candidate_id
+    WHERE (
+        (gcd.moodboard_slug = ? AND gcd.run_id = ?)
+        OR gvc.assigned_moodboard_slug = ?
+      )
+      AND gvc.candidate_status = 'active'
+      AND (
+        (
+          gvc.review_status = 'reviewing'
+          AND gvc.review_locked_until IS NOT NULL
+          AND gvc.review_locked_until > ?
+        )
+        OR (
+          gvc.review_status = 'approved'
+          AND gvc.cleanup_status = 'cleaning'
+          AND gvc.cleanup_next_retry_at IS NOT NULL
+          AND gvc.cleanup_next_retry_at > ?
+        )
+      )
+    "#
+}
+
+fn eligible_global_source_work_sql() -> &'static str {
+    r#"
+    SELECT COUNT(*) AS count
+    FROM (
+      SELECT id
+      FROM global_moodboard_search_state
+      WHERE moodboard_slug = ?
+        AND status IN ('active', 'cooldown')
+        AND (next_eligible_at IS NULL OR next_eligible_at <= ?)
+      UNION ALL
+      SELECT id
+      FROM global_moodboard_handles
+      WHERE moodboard_slug = ?
+        AND status IN ('active', 'cooldown')
+        AND (cooldown_until IS NULL OR cooldown_until <= ?)
+    )
+    "#
+}
+
+fn earliest_global_retry_at_sql() -> &'static str {
+    r#"
+    SELECT MIN(next_retry_at) AS next_retry_at
+    FROM (
+      SELECT next_eligible_at AS next_retry_at
+      FROM global_moodboard_search_state
+      WHERE moodboard_slug = ?
+        AND status IN ('active', 'cooldown')
+        AND next_eligible_at IS NOT NULL
+        AND next_eligible_at > ?
+      UNION ALL
+      SELECT cooldown_until AS next_retry_at
+      FROM global_moodboard_handles
+      WHERE moodboard_slug = ?
+        AND status IN ('active', 'cooldown')
+        AND cooldown_until IS NOT NULL
+        AND cooldown_until > ?
+      UNION ALL
+      SELECT gvc.review_next_retry_at AS next_retry_at
+      FROM global_visual_candidate_discoveries gcd
+      JOIN global_visual_reference_candidates gvc ON gvc.id = gcd.candidate_id
+      WHERE (
+          (gcd.moodboard_slug = ? AND gcd.run_id = ?)
+          OR gvc.assigned_moodboard_slug = ?
+        )
+        AND gvc.candidate_status = 'active'
+        AND gvc.review_status = 'failed'
+        AND gvc.review_next_retry_at IS NOT NULL
+        AND gvc.review_next_retry_at > ?
+      UNION ALL
+      SELECT gvc.review_locked_until AS next_retry_at
+      FROM global_visual_candidate_discoveries gcd
+      JOIN global_visual_reference_candidates gvc ON gvc.id = gcd.candidate_id
+      WHERE (
+          (gcd.moodboard_slug = ? AND gcd.run_id = ?)
+          OR gvc.assigned_moodboard_slug = ?
+        )
+        AND gvc.candidate_status = 'active'
+        AND gvc.review_status = 'reviewing'
+        AND gvc.review_locked_until IS NOT NULL
+        AND gvc.review_locked_until > ?
+      UNION ALL
+      SELECT gvc.cleanup_next_retry_at AS next_retry_at
+      FROM global_visual_candidate_discoveries gcd
+      JOIN global_visual_reference_candidates gvc ON gvc.id = gcd.candidate_id
+      WHERE (
+          (gcd.moodboard_slug = ? AND gcd.run_id = ?)
+          OR gvc.assigned_moodboard_slug = ?
+        )
+        AND gvc.candidate_status = 'active'
+        AND gvc.review_status = 'approved'
+        AND gvc.cleanup_status IN ('failed', 'cleaning')
+        AND gvc.cleanup_next_retry_at IS NOT NULL
+        AND gvc.cleanup_next_retry_at > ?
+    )
+    "#
+}
+
+fn update_global_reference_state_after_recount_sql() -> &'static str {
+    r#"
+    UPDATE global_moodboard_reference_state
+    SET active_reference_count = ?,
+        status = ?,
+        underfilled = ?,
+        next_retry_at = ?,
+        last_successful_refresh_at = CASE WHEN ? THEN ? ELSE last_successful_refresh_at END,
+        last_ready_at = CASE WHEN ? THEN ? ELSE last_ready_at END,
+        last_underfilled_at = CASE WHEN ? THEN ? ELSE last_underfilled_at END,
+        last_insufficient_at = CASE WHEN ? THEN ? ELSE last_insufficient_at END,
+        current_run_id = CASE WHEN moodboard_slug = ? THEN ? ELSE current_run_id END,
+        updated_at = ?
+    WHERE moodboard_slug = ?
+      AND (
+        (moodboard_slug = ? AND current_run_id = ?)
+        OR (
+          moodboard_slug != ?
+          AND (
+            current_run_id IS NULL
+            OR current_run_id = ?
+            OR NOT EXISTS (
+              SELECT 1
+              FROM global_moodboard_source_runs active_run
+              WHERE active_run.id = current_run_id
+                AND active_run.status IN ('queued', 'refreshing')
+            )
+          )
+        )
+      )
+    -- assigned slug recount side effect
+    "#
 }
 
 fn select_global_candidates_for_review_sql() -> &'static str {
@@ -2238,16 +2590,239 @@ async fn increment_global_source_run_count(
 async fn active_global_reference_count(db: &D1Database, moodboard_slug: &str) -> WorkerResult<u32> {
     let row = db::first::<CountRow>(
         db,
-        r#"
-        SELECT COUNT(*) AS count
-        FROM global_moodboard_references
-        WHERE moodboard_slug = ?
-          AND status = 'active'
-        "#,
+        active_global_reference_count_sql(),
         vec![json!(moodboard_slug)],
     )
     .await?;
     Ok(row.map(|row| row.count).unwrap_or(0))
+}
+
+async fn impacted_global_moodboard_slugs(
+    db: &D1Database,
+    moodboard_slug: &str,
+    run_id: &str,
+) -> WorkerResult<Vec<String>> {
+    let rows = db::all::<MoodboardSlugRow>(
+        db,
+        impacted_global_moodboard_slugs_sql(),
+        vec![
+            json!(run_id),
+            json!(run_id),
+            json!(moodboard_slug),
+            json!(moodboard_slug),
+        ],
+    )
+    .await?;
+    let mut seen = HashSet::new();
+    let mut slugs = rows
+        .into_iter()
+        .filter_map(|row| {
+            let slug = row.moodboard_slug.trim().to_string();
+            (!slug.is_empty() && seen.insert(slug.clone())).then_some(slug)
+        })
+        .collect::<Vec<_>>();
+    if !seen.contains(moodboard_slug) {
+        slugs.push(moodboard_slug.to_string());
+    }
+    Ok(slugs)
+}
+
+async fn retryable_global_candidate_work_count(
+    db: &D1Database,
+    source_moodboard_slug: &str,
+    run_id: &str,
+    assigned_moodboard_slug: &str,
+    review_retry_limit: u32,
+    cleanup_retry_limit: u32,
+    now: &str,
+) -> WorkerResult<u32> {
+    let row = db::first::<CountRow>(
+        db,
+        retryable_global_candidate_work_sql(),
+        vec![
+            json!(source_moodboard_slug),
+            json!(run_id),
+            json!(assigned_moodboard_slug),
+            json!(now),
+            json!(review_retry_limit),
+            json!(review_retry_limit),
+            json!(now),
+            json!(now),
+            json!(cleanup_retry_limit),
+            json!(now),
+        ],
+    )
+    .await?;
+    Ok(row.map(|row| row.count).unwrap_or(0))
+}
+
+async fn in_flight_global_candidate_work_count(
+    db: &D1Database,
+    source_moodboard_slug: &str,
+    run_id: &str,
+    assigned_moodboard_slug: &str,
+    now: &str,
+) -> WorkerResult<u32> {
+    let row = db::first::<CountRow>(
+        db,
+        in_flight_global_candidate_work_sql(),
+        vec![
+            json!(source_moodboard_slug),
+            json!(run_id),
+            json!(assigned_moodboard_slug),
+            json!(now),
+            json!(now),
+        ],
+    )
+    .await?;
+    Ok(row.map(|row| row.count).unwrap_or(0))
+}
+
+async fn eligible_global_source_work_count(
+    db: &D1Database,
+    moodboard_slug: &str,
+    now: &str,
+) -> WorkerResult<u32> {
+    let row = db::first::<CountRow>(
+        db,
+        eligible_global_source_work_sql(),
+        vec![
+            json!(moodboard_slug),
+            json!(now),
+            json!(moodboard_slug),
+            json!(now),
+        ],
+    )
+    .await?;
+    Ok(row.map(|row| row.count).unwrap_or(0))
+}
+
+async fn earliest_global_retry_at(
+    db: &D1Database,
+    source_moodboard_slug: &str,
+    run_id: &str,
+    assigned_moodboard_slug: &str,
+) -> WorkerResult<Option<String>> {
+    let now = now_iso_string();
+    let row = db::first::<NextRetryAtRow>(
+        db,
+        earliest_global_retry_at_sql(),
+        vec![
+            json!(assigned_moodboard_slug),
+            json!(now),
+            json!(assigned_moodboard_slug),
+            json!(now),
+            json!(source_moodboard_slug),
+            json!(run_id),
+            json!(assigned_moodboard_slug),
+            json!(now),
+            json!(source_moodboard_slug),
+            json!(run_id),
+            json!(assigned_moodboard_slug),
+            json!(now),
+            json!(source_moodboard_slug),
+            json!(run_id),
+            json!(assigned_moodboard_slug),
+            json!(now),
+        ],
+    )
+    .await?;
+    Ok(row.and_then(|row| row.next_retry_at))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_global_reference_state_after_recount(
+    db: &D1Database,
+    source_moodboard_slug: &str,
+    run_id: &str,
+    moodboard_slug: &str,
+    active_count: u32,
+    status: &str,
+    underfilled: u8,
+    next_retry_at: Option<&str>,
+    set_last_successful_refresh_at: bool,
+    set_last_ready_at: bool,
+    set_last_underfilled_at: bool,
+    set_last_insufficient_at: bool,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        update_global_reference_state_after_recount_sql(),
+        vec![
+            json!(active_count),
+            json!(status),
+            json!(underfilled),
+            next_retry_at
+                .map(|value| Value::String(value.to_string()))
+                .unwrap_or(Value::Null),
+            json!(set_last_successful_refresh_at as u8),
+            json!(now),
+            json!(set_last_ready_at as u8),
+            json!(now),
+            json!(set_last_underfilled_at as u8),
+            json!(now),
+            json!(set_last_insufficient_at as u8),
+            json!(now),
+            json!(source_moodboard_slug),
+            json!(run_id),
+            json!(now),
+            json!(moodboard_slug),
+            json!(source_moodboard_slug),
+            json!(run_id),
+            json!(source_moodboard_slug),
+            json!(run_id),
+        ],
+    )
+    .await
+}
+
+async fn complete_global_source_run_after_recount(
+    db: &D1Database,
+    moodboard_slug: &str,
+    run_id: &str,
+    status: &str,
+    reason: &str,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        r#"
+        UPDATE global_moodboard_source_runs
+        SET status = ?,
+            reason = ?,
+            error_code = ?,
+            error_message = ?,
+            completed_at = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND status IN ('queued', 'refreshing')
+          AND EXISTS (
+            SELECT 1
+            FROM global_moodboard_reference_state
+            WHERE moodboard_slug = ?
+              AND current_run_id = ?
+          )
+        "#,
+        vec![
+            json!(status),
+            json!(reason),
+            error_code
+                .map(|value| Value::String(value.to_string()))
+                .unwrap_or(Value::Null),
+            error_message
+                .map(|value| Value::String(value.to_string()))
+                .unwrap_or(Value::Null),
+            json!(now),
+            json!(now),
+            json!(run_id),
+            json!(moodboard_slug),
+            json!(run_id),
+        ],
+    )
+    .await
 }
 
 async fn global_review_has_eligible_rows(
@@ -2899,6 +3474,17 @@ struct CurrentRunRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct GlobalSourceRunFinalizeRow {
+    error_code: Option<String>,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoodboardSlugRow {
+    moodboard_slug: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GlobalSearchWorkRow {
     moodboard_slug: String,
     search_term: String,
@@ -2980,6 +3566,11 @@ struct SeedreamCleanupRequest {
 #[derive(Debug, Deserialize)]
 struct CountRow {
     count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct NextRetryAtRow {
+    next_retry_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -599,6 +599,90 @@ fn global_cleanup_creates_reference_only_after_cleaned_candidate() {
 }
 
 #[test]
+fn global_finalization_recounts_discovery_and_cross_routed_assigned_slugs() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    assert!(source.contains("SELECT DISTINCT moodboard_slug"));
+    assert!(source.contains("source_run_id = ?"));
+    assert!(source.contains("discovery_moodboard_slug = ?"));
+    assert!(source.contains("global_moodboard_reference_state"));
+    assert!(source.contains("active_reference_count"));
+    assert!(source.contains("last_successful_refresh_at"));
+    assert!(source.contains("underfilled_exhausted"));
+    assert!(source.contains("insufficient_refs"));
+}
+
+#[test]
+fn global_finalization_does_not_overwrite_cross_routed_slug_current_run() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    assert!(source.contains(
+        "current_run_id = CASE WHEN moodboard_slug = ? THEN ? ELSE current_run_id END"
+    ));
+    assert!(source.contains("(moodboard_slug = ? AND current_run_id = ?)"));
+    assert!(source.contains("moodboard_slug != ?"));
+    assert!(source.contains("current_run_id IS NULL"));
+    assert!(source.contains("OR current_run_id = ?"));
+    assert!(!source.contains("? != ? OR current_run_id = ?"));
+    assert!(source.contains("assigned slug recount side effect"));
+}
+
+#[test]
+fn global_finalization_allows_recount_when_cross_routed_current_run_is_terminal() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let update_sql = source
+        .split("fn update_global_reference_state_after_recount_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn select_global_candidates_for_review_sql").next())
+        .expect("global finalization state update sql");
+
+    assert!(update_sql.contains("NOT EXISTS"));
+    assert!(update_sql.contains("FROM global_moodboard_source_runs active_run"));
+    assert!(update_sql.contains("active_run.id = current_run_id"));
+    assert!(update_sql.contains("active_run.status IN ('queued', 'refreshing')"));
+}
+
+#[test]
+fn global_finalization_zero_active_work_remains_non_terminal() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let body =
+        reference_pipeline_function_body(source, "async fn finalize_global_moodboard_library");
+
+    assert!(!body.contains("} else if work_exists {\n            \"underfilled\""));
+    assert!(body.contains("active_count == 0 && work_exists"));
+    assert!(body.contains("\"refreshing\""));
+}
+
+#[test]
+fn global_finalization_does_not_complete_source_run_while_work_remains() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let body =
+        reference_pipeline_function_body(source, "async fn finalize_global_moodboard_library");
+
+    assert!(body.contains("source_slug_work_exists"));
+    assert!(body.contains("if source_slug_work_exists {\n        return Ok(());\n    }"));
+    assert!(body.contains("source_slug_status == \"discovery_failed\""));
+}
+
+#[test]
+fn global_finalization_counts_in_flight_review_and_cleanup_for_drain() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let body =
+        reference_pipeline_function_body(source, "async fn finalize_global_moodboard_library");
+    let inflight_sql = source
+        .split("fn in_flight_global_candidate_work_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn eligible_global_source_work_sql").next())
+        .expect("in-flight finalization candidate drain sql");
+
+    assert!(body.contains("in_flight_candidate_work"));
+    assert!(body.contains("retryable_candidate_work > 0 || in_flight_candidate_work > 0"));
+    assert!(inflight_sql.contains("gvc.review_status = 'reviewing'"));
+    assert!(inflight_sql.contains("gvc.review_locked_until > ?"));
+    assert!(inflight_sql.contains("gvc.review_status = 'approved'"));
+    assert!(inflight_sql.contains("gvc.cleanup_status = 'cleaning'"));
+    assert!(inflight_sql.contains("gvc.cleanup_next_retry_at > ?"));
+}
+
+#[test]
 fn global_cleanup_reclaims_expired_cleaning_candidates() {
     let source = include_str!("../src/queues/reference_pipeline.rs");
     let load_sql = source
