@@ -1033,7 +1033,8 @@ fn global_review_rechecks_current_run_after_claim_before_ai_call() {
         .next()
         .expect("ai call section");
 
-    assert!(before_ai_call.contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
+    assert!(before_ai_call.contains("current_global_run_or_record_stale"));
+    assert!(before_ai_call.contains("must_not_create_global_reference_from_stale_run"));
 }
 
 #[test]
@@ -1089,7 +1090,11 @@ fn reference_pipeline_source_fetch_rechecks_current_run_after_provider_calls() {
         let failure = after_error.find(failure_helper).expect(handler);
         let before_failure = &after_error[..failure];
         assert!(
-            before_failure.contains("global_run_is_current(db, moodboard_slug, run_id).await?"),
+            before_failure.contains("current_global_run_or_record_stale"),
+            "{handler}"
+        );
+        assert!(
+            before_failure.contains("must_not_create_global_reference_from_stale_run"),
             "{handler}"
         );
     }
@@ -1127,9 +1132,13 @@ fn reference_pipeline_source_failures_are_recorded_before_ack() {
 fn reference_pipeline_ensure_reuses_current_nonterminal_global_run() {
     let source = include_str!("../src/queues/reference_pipeline.rs");
     let body = reference_pipeline_function_body(source, "async fn ensure_global_moodboard_library");
+    let ensure_run_body =
+        reference_pipeline_function_body(source, "async fn ensure_or_create_current_global_run");
 
     for snippet in [
-        "load_reusable_current_global_source_run",
+        "ensure_or_create_current_global_run",
+        "current_global_run_for_ensure_sql",
+        "mark_stale_global_run_superseded_sql",
         "enqueue_global_source_work_for_run",
         "status IN ('queued', 'refreshing')",
         "current_run_id",
@@ -1137,13 +1146,25 @@ fn reference_pipeline_ensure_reuses_current_nonterminal_global_run() {
         assert!(source.contains(snippet), "{snippet}");
     }
 
-    let reusable = body
-        .find("load_reusable_current_global_source_run")
-        .expect("ensure should check reusable run");
-    let new_run = body
-        .find("new_global_run_id")
-        .expect("ensure should still create new runs when needed");
-    assert!(reusable < new_run);
+    let retry_gate = body
+        .find("global_next_retry_gate_is_blocked")
+        .expect("ensure should check retry gate");
+    let live_count = body
+        .find("active_global_reference_count")
+        .expect("ensure should check live global reference count");
+    let ensure_run = body
+        .find("ensure_or_create_current_global_run")
+        .expect("ensure should reuse or create a current run");
+    assert!(live_count < retry_gate);
+    assert!(retry_gate < ensure_run);
+
+    let current_lookup = ensure_run_body
+        .find("current_global_run_for_ensure_sql")
+        .expect("ensure helper should check current run before creating");
+    let new_run = ensure_run_body
+        .find("create_global_moodboard_source_run")
+        .expect("ensure helper should still create new runs when needed");
+    assert!(current_lookup < new_run);
 }
 
 fn reference_pipeline_function_body<'a>(source: &'a str, marker: &str) -> &'a str {
@@ -1361,17 +1382,11 @@ fn global_cleanup_rechecks_current_run_around_provider_side_effects() {
         .find("cache_cleaned_global_moodboard_reference")
         .expect("global cache helper");
 
-    assert!(body[fetch_pos..upload_pos]
-        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
-    assert!(body[upload_pos..seedream_pos]
-        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
-    assert!(
-        body[seedream_pos..].contains("global_run_is_current(db, moodboard_slug, run_id).await?")
-    );
-    assert!(complete_body[..cache_pos]
-        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
-    assert!(complete_body[cache_pos..]
-        .contains("global_run_is_current(db, moodboard_slug, run_id).await?"));
+    assert!(body[fetch_pos..upload_pos].contains("current_global_run_or_record_stale"));
+    assert!(body[upload_pos..seedream_pos].contains("current_global_run_or_record_stale"));
+    assert!(body[seedream_pos..].contains("current_global_run_or_record_stale"));
+    assert!(complete_body[..cache_pos].contains("current_global_run_or_record_stale"));
+    assert!(complete_body[cache_pos..].contains("current_global_run_or_record_stale"));
 }
 
 #[test]
@@ -6063,4 +6078,355 @@ fn instagram_reels_normalizer_converts_numeric_taken_at_values() {
         items[1].source_published_at.as_deref(),
         Some("2026-01-01T00:00:00.000Z")
     );
+}
+
+#[test]
+fn global_ensure_respects_next_retry_gate_and_supersedes_stale_runs() {
+    let discovery = include_str!("../src/services/global_reference_discovery.rs");
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let retry_gate_sql = discovery
+        .split("pub fn global_next_retry_gate_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("pub fn current_global_run_for_ensure_sql()")
+                .next()
+        })
+        .expect("global retry gate SQL section");
+    assert!(discovery.contains("global_next_retry_gate_sql"));
+    assert!(discovery.contains("next_retry_at > ?"));
+    assert!(discovery.contains("status IN ('insufficient_refs', 'underfilled_exhausted')"));
+    assert!(retry_gate_sql.contains("discovery_failed"));
+    assert!(discovery.contains("current_global_run_for_ensure_sql"));
+    assert!(discovery.contains("global_discovery_run_stale_after_minutes"));
+    assert!(discovery.contains("stale_superseded"));
+    assert!(queue.contains("ensure_global_moodboard_library"));
+    assert!(queue.contains("record_global_ensure_skip"));
+    assert!(queue.contains("ensure_or_create_current_global_run"));
+}
+
+#[test]
+fn stale_global_messages_are_acknowledged_without_creating_reusable_assets() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let discovery = include_str!("../src/services/global_reference_discovery.rs");
+    let stale_message_sql = discovery
+        .split("pub fn record_stale_global_message_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("pub fn bootstrap_global_search_state_sql()")
+                .next()
+        })
+        .expect("stale global message SQL section");
+    assert!(queue.contains("current_global_run_guard_sql"));
+    assert!(queue.contains("record_stale_global_message"));
+    assert!(discovery.contains("stale_run_message_seen"));
+    assert!(queue.contains("return Ok(())"));
+    assert!(discovery.contains("gmrs.current_run_id = ?"));
+    assert!(queue.contains("must_not_create_global_reference_from_stale_run"));
+    assert!(!stale_message_sql.contains("COALESCE(error_code, 'stale_run_message_seen')"));
+    assert!(stale_message_sql.contains("error_code || ';stale_run_message_seen'"));
+    assert!(stale_message_sql.contains("AND status <> 'completed'"));
+}
+
+#[test]
+fn stale_global_run_supersession_uses_cas_handoff_and_active_write_guards() {
+    let discovery = include_str!("../src/services/global_reference_discovery.rs");
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let ensure_body =
+        reference_pipeline_function_body(queue, "async fn ensure_or_create_current_global_run");
+    let handoff_sql = discovery
+        .split("pub fn set_current_global_source_run_if_current_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("pub fn current_global_run_guard_sql()")
+                .next()
+        })
+        .expect("current run handoff SQL section");
+    let supersede_sql = discovery
+        .split("pub fn mark_stale_global_run_superseded_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("pub fn set_current_global_source_run_if_current_sql()")
+                .next()
+        })
+        .expect("stale supersede SQL section");
+    let handoff_lost_sql = discovery
+        .split("pub fn mark_global_handoff_lost_run_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("pub fn current_global_run_guard_sql()")
+                .next()
+        })
+        .expect("handoff lost SQL section");
+    let approved_sql = queue
+        .split("fn mark_global_candidate_review_approved_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn mark_global_candidate_review_rejected_sql()")
+                .next()
+        })
+        .expect("approved review SQL section");
+    let rejected_sql = queue
+        .split("fn mark_global_candidate_review_rejected_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn mark_global_candidate_review_failed_sql()")
+                .next()
+        })
+        .expect("rejected review SQL section");
+    let failed_sql = queue
+        .split("fn mark_global_candidate_review_failed_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn load_global_candidate_for_cleanup_sql()")
+                .next()
+        })
+        .expect("failed review SQL section");
+    let reference_insert_sql = queue
+        .split("fn insert_global_moodboard_reference_sql()")
+        .nth(1)
+        .and_then(|section| section.split("async fn upsert_global_handle").next())
+        .expect("global reference insert SQL section");
+
+    assert!(discovery.contains("set_current_global_source_run_if_current_sql"));
+    assert!(handoff_sql.contains("global_moodboard_source_runs old_run"));
+    assert!(handoff_sql.contains(
+        "old_run.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')"
+    ));
+    assert!(handoff_sql.contains("old_run.updated_at <= ?"));
+    assert!(!supersede_sql.contains("current_run_id = ?"));
+    assert!(!supersede_sql.contains("updated_at <= ?"));
+    assert!(supersede_sql.contains("error_code = CASE"));
+    assert!(supersede_sql.contains("error_code || ';stale_superseded'"));
+    assert!(supersede_sql.contains("instr(error_code, 'stale_superseded')"));
+    assert!(supersede_sql.contains("error_message = CASE"));
+    assert!(handoff_lost_sql.contains("status = 'stale_superseded'"));
+    assert!(handoff_lost_sql.contains("handoff_lost"));
+    assert!(handoff_lost_sql
+        .contains("status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')"));
+    assert!(ensure_body.contains("changed_rows(&handoff"));
+    assert!(ensure_body.contains("mark_stale_global_run_superseded"));
+    assert!(ensure_body.contains("mark_global_handoff_lost_run_sql"));
+    assert!(ensure_body.contains("return Ok(None)"));
+    assert!(ensure_body.contains("json!(stale_cutoff)"));
+    assert!(
+        ensure_body.find("changed_rows(&handoff)? == 0").unwrap()
+            < ensure_body
+                .find("mark_global_handoff_lost_run_sql")
+                .unwrap()
+    );
+    assert!(
+        ensure_body
+            .find("mark_global_handoff_lost_run_sql")
+            .unwrap()
+            < ensure_body.find("return Ok(None)").unwrap()
+    );
+    assert!(
+        ensure_body
+            .find("create_global_moodboard_source_run")
+            .unwrap()
+            < ensure_body
+                .find("set_current_global_source_run_if_current")
+                .unwrap()
+    );
+    assert!(
+        ensure_body
+            .find("set_current_global_source_run_if_current")
+            .unwrap()
+            < ensure_body
+                .find("mark_stale_global_run_superseded")
+                .unwrap()
+    );
+
+    for sql in [approved_sql, rejected_sql, failed_sql, reference_insert_sql] {
+        assert!(sql.contains("global_moodboard_source_runs gsr"));
+        assert!(sql.contains(
+            "gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')"
+        ));
+        assert!(sql.contains("gsr.id = ?"));
+    }
+}
+
+#[test]
+fn global_media_asset_cache_is_guarded_before_reusable_asset_insert() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let cache_body = reference_pipeline_function_body(
+        queue,
+        "async fn cache_cleaned_global_moodboard_reference_if_current",
+    );
+    let complete_body = reference_pipeline_function_body(
+        queue,
+        "async fn complete_cleaned_global_moodboard_reference",
+    );
+    let insert_pos = cache_body
+        .find("insert_guarded_global_media_asset_sql")
+        .expect("guarded media asset insert");
+    let guard_pos = cache_body
+        .find("current_global_run_or_record_stale")
+        .expect("run guard before media insert");
+    let fetch_pos = cache_body
+        .find("fetch_visual_reference_image")
+        .expect("cleaned image fetch");
+    let r2_put_pos = cache_body
+        .find("env.bucket(\"MEDIA\")")
+        .expect("R2 media write");
+    let post_fetch_guard_pos = cache_body[fetch_pos..]
+        .find("current_global_run_or_record_stale")
+        .map(|offset| fetch_pos + offset)
+        .expect("run guard after cleaned image fetch");
+
+    assert!(queue.contains("cache_cleaned_global_moodboard_reference_if_current"));
+    assert!(queue.contains("insert_guarded_global_media_asset_sql"));
+    assert!(guard_pos < insert_pos);
+    assert!(fetch_pos < post_fetch_guard_pos);
+    assert!(post_fetch_guard_pos < r2_put_pos);
+    assert!(cache_body[post_fetch_guard_pos..r2_put_pos].contains("return Ok(None)"));
+    assert!(cache_body.contains("INSERT OR IGNORE INTO media_assets"));
+    assert!(cache_body.contains("global_moodboard_source_runs gsr"));
+    assert!(cache_body
+        .contains("gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')"));
+    assert!(complete_body.contains("Ok(None) => {"));
+    assert!(complete_body.contains("must_not_create_global_reference_from_stale_run"));
+    assert!(complete_body.contains("return Ok(())"));
+}
+
+#[test]
+fn global_cleanup_failure_bind_count_matches_active_current_run_guard() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let cleanup_failed_sql = queue
+        .split("fn mark_global_candidate_cleanup_failed_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("fn mark_global_candidate_cleanup_succeeded_sql()")
+                .next()
+        })
+        .expect("cleanup failed SQL section");
+    let failure_body = reference_pipeline_function_body(
+        queue,
+        "async fn record_global_candidate_cleanup_failure_and_finalize",
+    );
+    let cleanup_failed_call_binds = failure_body
+        .split("mark_global_candidate_cleanup_failed_sql()")
+        .nth(1)
+        .and_then(|section| section.split("],").next())
+        .expect("cleanup failed bind vector");
+
+    assert!(cleanup_failed_sql.contains("gmrs.current_run_id = ?"));
+    assert!(cleanup_failed_sql.contains("gsr.id = ?"));
+    assert_eq!(cleanup_failed_sql.matches('?').count(), 11);
+    assert_eq!(
+        cleanup_failed_call_binds.matches("json!(").count(),
+        cleanup_failed_sql.matches('?').count()
+    );
+    assert_eq!(
+        cleanup_failed_call_binds.matches("json!(run_id)").count(),
+        2
+    );
+}
+
+#[test]
+fn global_source_writes_are_sql_guarded_by_current_active_run() {
+    let discovery = include_str!("../src/services/global_reference_discovery.rs");
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let handle_sql = discovery
+        .split("pub fn upsert_global_handle_if_current_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("pub fn upsert_global_candidate_if_current_sql()")
+                .next()
+        })
+        .expect("guarded handle SQL section");
+    let candidate_sql = discovery
+        .split("pub fn upsert_global_candidate_if_current_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("pub fn audit_global_candidate_discovery_if_current_sql()")
+                .next()
+        })
+        .expect("guarded candidate SQL section");
+    let audit_sql = discovery
+        .split("pub fn audit_global_candidate_discovery_if_current_sql()")
+        .nth(1)
+        .and_then(|section| section.split("pub fn source_key_for_reels_search").next())
+        .expect("guarded audit SQL section");
+    let upsert_handle_body =
+        reference_pipeline_function_body(queue, "async fn upsert_global_handle");
+    let upsert_candidate_body =
+        reference_pipeline_function_body(queue, "async fn upsert_global_candidates_and_audit");
+    let run_count_body =
+        reference_pipeline_function_body(queue, "async fn increment_global_source_run_count");
+    let discover_handles_body =
+        reference_pipeline_function_body(queue, "async fn discover_global_instagram_handles");
+
+    for sql in [handle_sql, candidate_sql, audit_sql] {
+        assert!(sql.contains("global_moodboard_reference_state gmrs"));
+        assert!(sql.contains("global_moodboard_source_runs gsr"));
+        assert!(sql.contains("gmrs.current_run_id = ?"));
+        assert!(sql.contains("gsr.id = ?"));
+        assert!(sql.contains(
+            "gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')"
+        ));
+    }
+
+    assert!(upsert_handle_body.contains("upsert_global_handle_if_current_sql"));
+    assert!(upsert_handle_body.contains("run_id: &str"));
+    assert!(upsert_candidate_body.contains("upsert_global_candidate_if_current_sql"));
+    assert!(upsert_candidate_body.contains("audit_global_candidate_discovery_if_current_sql"));
+    assert!(upsert_candidate_body.contains("json!(run_id)"));
+    assert!(run_count_body.contains("guarded_global_source_run_count_update_sql"));
+    assert!(run_count_body.contains("moodboard_slug: &str"));
+    assert!(run_count_body.contains("global_moodboard_source_runs gsr"));
+    assert!(discover_handles_body.contains("upsert_global_handle("));
+    assert!(discover_handles_body.contains("run_id,"));
+    assert!(discover_handles_body.contains("increment_global_source_run_count("));
+    assert!(discover_handles_body.contains("moodboard_slug,"));
+}
+
+#[test]
+fn global_source_failure_updates_are_sql_guarded_by_current_active_run() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let search_failure_body =
+        reference_pipeline_function_body(queue, "async fn record_global_search_fetch_failure");
+    let handle_failure_body =
+        reference_pipeline_function_body(queue, "async fn record_global_handle_fetch_failure");
+    let run_failure_body =
+        reference_pipeline_function_body(queue, "async fn record_global_source_run_failure");
+    let search_enqueue_body = reference_pipeline_function_body(
+        queue,
+        "async fn record_scrapecreators_search_failure_and_enqueue_finalize",
+    );
+    let handle_enqueue_body = reference_pipeline_function_body(
+        queue,
+        "async fn record_scrapecreators_handle_failure_and_enqueue_finalize",
+    );
+
+    for body in [search_failure_body, handle_failure_body, run_failure_body] {
+        assert!(body.contains("global_moodboard_reference_state gmrs"));
+        assert!(body.contains("global_moodboard_source_runs gsr"));
+        assert!(body.contains("gmrs.current_run_id = ?"));
+        assert!(body.contains("gsr.id = ?"));
+        assert!(body.contains(
+            "gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')"
+        ));
+        assert!(body.contains("run_id: &str"));
+    }
+
+    assert!(run_failure_body.contains("moodboard_slug: &str"));
+    assert!(run_failure_body.contains("AND moodboard_slug = ?"));
+    assert!(search_enqueue_body.contains("record_global_search_fetch_failure("));
+    assert!(search_enqueue_body.contains("run_id,"));
+    assert!(search_enqueue_body.contains("record_global_source_run_failure("));
+    assert!(handle_enqueue_body.contains("record_global_handle_fetch_failure("));
+    assert!(handle_enqueue_body.contains("run_id,"));
+    assert!(handle_enqueue_body.contains("record_global_source_run_failure("));
 }

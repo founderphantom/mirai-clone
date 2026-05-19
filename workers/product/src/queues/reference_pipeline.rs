@@ -21,16 +21,26 @@ use crate::providers::seedream::{
 use crate::queues::messages::ReferencePipelineMessage;
 use crate::scrapecreators::fetch_scrapecreators_json;
 use crate::services::global_reference_discovery::{
-    audit_global_candidate_discovery_sql, bootstrap_global_search_state_sql,
-    select_global_handle_work_sql, select_global_search_work_sql, source_key_for_instagram_handle,
-    source_key_for_reels_search, upsert_global_candidate_sql, upsert_global_handle_sql,
+    audit_global_candidate_discovery_if_current_sql, bootstrap_global_search_state_sql,
+    current_global_run_for_ensure_sql, current_global_run_guard_sql, global_next_retry_gate_sql,
+    mark_global_handoff_lost_run_sql, mark_stale_global_run_superseded_sql,
+    record_global_ensure_skip_sql, record_stale_global_message_sql, select_global_handle_work_sql,
+    select_global_search_work_sql, set_current_global_source_run_if_current_sql,
+    source_key_for_instagram_handle, source_key_for_reels_search,
+    upsert_global_candidate_if_current_sql, upsert_global_handle_if_current_sql,
+    GLOBAL_DISCOVERY_RUN_STALE_AFTER_MINUTES_CONFIG_KEY,
 };
-use crate::services::queue_reservations::QueueHandlingOutcome;
+use crate::services::queue_reservations::{now_iso_string, QueueHandlingOutcome};
+use crate::services::visual_reference_cache::{
+    fetch_visual_reference_image, global_visual_reference_storage_key, CachedVisualReference,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use worker::{D1Database, Env, Error, MessageBatch, MessageExt, Result as WorkerResult};
+use worker::{
+    D1Database, Env, Error, HttpMetadata, MessageBatch, MessageExt, Result as WorkerResult,
+};
 
 const REFERENCE_PIPELINE_QUEUE_BINDING: &str = "REFERENCE_PIPELINE_QUEUE";
 const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER";
@@ -290,6 +300,8 @@ async fn ensure_global_moodboard_library(
 
     let now = now_iso_string();
     ensure_global_reference_state(db, &definition.slug, &now).await?;
+    bootstrap_search_state_for_moodboard(db, &definition, &now).await?;
+
     let target = config_value_u32(db, "global_refs_per_moodboard_target", 25).await?;
     if active_global_reference_count(db, &definition.slug).await? >= target {
         return enqueue_finalize_global_moodboard_library(
@@ -300,13 +312,155 @@ async fn ensure_global_moodboard_library(
         )
         .await;
     }
-    if let Some(run) = load_reusable_current_global_source_run(db, &definition.slug).await? {
-        return enqueue_global_source_work_for_run(db, env, &definition.slug, &run.id).await;
-    }
-    if !global_reference_state_retry_is_due(db, &definition.slug, &now).await? {
+
+    if global_next_retry_gate_is_blocked(db, &definition.slug, &now).await? {
+        record_global_ensure_skip(db, &definition.slug, reason, &now).await?;
         return Ok(());
     }
 
+    let config = load_reference_pipeline_lifecycle_config(db).await?;
+    let Some(run_id) = ensure_or_create_current_global_run(
+        db,
+        &definition,
+        reason,
+        target,
+        config.global_discovery_run_stale_after_minutes,
+        &now,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    enqueue_global_source_work_for_run(db, env, &definition.slug, &run_id).await
+}
+
+async fn global_next_retry_gate_is_blocked(
+    db: &D1Database,
+    moodboard_slug: &str,
+    now: &str,
+) -> WorkerResult<bool> {
+    let row = db::first::<Value>(
+        db,
+        global_next_retry_gate_sql(),
+        vec![json!(moodboard_slug), json!(now)],
+    )
+    .await?;
+    Ok(row.is_some())
+}
+
+async fn record_global_ensure_skip(
+    db: &D1Database,
+    moodboard_slug: &str,
+    reason: &str,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        record_global_ensure_skip_sql(),
+        vec![
+            json!(format!("global_skip_{}", uuid::Uuid::new_v4().simple())),
+            json!(moodboard_slug),
+            json!(reason),
+            json!(now),
+            json!(now),
+            json!(now),
+        ],
+    )
+    .await
+}
+
+async fn ensure_or_create_current_global_run(
+    db: &D1Database,
+    definition: &GlobalMoodboardDefinitionRow,
+    reason: &str,
+    target: u32,
+    stale_after_minutes: i64,
+    now: &str,
+) -> WorkerResult<Option<String>> {
+    if let Some(row) = db::first::<CurrentGlobalRunForEnsureRow>(
+        db,
+        current_global_run_for_ensure_sql(),
+        vec![json!(definition.slug.as_str())],
+    )
+    .await?
+    {
+        if let Some(run_id) = row.current_run_id {
+            let active = row
+                .status
+                .as_deref()
+                .map(is_active_global_source_run_status)
+                .unwrap_or(false);
+            let stale_cutoff = crate::services::queue_reservations::add_minutes_iso(
+                now,
+                -stale_after_minutes.max(1),
+            );
+            let fresh = row
+                .updated_at
+                .as_deref()
+                .map(|updated_at| updated_at > stale_cutoff.as_str())
+                .unwrap_or(false);
+            if active && fresh {
+                return Ok(Some(run_id));
+            }
+            if active {
+                let new_run_id =
+                    create_global_moodboard_source_run(db, definition, reason, now).await?;
+                let handoff = db::run(
+                    db,
+                    set_current_global_source_run_if_current_sql(),
+                    vec![
+                        json!(new_run_id.as_str()),
+                        json!(target),
+                        json!(now),
+                        json!(definition.slug.as_str()),
+                        json!(run_id.as_str()),
+                        json!(run_id.as_str()),
+                        json!(stale_cutoff),
+                    ],
+                )
+                .await?;
+                if changed_rows(&handoff)? == 0 {
+                    db::exec(
+                        db,
+                        mark_global_handoff_lost_run_sql(),
+                        vec![
+                            json!(now),
+                            json!(now),
+                            json!(new_run_id.as_str()),
+                            json!(definition.slug.as_str()),
+                        ],
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                db::exec(
+                    db,
+                    mark_stale_global_run_superseded_sql(),
+                    vec![
+                        json!(now),
+                        json!(now),
+                        json!(run_id.as_str()),
+                        json!(definition.slug.as_str()),
+                    ],
+                )
+                .await?;
+                return Ok(Some(new_run_id));
+            }
+        }
+    }
+
+    let run_id = create_global_moodboard_source_run(db, definition, reason, now).await?;
+    set_current_global_source_run(db, &definition.slug, &run_id, target, now).await?;
+    Ok(Some(run_id))
+}
+
+async fn create_global_moodboard_source_run(
+    db: &D1Database,
+    definition: &GlobalMoodboardDefinitionRow,
+    reason: &str,
+    now: &str,
+) -> WorkerResult<String> {
     let run_id = new_global_run_id();
     let selected_terms = selected_search_terms(
         &definition.search_queries_json,
@@ -321,10 +475,23 @@ async fn ensure_global_moodboard_library(
         reason,
         &selected_terms,
         &date_windows,
+        now,
     )
     .await?;
-    set_current_global_source_run(db, &definition.slug, &run_id, target, &now).await?;
+    Ok(run_id)
+}
 
+async fn bootstrap_search_state_for_moodboard(
+    db: &D1Database,
+    definition: &GlobalMoodboardDefinitionRow,
+    now: &str,
+) -> WorkerResult<()> {
+    let selected_terms = selected_search_terms(
+        &definition.search_queries_json,
+        definition.title.as_str(),
+        2,
+    );
+    let date_windows = vec!["last-month".to_string()];
     let reels_pages_per_term = config_value_u32(db, "instagram_reels_pages_per_term", 1)
         .await?
         .max(1);
@@ -344,7 +511,7 @@ async fn ensure_global_moodboard_library(
                                 &page.to_string()
                             ],
                         )),
-                        json!(definition.slug),
+                        json!(definition.slug.as_str()),
                         json!(search_term),
                         json!(date_window),
                         json!(page),
@@ -357,7 +524,7 @@ async fn ensure_global_moodboard_library(
         }
     }
 
-    enqueue_global_source_work_for_run(db, env, &definition.slug, &run_id).await
+    Ok(())
 }
 
 async fn discover_global_instagram_handles(
@@ -369,7 +536,9 @@ async fn discover_global_instagram_handles(
     date_window: &str,
     page: u32,
 ) -> WorkerResult<()> {
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -409,7 +578,9 @@ async fn discover_global_instagram_handles(
     let raw = match fetch_scrapecreators_json(&request_url, &api_key).await {
         Ok(raw) => raw,
         Err(error) => {
-            if !global_run_is_current(db, moodboard_slug, run_id).await? {
+            let now = now_iso_string();
+            if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+                must_not_create_global_reference_from_stale_run();
                 return Ok(());
             }
             record_scrapecreators_search_failure_and_enqueue_finalize(
@@ -428,21 +599,37 @@ async fn discover_global_instagram_handles(
         }
     };
     if !ensure_current_global_run_after_provider_fetch(db, moodboard_slug, run_id).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
     let max_handles = config_value_u32(db, "instagram_max_handles_per_moodboard", 20)
         .await?
         .max(1);
     let handles = extract_instagram_reels_owner_handles(&raw, max_handles as usize);
-    let now = now_iso_string();
     let source_key = source_key_for_reels_search(search_term, date_window, page);
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(());
+    }
 
     for handle in &handles {
-        upsert_global_handle(db, moodboard_slug, handle, &source_key, 0, &now).await?;
+        upsert_global_handle(
+            db,
+            moodboard_slug,
+            handle,
+            &source_key,
+            0,
+            run_id,
+            moodboard_slug,
+            &now,
+        )
+        .await?;
     }
     mark_global_search_state_seen(
         db,
         moodboard_slug,
+        run_id,
         search_term,
         date_window,
         page,
@@ -450,8 +637,14 @@ async fn discover_global_instagram_handles(
         &now,
     )
     .await?;
-    increment_global_source_run_count(db, run_id, "discovered_handle_count", handles.len() as u32)
-        .await?;
+    increment_global_source_run_count(
+        db,
+        moodboard_slug,
+        run_id,
+        "discovered_handle_count",
+        handles.len() as u32,
+    )
+    .await?;
 
     for handle in handles {
         env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
@@ -477,7 +670,9 @@ async fn fetch_global_instagram_profile(
     discovered_via: &str,
     related_depth: u8,
 ) -> WorkerResult<()> {
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -510,7 +705,9 @@ async fn fetch_global_instagram_profile(
     let raw = match fetch_scrapecreators_json(&request_url, &api_key).await {
         Ok(raw) => raw,
         Err(error) => {
-            if !global_run_is_current(db, moodboard_slug, run_id).await? {
+            let now = now_iso_string();
+            if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+                must_not_create_global_reference_from_stale_run();
                 return Ok(());
             }
             record_scrapecreators_handle_failure_and_enqueue_finalize(
@@ -527,14 +724,19 @@ async fn fetch_global_instagram_profile(
         }
     };
     if !ensure_current_global_run_after_provider_fetch(db, moodboard_slug, run_id).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
-    let now = now_iso_string();
 
     if related_depth == 0 {
         let related_limit = config_value_u32(db, "instagram_related_handles_per_profile", 8)
             .await?
             .max(1) as usize;
+        let now = now_iso_string();
+        if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+            must_not_create_global_reference_from_stale_run();
+            return Ok(());
+        }
         for related in normalize_instagram_profile_related_handles(&raw, related_limit) {
             let source_key = source_key_for_instagram_handle(handle, "profile_related");
             upsert_global_handle(
@@ -543,6 +745,8 @@ async fn fetch_global_instagram_profile(
                 &related,
                 &source_key,
                 related_depth.saturating_add(1),
+                run_id,
+                moodboard_slug,
                 &now,
             )
             .await?;
@@ -573,7 +777,9 @@ async fn fetch_global_instagram_posts(
     next_max_id: Option<&str>,
     page: u8,
 ) -> WorkerResult<()> {
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -606,7 +812,9 @@ async fn fetch_global_instagram_posts(
     let raw = match fetch_scrapecreators_json(&request_url, &api_key).await {
         Ok(raw) => raw,
         Err(error) => {
-            if !global_run_is_current(db, moodboard_slug, run_id).await? {
+            let now = now_iso_string();
+            if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+                must_not_create_global_reference_from_stale_run();
                 return Ok(());
             }
             record_scrapecreators_handle_failure_and_enqueue_finalize(
@@ -623,6 +831,7 @@ async fn fetch_global_instagram_posts(
         }
     };
     if !ensure_current_global_run_after_provider_fetch(db, moodboard_slug, run_id).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
     let images_per_post = config_value_u32(db, "instagram_images_per_post", 3)
@@ -643,18 +852,30 @@ async fn fetch_global_instagram_posts(
     .filter(|candidate| instagram_candidate_meets_min_dimensions(candidate, min_width, min_height))
     .collect::<Vec<_>>();
     let source_key = source_key_for_instagram_handle(handle, next_max_id.unwrap_or("posts:first"));
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(());
+    }
     upsert_global_candidates_and_audit(db, moodboard_slug, run_id, &source_key, &candidates)
         .await?;
     mark_global_handle_fetch_result(
         db,
         moodboard_slug,
+        run_id,
         handle,
         next_max_id_from(&raw),
         &now_iso_string(),
     )
     .await?;
-    increment_global_source_run_count(db, run_id, "candidate_count", candidates.len() as u32)
-        .await?;
+    increment_global_source_run_count(
+        db,
+        moodboard_slug,
+        run_id,
+        "candidate_count",
+        candidates.len() as u32,
+    )
+    .await?;
 
     let detail_limit = config_value_u32(db, "instagram_post_detail_limit_per_profile", 4)
         .await?
@@ -702,7 +923,9 @@ async fn fetch_global_instagram_post_detail(
     discovered_via: &str,
     source_url: &str,
 ) -> WorkerResult<()> {
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -735,7 +958,9 @@ async fn fetch_global_instagram_post_detail(
     let raw = match fetch_scrapecreators_json(&request_url, &api_key).await {
         Ok(raw) => raw,
         Err(error) => {
-            if !global_run_is_current(db, moodboard_slug, run_id).await? {
+            let now = now_iso_string();
+            if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+                must_not_create_global_reference_from_stale_run();
                 return Ok(());
             }
             record_scrapecreators_handle_failure_and_enqueue_finalize(
@@ -752,6 +977,7 @@ async fn fetch_global_instagram_post_detail(
         }
     };
     if !ensure_current_global_run_after_provider_fetch(db, moodboard_slug, run_id).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
     let images_per_post = config_value_u32(db, "instagram_images_per_post", 3)
@@ -772,10 +998,21 @@ async fn fetch_global_instagram_post_detail(
     .filter(|candidate| instagram_candidate_meets_min_dimensions(candidate, min_width, min_height))
     .collect::<Vec<_>>();
     let source_key = source_key_for_instagram_handle(handle, source_url);
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(());
+    }
     upsert_global_candidates_and_audit(db, moodboard_slug, run_id, &source_key, &candidates)
         .await?;
-    increment_global_source_run_count(db, run_id, "candidate_count", candidates.len() as u32)
-        .await?;
+    increment_global_source_run_count(
+        db,
+        moodboard_slug,
+        run_id,
+        "candidate_count",
+        candidates.len() as u32,
+    )
+    .await?;
 
     enqueue_review_global_visual_candidates(env, moodboard_slug, run_id, 60).await?;
     enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "post_detail_fetched")
@@ -789,7 +1026,9 @@ async fn review_global_visual_candidates(
     run_id: &str,
     limit: u32,
 ) -> WorkerResult<()> {
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -804,7 +1043,6 @@ async fn review_global_visual_candidates(
     let review_retry_limit = config_value_u32(db, "visual_reference_review_retry_limit", 2)
         .await?
         .max(1);
-    let now = now_iso_string();
     let candidates = db::all::<GlobalVisualCandidateReviewRow>(
         db,
         select_global_candidates_for_review_sql(),
@@ -823,7 +1061,9 @@ async fn review_global_visual_candidates(
 
     for candidate in candidates {
         let _observed_attempt_count = candidate.review_attempt_count;
-        if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        let now = now_iso_string();
+        if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+            must_not_create_global_reference_from_stale_run();
             return Ok(());
         }
 
@@ -844,13 +1084,16 @@ async fn review_global_visual_candidates(
                 json!(review_retry_limit),
                 json!(moodboard_slug),
                 json!(run_id),
+                json!(run_id),
             ],
         )
         .await?;
         if changed_rows(&claim_result)? == 0 {
             continue;
         }
-        if !global_run_is_current(db, moodboard_slug, run_id).await? {
+        let now = now_iso_string();
+        if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+            must_not_create_global_reference_from_stale_run();
             return Ok(());
         }
 
@@ -873,6 +1116,11 @@ async fn review_global_visual_candidates(
         {
             Ok(review) => review,
             Err(error) => {
+                let now = now_iso_string();
+                if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+                    must_not_create_global_reference_from_stale_run();
+                    return Ok(());
+                }
                 let code = queue_error_code(&error.to_string());
                 db::exec(
                     db,
@@ -889,6 +1137,7 @@ async fn review_global_visual_candidates(
                         json!(claim_id),
                         json!(moodboard_slug),
                         json!(run_id),
+                        json!(run_id),
                     ],
                 )
                 .await?;
@@ -897,6 +1146,11 @@ async fn review_global_visual_candidates(
         };
 
         let review_json = serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string());
+        let now = now_iso_string();
+        if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+            must_not_create_global_reference_from_stale_run();
+            return Ok(());
+        }
         match accept_global_visual_review(&review, &active_moodboards) {
             Ok(accepted) => {
                 let write_now = now_iso_string();
@@ -912,6 +1166,7 @@ async fn review_global_visual_candidates(
                         json!(run_id),
                         json!(claim_id),
                         json!(moodboard_slug),
+                        json!(run_id),
                         json!(run_id),
                     ],
                 )
@@ -940,6 +1195,7 @@ async fn review_global_visual_candidates(
                         json!(claim_id),
                         json!(moodboard_slug),
                         json!(run_id),
+                        json!(run_id),
                     ],
                 )
                 .await?;
@@ -947,7 +1203,9 @@ async fn review_global_visual_candidates(
         }
     }
 
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
     if global_review_has_eligible_rows(db, moodboard_slug, run_id, review_retry_limit).await? {
@@ -970,14 +1228,15 @@ async fn cleanup_global_moodboard_reference(
     run_id: &str,
     candidate_id: &str,
 ) -> WorkerResult<()> {
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
     let retry_limit = config_value_u32(db, "visual_reference_cleanup_retry_limit", 3)
         .await?
         .max(1);
-    let now = now_iso_string();
     let Some(candidate) = db::first::<GlobalVisualCandidateCleanupRow>(
         db,
         load_global_candidate_for_cleanup_sql(),
@@ -986,6 +1245,7 @@ async fn cleanup_global_moodboard_reference(
             json!(now),
             json!(now),
             json!(moodboard_slug),
+            json!(run_id),
             json!(run_id),
         ],
     )
@@ -1016,6 +1276,7 @@ async fn cleanup_global_moodboard_reference(
             json!(now_iso_string()),
             json!(moodboard_slug),
             json!(run_id),
+            json!(run_id),
         ],
     )
     .await?;
@@ -1030,6 +1291,11 @@ async fn cleanup_global_moodboard_reference(
         )
         .await?
         {
+            let now = now_iso_string();
+            if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+                must_not_create_global_reference_from_stale_run();
+                return Ok(());
+            }
             enqueue_finalize_global_moodboard_library(
                 env,
                 moodboard_slug,
@@ -1040,7 +1306,9 @@ async fn cleanup_global_moodboard_reference(
         }
         return Ok(());
     }
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -1081,7 +1349,9 @@ async fn cleanup_global_moodboard_reference(
             return Ok(());
         }
     };
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -1103,7 +1373,9 @@ async fn cleanup_global_moodboard_reference(
             return Ok(());
         }
     };
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -1127,7 +1399,9 @@ async fn cleanup_global_moodboard_reference(
                 return Ok(());
             }
         };
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -1150,7 +1424,9 @@ async fn cleanup_global_moodboard_reference(
                 return Ok(());
             }
         };
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -1176,10 +1452,16 @@ async fn cleanup_global_moodboard_reference(
             json!(cleanup_lock_expires_at),
             json!(moodboard_slug),
             json!(run_id),
+            json!(run_id),
         ],
     )
     .await?;
     if changed_rows(&mark_result)? == 0 {
+        let now = now_iso_string();
+        if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+            must_not_create_global_reference_from_stale_run();
+            return Ok(());
+        }
         enqueue_finalize_global_moodboard_library(
             env,
             moodboard_slug,
@@ -1218,13 +1500,18 @@ async fn finalize_global_moodboard_library(
     run_id: &str,
     reason: &str,
 ) -> WorkerResult<()> {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(());
+    }
+
     let Some(source_run) =
         load_current_global_source_run_for_finalize(db, moodboard_slug, run_id).await?
     else {
         return Ok(());
     };
 
-    let now = now_iso_string();
     let impacted_slugs = impacted_global_moodboard_slugs(db, moodboard_slug, run_id).await?;
     let target = config_value_u32(db, "global_refs_per_moodboard_target", 25)
         .await?
@@ -1440,49 +1727,6 @@ async fn ensure_global_reference_state(
     .await
 }
 
-async fn global_reference_state_retry_is_due(
-    db: &D1Database,
-    moodboard_slug: &str,
-    now: &str,
-) -> WorkerResult<bool> {
-    let row = db::first::<GlobalReferenceStateRetryRow>(
-        db,
-        r#"
-        SELECT next_retry_at
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-        LIMIT 1
-        "#,
-        vec![json!(moodboard_slug)],
-    )
-    .await?;
-    Ok(row
-        .and_then(|row| row.next_retry_at)
-        .map(|next_retry_at| next_retry_at.as_str() <= now)
-        .unwrap_or(true))
-}
-
-async fn load_reusable_current_global_source_run(
-    db: &D1Database,
-    moodboard_slug: &str,
-) -> WorkerResult<Option<ReusableGlobalSourceRunRow>> {
-    db::first(
-        db,
-        r#"
-        SELECT run.id
-        FROM global_moodboard_reference_state state
-        INNER JOIN global_moodboard_source_runs run
-          ON run.id = state.current_run_id
-        WHERE state.moodboard_slug = ?
-          AND run.moodboard_slug = ?
-          AND run.status IN ('queued', 'refreshing')
-        LIMIT 1
-        "#,
-        vec![json!(moodboard_slug), json!(moodboard_slug)],
-    )
-    .await
-}
-
 async fn create_global_source_run(
     db: &D1Database,
     run_id: &str,
@@ -1490,8 +1734,8 @@ async fn create_global_source_run(
     reason: &str,
     selected_terms: &[String],
     date_windows: &[String],
+    now: &str,
 ) -> WorkerResult<()> {
-    let now = now_iso_string();
     db::exec(
         db,
         r#"
@@ -1595,34 +1839,62 @@ async fn set_current_global_source_run(
     .await
 }
 
-async fn global_run_is_current(
+fn is_active_global_source_run_status(status: &str) -> bool {
+    matches!(
+        status,
+        "queued" | "refreshing" | "scraping" | "reviewing" | "cleaning"
+    )
+}
+
+async fn current_global_run_or_record_stale(
     db: &D1Database,
     moodboard_slug: &str,
     run_id: &str,
+    now: &str,
 ) -> WorkerResult<bool> {
-    let row = db::first::<CurrentRunRow>(
+    let current = db::first::<Value>(
         db,
-        r#"
-        SELECT current_run_id
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-        LIMIT 1
-        "#,
-        vec![json!(moodboard_slug)],
+        current_global_run_guard_sql(),
+        vec![json!(moodboard_slug), json!(run_id), json!(run_id)],
     )
     .await?;
-    Ok(row
-        .and_then(|row| row.current_run_id)
-        .map(|current_run_id| current_run_id == run_id)
-        .unwrap_or(false))
+    if current.is_some() {
+        return Ok(true);
+    }
+
+    record_stale_global_message(db, moodboard_slug, run_id, now).await?;
+    Ok(false)
 }
+
+async fn record_stale_global_message(
+    db: &D1Database,
+    moodboard_slug: &str,
+    run_id: &str,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        record_stale_global_message_sql(),
+        vec![
+            json!(now),
+            json!(run_id),
+            json!(moodboard_slug),
+            json!(moodboard_slug),
+            json!(run_id),
+        ],
+    )
+    .await
+}
+
+fn must_not_create_global_reference_from_stale_run() {}
 
 async fn ensure_current_global_run_after_provider_fetch(
     db: &D1Database,
     moodboard_slug: &str,
     run_id: &str,
 ) -> WorkerResult<bool> {
-    global_run_is_current(db, moodboard_slug, run_id).await
+    let now = now_iso_string();
+    current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await
 }
 
 async fn load_current_global_source_run_for_finalize(
@@ -1948,9 +2220,14 @@ fn claim_global_candidate_for_review_sql() -> &'static str {
       )
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -1975,9 +2252,14 @@ fn mark_global_candidate_review_approved_sql() -> &'static str {
       AND review_claim_id = ?
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -1999,9 +2281,14 @@ fn mark_global_candidate_review_rejected_sql() -> &'static str {
       AND review_claim_id = ?
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2023,9 +2310,14 @@ fn mark_global_candidate_review_failed_sql() -> &'static str {
       AND review_claim_id = ?
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2057,9 +2349,14 @@ fn load_global_candidate_for_cleanup_sql() -> &'static str {
       AND (cleanup_status = 'cleaning' OR cleanup_next_retry_at IS NULL OR cleanup_next_retry_at <= ?)
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2081,9 +2378,14 @@ fn claim_global_candidate_for_cleanup_sql() -> &'static str {
       AND (cleanup_status = 'cleaning' OR cleanup_next_retry_at IS NULL OR cleanup_next_retry_at <= ?)
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2108,9 +2410,14 @@ fn load_cleaned_global_candidate_for_followup_sql() -> &'static str {
       )
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2144,9 +2451,14 @@ fn load_cleaned_global_candidate_for_reference_resume_sql() -> &'static str {
       )
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2170,9 +2482,14 @@ fn claim_cleaned_global_candidate_for_reference_resume_sql() -> &'static str {
       )
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2193,9 +2510,14 @@ fn mark_global_candidate_cleanup_failed_sql() -> &'static str {
       AND cleanup_next_retry_at = ?
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2217,9 +2539,14 @@ fn mark_global_candidate_cleanup_succeeded_sql() -> &'static str {
       AND cleanup_next_retry_at = ?
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2304,9 +2631,14 @@ fn insert_global_moodboard_reference_sql() -> &'static str {
       AND gvc.assigned_moodboard_slug IS NOT NULL
       AND EXISTS (
         SELECT 1
-        FROM global_moodboard_reference_state
-        WHERE moodboard_slug = ?
-          AND current_run_id = ?
+        FROM global_moodboard_reference_state gmrs
+        INNER JOIN global_moodboard_source_runs gsr
+          ON gsr.id = gmrs.current_run_id
+         AND gsr.moodboard_slug = gmrs.moodboard_slug
+        WHERE gmrs.moodboard_slug = ?
+          AND gmrs.current_run_id = ?
+          AND gsr.id = ?
+          AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
       )
     "#
 }
@@ -2317,6 +2649,8 @@ async fn upsert_global_handle(
     handle: &str,
     discovered_via: &str,
     related_depth: u8,
+    run_id: &str,
+    guard_moodboard_slug: &str,
     now: &str,
 ) -> WorkerResult<()> {
     let Some(handle) = normalize_instagram_handle(handle) else {
@@ -2324,7 +2658,7 @@ async fn upsert_global_handle(
     };
     db::exec(
         db,
-        upsert_global_handle_sql(),
+        upsert_global_handle_if_current_sql(),
         vec![
             json!(deterministic_id(
                 "global_handle",
@@ -2336,6 +2670,12 @@ async fn upsert_global_handle(
             json!(related_depth),
             json!(now),
             json!(now),
+            json!(guard_moodboard_slug),
+            json!(run_id),
+            json!(run_id),
+            json!(guard_moodboard_slug),
+            json!(run_id),
+            json!(run_id),
         ],
     )
     .await
@@ -2344,6 +2684,7 @@ async fn upsert_global_handle(
 async fn mark_global_search_state_seen(
     db: &D1Database,
     moodboard_slug: &str,
+    run_id: &str,
     search_term: &str,
     date_window: &str,
     page: u32,
@@ -2365,6 +2706,17 @@ async fn mark_global_search_state_seen(
           AND search_term = ?
           AND date_window = ?
           AND page = ?
+          AND EXISTS (
+            SELECT 1
+            FROM global_moodboard_reference_state gmrs
+            INNER JOIN global_moodboard_source_runs gsr
+              ON gsr.id = gmrs.current_run_id
+             AND gsr.moodboard_slug = gmrs.moodboard_slug
+            WHERE gmrs.moodboard_slug = ?
+              AND gmrs.current_run_id = ?
+              AND gsr.id = ?
+              AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
+          )
         "#,
         vec![
             json!(now),
@@ -2374,6 +2726,9 @@ async fn mark_global_search_state_seen(
             json!(search_term),
             json!(date_window),
             json!(page),
+            json!(moodboard_slug),
+            json!(run_id),
+            json!(run_id),
         ],
     )
     .await
@@ -2382,6 +2737,7 @@ async fn mark_global_search_state_seen(
 async fn mark_global_handle_fetch_result(
     db: &D1Database,
     moodboard_slug: &str,
+    run_id: &str,
     handle: &str,
     next_cursor: Option<String>,
     now: &str,
@@ -2398,6 +2754,17 @@ async fn mark_global_handle_fetch_result(
             updated_at = ?
         WHERE moodboard_slug = ?
           AND handle = lower(?)
+          AND EXISTS (
+            SELECT 1
+            FROM global_moodboard_reference_state gmrs
+            INNER JOIN global_moodboard_source_runs gsr
+              ON gsr.id = gmrs.current_run_id
+             AND gsr.moodboard_slug = gmrs.moodboard_slug
+            WHERE gmrs.moodboard_slug = ?
+              AND gmrs.current_run_id = ?
+              AND gsr.id = ?
+              AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
+          )
         "#,
         vec![
             json!(now),
@@ -2405,6 +2772,9 @@ async fn mark_global_handle_fetch_result(
             json!(now),
             json!(moodboard_slug),
             json!(handle),
+            json!(moodboard_slug),
+            json!(run_id),
+            json!(run_id),
         ],
     )
     .await
@@ -2422,11 +2792,17 @@ async fn record_scrapecreators_search_failure_and_enqueue_finalize(
     error_message: &str,
 ) -> WorkerResult<()> {
     let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(());
+    }
+
     let cooldown_until = retry_after_iso(1);
     let detail = compact_error_detail(error_message);
     record_global_search_fetch_failure(
         db,
         moodboard_slug,
+        run_id,
         search_term,
         date_window,
         page,
@@ -2436,7 +2812,7 @@ async fn record_scrapecreators_search_failure_and_enqueue_finalize(
         &now,
     )
     .await?;
-    record_global_source_run_failure(db, run_id, error_code, &detail, &now).await?;
+    record_global_source_run_failure(db, moodboard_slug, run_id, error_code, &detail, &now).await?;
     enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "source_fetch_failed")
         .await
 }
@@ -2451,10 +2827,16 @@ async fn record_scrapecreators_handle_failure_and_enqueue_finalize(
     error_message: &str,
 ) -> WorkerResult<()> {
     let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(());
+    }
+
     let cooldown_until = retry_after_iso(1);
     let detail = compact_error_detail(error_message);
-    record_global_handle_fetch_failure(db, moodboard_slug, handle, &cooldown_until, &now).await?;
-    record_global_source_run_failure(db, run_id, error_code, &detail, &now).await?;
+    record_global_handle_fetch_failure(db, moodboard_slug, run_id, handle, &cooldown_until, &now)
+        .await?;
+    record_global_source_run_failure(db, moodboard_slug, run_id, error_code, &detail, &now).await?;
     enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "source_fetch_failed")
         .await
 }
@@ -2462,6 +2844,7 @@ async fn record_scrapecreators_handle_failure_and_enqueue_finalize(
 async fn record_global_search_fetch_failure(
     db: &D1Database,
     moodboard_slug: &str,
+    run_id: &str,
     search_term: &str,
     date_window: &str,
     page: u32,
@@ -2484,6 +2867,17 @@ async fn record_global_search_fetch_failure(
           AND search_term = ?
           AND date_window = ?
           AND page = ?
+          AND EXISTS (
+            SELECT 1
+            FROM global_moodboard_reference_state gmrs
+            INNER JOIN global_moodboard_source_runs gsr
+              ON gsr.id = gmrs.current_run_id
+             AND gsr.moodboard_slug = gmrs.moodboard_slug
+            WHERE gmrs.moodboard_slug = ?
+              AND gmrs.current_run_id = ?
+              AND gsr.id = ?
+              AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
+          )
         "#,
         vec![
             json!(error_code),
@@ -2494,6 +2888,9 @@ async fn record_global_search_fetch_failure(
             json!(search_term),
             json!(date_window),
             json!(page),
+            json!(moodboard_slug),
+            json!(run_id),
+            json!(run_id),
         ],
     )
     .await
@@ -2502,6 +2899,7 @@ async fn record_global_search_fetch_failure(
 async fn record_global_handle_fetch_failure(
     db: &D1Database,
     moodboard_slug: &str,
+    run_id: &str,
     handle: &str,
     cooldown_until: &str,
     now: &str,
@@ -2515,12 +2913,26 @@ async fn record_global_handle_fetch_failure(
             updated_at = ?
         WHERE moodboard_slug = ?
           AND handle = lower(?)
+          AND EXISTS (
+            SELECT 1
+            FROM global_moodboard_reference_state gmrs
+            INNER JOIN global_moodboard_source_runs gsr
+              ON gsr.id = gmrs.current_run_id
+             AND gsr.moodboard_slug = gmrs.moodboard_slug
+            WHERE gmrs.moodboard_slug = ?
+              AND gmrs.current_run_id = ?
+              AND gsr.id = ?
+              AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
+          )
         "#,
         vec![
             json!(cooldown_until),
             json!(now),
             json!(moodboard_slug),
             json!(handle),
+            json!(moodboard_slug),
+            json!(run_id),
+            json!(run_id),
         ],
     )
     .await
@@ -2528,6 +2940,7 @@ async fn record_global_handle_fetch_failure(
 
 async fn record_global_source_run_failure(
     db: &D1Database,
+    moodboard_slug: &str,
     run_id: &str,
     error_code: &str,
     error_message: &str,
@@ -2541,11 +2954,27 @@ async fn record_global_source_run_failure(
             error_message = ?,
             updated_at = ?
         WHERE id = ?
+          AND moodboard_slug = ?
+          AND EXISTS (
+            SELECT 1
+            FROM global_moodboard_reference_state gmrs
+            INNER JOIN global_moodboard_source_runs gsr
+              ON gsr.id = gmrs.current_run_id
+             AND gsr.moodboard_slug = gmrs.moodboard_slug
+            WHERE gmrs.moodboard_slug = ?
+              AND gmrs.current_run_id = ?
+              AND gsr.id = ?
+              AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
+          )
         "#,
         vec![
             json!(error_code),
             json!(error_message),
             json!(now),
+            json!(run_id),
+            json!(moodboard_slug),
+            json!(moodboard_slug),
+            json!(run_id),
             json!(run_id),
         ],
     )
@@ -2565,7 +2994,7 @@ async fn upsert_global_candidates_and_audit(
         let candidate_id = deterministic_id("global_candidate", &[&source_image_key]);
         db::exec(
             db,
-            upsert_global_candidate_sql(),
+            upsert_global_candidate_if_current_sql(),
             vec![
                 json!(candidate_id),
                 json!("instagram"),
@@ -2621,12 +3050,17 @@ async fn upsert_global_candidates_and_audit(
                 json!(candidate.raw_json),
                 json!(now),
                 json!(now),
+                json!(moodboard_slug),
+                json!(run_id),
+                json!(run_id),
+                json!(run_id),
+                json!(run_id),
             ],
         )
         .await?;
         db::exec(
             db,
-            audit_global_candidate_discovery_sql(),
+            audit_global_candidate_discovery_if_current_sql(),
             vec![
                 json!(deterministic_id(
                     "global_discovery",
@@ -2645,6 +3079,9 @@ async fn upsert_global_candidates_and_audit(
                 json!(candidate.discovered_via),
                 json!(candidate.source_handle),
                 json!(now),
+                json!(moodboard_slug),
+                json!(run_id),
+                json!(run_id),
             ],
         )
         .await?;
@@ -2654,6 +3091,7 @@ async fn upsert_global_candidates_and_audit(
 
 async fn increment_global_source_run_count(
     db: &D1Database,
+    moodboard_slug: &str,
     run_id: &str,
     column: &str,
     amount: u32,
@@ -2667,13 +3105,38 @@ async fn increment_global_source_run_count(
             ))
         }
     };
-    let sql = format!(
-        "UPDATE global_moodboard_source_runs SET {column} = {column} + ?, updated_at = ? WHERE id = ?"
+    let guarded_global_source_run_count_update_sql = format!(
+        r#"
+        UPDATE global_moodboard_source_runs
+        SET {column} = {column} + ?,
+            updated_at = ?
+        WHERE id = ?
+          AND moodboard_slug = ?
+          AND EXISTS (
+            SELECT 1
+            FROM global_moodboard_reference_state gmrs
+            INNER JOIN global_moodboard_source_runs gsr
+              ON gsr.id = gmrs.current_run_id
+             AND gsr.moodboard_slug = gmrs.moodboard_slug
+            WHERE gmrs.moodboard_slug = ?
+              AND gmrs.current_run_id = ?
+              AND gsr.id = ?
+              AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
+          )
+        "#
     );
     db::exec(
         db,
-        &sql,
-        vec![json!(amount), json!(now_iso_string()), json!(run_id)],
+        &guarded_global_source_run_count_update_sql,
+        vec![
+            json!(amount),
+            json!(now_iso_string()),
+            json!(run_id),
+            json!(moodboard_slug),
+            json!(moodboard_slug),
+            json!(run_id),
+            json!(run_id),
+        ],
     )
     .await
 }
@@ -2964,7 +3427,7 @@ async fn load_reference_pipeline_lifecycle_config(
     Ok(ReferencePipelineLifecycleConfig {
         global_discovery_run_stale_after_minutes: config_value_i64(
             db,
-            "global_discovery_run_stale_after_minutes",
+            GLOBAL_DISCOVERY_RUN_STALE_AFTER_MINUTES_CONFIG_KEY,
             60,
         )
         .await?,
@@ -3049,6 +3512,11 @@ async fn record_global_candidate_cleanup_failure_and_finalize(
     error_message: &str,
 ) -> WorkerResult<()> {
     let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(());
+    }
+
     let next_retry_at = retry_after_minutes(15);
     db::exec(
         db,
@@ -3063,6 +3531,7 @@ async fn record_global_candidate_cleanup_failure_and_finalize(
             json!(candidate_id),
             json!(cleanup_claim_expires_at),
             json!(moodboard_slug),
+            json!(run_id),
             json!(run_id),
         ],
     )
@@ -3079,10 +3548,21 @@ async fn resume_or_finalize_cleaned_global_candidate(
     candidate_id: &str,
     retry_limit: u32,
 ) -> WorkerResult<bool> {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(true);
+    }
+
     if let Some(candidate) = db::first::<GlobalVisualCandidateReferenceRow>(
         db,
         load_cleaned_global_candidate_for_reference_resume_sql(),
-        vec![json!(candidate_id), json!(moodboard_slug), json!(run_id)],
+        vec![
+            json!(candidate_id),
+            json!(moodboard_slug),
+            json!(run_id),
+            json!(run_id),
+        ],
     )
     .await?
     {
@@ -3095,6 +3575,7 @@ async fn resume_or_finalize_cleaned_global_candidate(
                 json!(now_iso_string()),
                 json!(candidate_id),
                 json!(moodboard_slug),
+                json!(run_id),
                 json!(run_id),
             ],
         )
@@ -3119,7 +3600,12 @@ async fn resume_or_finalize_cleaned_global_candidate(
     if let Some(candidate) = db::first::<GlobalVisualCandidateFollowupRow>(
         db,
         load_cleaned_global_candidate_for_followup_sql(),
-        vec![json!(candidate_id), json!(moodboard_slug), json!(run_id)],
+        vec![
+            json!(candidate_id),
+            json!(moodboard_slug),
+            json!(run_id),
+            json!(run_id),
+        ],
     )
     .await?
     {
@@ -3141,6 +3627,12 @@ async fn complete_cleaned_global_moodboard_reference(
     candidate: &GlobalVisualCandidateReferenceRow,
     review: Option<GlobalVisualReferenceReview>,
 ) -> WorkerResult<()> {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(());
+    }
+
     let review = match review {
         Some(review) => review,
         None => match serde_json::from_str::<GlobalVisualReferenceReview>(&candidate.review_json) {
@@ -3163,40 +3655,44 @@ async fn complete_cleaned_global_moodboard_reference(
         },
     };
 
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
-        return Ok(());
-    }
     let global_reference_id = deterministic_global_moodboard_reference_id(candidate_id);
-    let cached =
-        match crate::services::visual_reference_cache::cache_cleaned_global_moodboard_reference(
-            db,
-            env,
-            &candidate.assigned_moodboard_slug,
-            &global_reference_id,
-            &candidate.cleaned_image_url,
-            candidate.image_width,
-            candidate.image_height,
-        )
-        .await
-        {
-            Ok(cached) => cached,
-            Err(error) => {
-                record_global_candidate_cleanup_failure_and_finalize(
-                    db,
-                    env,
-                    moodboard_slug,
-                    run_id,
-                    candidate_id,
-                    retry_limit,
-                    cleanup_claim_expires_at,
-                    "global_reference_cache_failed",
-                    &error.to_string(),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-    if !global_run_is_current(db, moodboard_slug, run_id).await? {
+    let cached = match cache_cleaned_global_moodboard_reference_if_current(
+        db,
+        env,
+        moodboard_slug,
+        run_id,
+        &candidate.assigned_moodboard_slug,
+        &global_reference_id,
+        &candidate.cleaned_image_url,
+        candidate.image_width,
+        candidate.image_height,
+    )
+    .await
+    {
+        Ok(Some(cached)) => cached,
+        Ok(None) => {
+            must_not_create_global_reference_from_stale_run();
+            return Ok(());
+        }
+        Err(error) => {
+            record_global_candidate_cleanup_failure_and_finalize(
+                db,
+                env,
+                moodboard_slug,
+                run_id,
+                candidate_id,
+                retry_limit,
+                cleanup_claim_expires_at,
+                "global_reference_cache_failed",
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
         return Ok(());
     }
 
@@ -3229,6 +3725,7 @@ async fn complete_cleaned_global_moodboard_reference(
                 json!(now_iso_string()),
                 json!(candidate_id),
                 json!(moodboard_slug),
+                json!(run_id),
                 json!(run_id),
             ],
         )
@@ -3263,6 +3760,131 @@ async fn complete_cleaned_global_moodboard_reference(
     .await
 }
 
+async fn cache_cleaned_global_moodboard_reference_if_current(
+    db: &D1Database,
+    env: &Env,
+    source_moodboard_slug: &str,
+    run_id: &str,
+    assigned_moodboard_slug: &str,
+    global_reference_id: &str,
+    cleaned_image_url: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> WorkerResult<Option<CachedVisualReference>> {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, source_moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(None);
+    }
+
+    let (bytes, content_type) = fetch_visual_reference_image(cleaned_image_url).await?;
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, source_moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(None);
+    }
+
+    let byte_size = bytes.len();
+    let sha256_hex = sha256_hex(&bytes);
+    let media_asset_id =
+        global_visual_reference_media_asset_id(assigned_moodboard_slug, global_reference_id);
+    let storage_key = global_visual_reference_storage_key(
+        assigned_moodboard_slug,
+        global_reference_id,
+        &content_type,
+    );
+
+    env.bucket("MEDIA")?
+        .put(storage_key.clone(), bytes)
+        .http_metadata(HttpMetadata {
+            content_type: Some(content_type.clone()),
+            content_language: None,
+            content_disposition: None,
+            content_encoding: None,
+            cache_control: None,
+            cache_expiry: None,
+        })
+        .execute()
+        .await?;
+
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, source_moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(None);
+    }
+
+    let insert_guarded_global_media_asset_sql = r#"
+        -- Global media assets use user_id = 'global' and clone_id = NULL.
+        INSERT OR IGNORE INTO media_assets (
+          id,
+          user_id,
+          clone_id,
+          kind,
+          source,
+          storage_key,
+          content_type,
+          bytes,
+          width,
+          height,
+          remote_url,
+          sha256,
+          metadata_json,
+          created_at
+        )
+        SELECT ?, 'global', NULL, 'global_visual_reference', 'instagram', ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1
+          FROM global_moodboard_reference_state gmrs
+          INNER JOIN global_moodboard_source_runs gsr
+            ON gsr.id = gmrs.current_run_id
+           AND gsr.moodboard_slug = gmrs.moodboard_slug
+          WHERE gmrs.moodboard_slug = ?
+            AND gmrs.current_run_id = ?
+            AND gsr.id = ?
+            AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
+        )
+    "#;
+    db::exec(
+        db,
+        insert_guarded_global_media_asset_sql,
+        vec![
+            json!(media_asset_id.clone()),
+            json!(storage_key.clone()),
+            json!(content_type.clone()),
+            json!(byte_size),
+            json!(width),
+            json!(height),
+            json!(cleaned_image_url),
+            json!(sha256_hex.clone()),
+            json!(json!({
+                "globalReferenceId": global_reference_id,
+                "moodboardSlug": assigned_moodboard_slug,
+                "cleanedImageUrl": cleaned_image_url
+            })
+            .to_string()),
+            json!(now),
+            json!(source_moodboard_slug),
+            json!(run_id),
+            json!(run_id),
+        ],
+    )
+    .await?;
+
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, source_moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(None);
+    }
+
+    Ok(Some(CachedVisualReference {
+        media_asset_id,
+        storage_key,
+        content_type,
+        byte_size,
+        sha256_hex,
+    }))
+}
+
 async fn ensure_global_cleanup_followups(
     db: &D1Database,
     env: &Env,
@@ -3270,6 +3892,12 @@ async fn ensure_global_cleanup_followups(
     run_id: &str,
     candidate: &GlobalVisualCandidateFollowupRow,
 ) -> WorkerResult<()> {
+    let now = now_iso_string();
+    if !current_global_run_or_record_stale(db, moodboard_slug, run_id, &now).await? {
+        must_not_create_global_reference_from_stale_run();
+        return Ok(());
+    }
+
     if candidate.assigned_moodboard_slug != candidate.discovery_moodboard_slug {
         if let Some(handle) = candidate.source_handle.as_deref() {
             if let Err(error) = upsert_global_handle(
@@ -3278,6 +3906,8 @@ async fn ensure_global_cleanup_followups(
                 handle,
                 "cross_routed_acceptance",
                 0,
+                run_id,
+                moodboard_slug,
                 &now_iso_string(),
             )
             .await
@@ -3566,16 +4196,33 @@ fn deterministic_id(prefix: &str, parts: &[&str]) -> String {
     format!("{prefix}_{}", hex::encode(&digest[..16]))
 }
 
+fn global_visual_reference_media_asset_id(
+    moodboard_slug: &str,
+    global_reference_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in ["global", moodboard_slug, global_reference_id] {
+        hasher.update(part.len().to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    let digest = hasher.finalize();
+    format!("media_global_visual_{}", &hex::encode(digest)[..24])
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 fn new_global_run_id() -> String {
     format!("global_run_{}", uuid::Uuid::new_v4().simple())
 }
 
 fn new_global_review_claim_id() -> String {
     format!("global_review_claim_{}", uuid::Uuid::new_v4().simple())
-}
-
-fn now_iso_string() -> String {
-    js_sys::Date::new_0().to_iso_string().into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3587,18 +4234,10 @@ struct GlobalMoodboardDefinitionRow {
 }
 
 #[derive(Debug, Deserialize)]
-struct GlobalReferenceStateRetryRow {
-    next_retry_at: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReusableGlobalSourceRunRow {
-    id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CurrentRunRow {
+struct CurrentGlobalRunForEnsureRow {
     current_run_id: Option<String>,
+    status: Option<String>,
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
