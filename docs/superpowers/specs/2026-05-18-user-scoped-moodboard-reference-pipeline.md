@@ -138,8 +138,10 @@ User selects 1-10 moodboards
 
 Clone becomes ready or Blitz needs a pool
   -> Load current selected user moodboard slugs
-  -> If global library cannot supply enough candidate refs, enqueue global discovery and mark clone pool waiting
-  -> When global discovery finishes, re-check global references and resume pool build
+  -> If global library cannot supply enough candidate refs, enqueue eligible global discovery for underfilled slugs
+  -> Wait only when in-progress or retryable global work exists
+  -> Otherwise attempt partial compatibility or mark insufficient
+  -> When selected or cross-routed global slugs gain refs, re-check global references and resume pool build
   -> Run clone compatibility for the specific clone
   -> Insert compatible clone-scoped visual_references
   -> Create or refresh Blitz batch for the clone
@@ -490,6 +492,16 @@ Routing behavior:
   app moodboard, accept it under `bestMoodboardSlug`.
 - If it does not strongly fit any app moodboard, reject it.
 - Do not route hard rejections.
+- The Kimi `bestMoodboardSlug` becomes the reference's assigned moodboard slug,
+  even when it differs from the run's discovery moodboard slug.
+- Cross-routed approvals must update reference counts, readiness state, and
+  waiting clone pool wakeups for the assigned moodboard slug, not only for the
+  discovery moodboard slug.
+- A global run that discovers under slug A and creates references assigned to
+  slug B must treat both A and B as impacted slugs during finalization. The B
+  update is a recount/wakeup side effect and must not overwrite B's
+  `current_run_id` or active run status when B already has a nonstale current
+  run.
 
 Kimi output should include:
 
@@ -627,9 +639,19 @@ Recommended schema:
     per moodboard slug
 - `global_visual_reference_candidates`
   - global candidate and review records
+  - `platform TEXT NOT NULL`
   - `source_image_key TEXT NOT NULL`
   - `first_seen_run_id`
   - `last_seen_run_id`
+  - `discovery_moodboard_slug`
+  - `assigned_moodboard_slug`
+  - `review_status`
+  - `review_run_id`
+  - `review_attempt_count`
+  - `review_claim_id`
+  - `review_locked_until`
+  - review status values: `queued`, `reviewing`, `approved`, `rejected`,
+    `failed`
   - `metadata_json TEXT NOT NULL DEFAULT '{}'`
   - stores source metadata, Kimi review, cleanup status, and cleanup attempts
   - uniqueness by `platform, source_image_key`
@@ -639,10 +661,17 @@ Recommended schema:
     here
 - `global_visual_candidate_discoveries`
   - run-level discovery audit for global candidates
-  - fields: `candidate_id`, `run_id`, `moodboard_slug`, `source_id`,
-    `discovered_via`, `source_handle`, `created_at`
+  - fields: `candidate_id`, `run_id`, `moodboard_slug`,
+    `source_key TEXT NOT NULL`, optional `source_id`, `discovered_via`,
+    `source_handle`, `created_at`
+  - `source_key` is the non-null audit identity for where the candidate was
+    found, such as `instagram_reels_search:<term>:<window>:<page>` or
+    `instagram_handle:<handle>:<post-or-profile-key>`
+  - `source_id` may reference a retained global `discovery_sources` row or global
+    source-state row if the migration keeps that table, but uniqueness must not
+    depend on nullable `source_id`
   - required uniqueness:
-    `UNIQUE(candidate_id, run_id, moodboard_slug, source_id)`
+    `UNIQUE(candidate_id, run_id, moodboard_slug, source_key)`
   - used for per-run counts, duplicate rediscovery audit, and stale-run
     filtering
 - `global_moodboard_references`
@@ -650,6 +679,9 @@ Recommended schema:
   - references `global_visual_reference_candidates.id`
   - references global `media_assets.id`
   - required uniqueness: `UNIQUE(candidate_id)` and `UNIQUE(media_asset_id)`
+  - stores `moodboard_slug` as the Kimi-assigned moodboard slug
+  - stores `source_run_id` and `discovery_moodboard_slug` for finalization,
+    cross-routed wakeups, and stale-run filtering
   - stores Kimi visual tags and Soul2 quality scores
   - status values: `active`, `disabled`, `deleted`
 - `clone_visual_reference_compatibility`
@@ -661,6 +693,12 @@ Recommended schema:
   - stores body-proportion, hair-length, and facial-hair decisions
   - incompatible references are recorded here and must not become Blitz-ready
     `visual_references`
+- `clone_reference_compatibility_attempts`
+  - audit-only table for provider attempts, stale pool messages, and discarded
+    compatibility work that must not mutate canonical compatibility state
+  - fields: `pool_run_id`, `clone_id`, `global_reference_id`, `status`,
+    `error_code`, `error_message`, `created_at`
+  - indexes: `(pool_run_id, clone_id)` and `(clone_id, global_reference_id)`
 - `clone_pool_waiting_moodboards`
   - indexed wakeup table for clone pools waiting on global moodboard supply
   - one row per `pool_run_id + moodboard_slug`
@@ -684,6 +722,13 @@ Recommended schema:
   - fields: `queue_name`, `message_kind`, `dedupe_key`, optional `run_id`,
     optional `pool_run_id`, `status`, `created_at`, `updated_at`, `expires_at`
   - required uniqueness: `UNIQUE(queue_name, message_kind, dedupe_key)`
+  - status values: `reserved`, `enqueued`, `handling`, `handled`, `failed`,
+    `expired`, `cancelled`
+  - active statuses are `reserved`, `enqueued`, and `handling`; active rows block
+    duplicate enqueue only while `expires_at` is in the future
+  - terminal statuses are `handled`, `failed`, `expired`, and `cancelled`;
+    terminal rows do not suppress future legitimate work after the caller
+    re-runs the normal eligibility gate
   - terminal or expired rows may be replaced only after the handler decides the
     work is eligible again
 
@@ -743,8 +788,12 @@ The migration must rebuild or recreate:
 - `global_moodboard_definitions`
   - create app-owned catalog rows from the current moodboard seeds
 - `discovery_sources`
+  - retain as global source-state rows or replace with global-specific source
+    tables
   - remove clone/user ownership assumptions from global discovery source rows
-    or replace with global-specific source tables
+  - `global_visual_candidate_discoveries.source_key` remains the required
+    non-null source identity either way; optional `source_id` may point to the
+    retained/replacement source table but is not part of the uniqueness contract
 - `global_moodboard_source_runs`
 - `global_moodboard_search_state`
 - `global_moodboard_handles`
@@ -752,6 +801,7 @@ The migration must rebuild or recreate:
 - `global_visual_candidate_discoveries`
 - `global_moodboard_references`
 - `clone_visual_reference_compatibility`
+- `clone_reference_compatibility_attempts`
 - `clone_pool_waiting_moodboards`
 - `visual_references`
   - keep `clone_id NOT NULL`
@@ -837,8 +887,13 @@ Rules:
   every downstream clone-pool message.
 - `ValidateCloneCompatibility` and `FinalizeCloneReferencePool` must carry
   `pool_run_id`.
-- Global handlers must verify the run is still current for that moodboard before
-  updating global-visible status.
+- Global handlers must verify the source run is still current for the discovery
+  moodboard before updating run status, creating active global references, or
+  creating reusable global `media_assets`.
+- Cross-routed reference activation uses the source run's currentness plus the
+  assigned slug's active definition. Assigned-slug state updates are recount and
+  wakeup side effects only; they must not overwrite another slug's
+  `current_run_id` or nonstale active run status.
 - Queue messages from stale global runs must be acked after recording
   `stale_run` or equivalent audit state.
 - Queue messages from stale global runs must not insert or activate
@@ -848,9 +903,9 @@ Rules:
 - Clone-scoped handlers must never run Instagram discovery directly.
 - Queue messages from stale clone pool runs must not insert Blitz-ready
   `visual_references`, must not insert `user_inspiration_pool` rows, and must
-  not transition compatibility rows to `accepted` or `rejected`. They may record
-  audit-only stale attempt metadata, or a nonterminal `failed` row with
-  `last_error_code = 'stale_pool_run'`.
+  not insert or update canonical `clone_visual_reference_compatibility` rows in
+  any status. They may record audit-only stale attempt metadata in
+  `clone_reference_compatibility_attempts` with `status = 'stale_ignored'`.
 - If selected moodboards do not have enough active global references to attempt
   compatibility, clone-scoped handlers enqueue `EnsureGlobalMoodboardLibrary`
   for underfilled slugs. They may mark the clone pool run
@@ -871,14 +926,23 @@ Rules:
   `global_refs_for_pool_min` active not-yet-rejected references, clone pool build
   should proceed while global discovery runs as background top-up.
 - `FinalizeGlobalMoodboardLibrary` is responsible for resuming deferred clone
-  pool work. After a current global run finishes, it must inspect ready,
-  nonfailed clones in `waiting_for_global_library` for users who selected that
-  moodboard slug through `clone_pool_waiting_moodboards`, not by scanning JSON,
-  and reserve/enqueue `BuildCloneReferencePool` wakeup messages when the global
-  library has at least one active reference for the current selected moodboards.
-  The wakeup resumes the existing current pool run when it is still nonstale,
-  current, and has the same selected moodboard hash; it supersedes only when the
-  waiting run is stale, no longer current, or selection changed.
+  pool work. After a current global run finishes, it must compute impacted slugs:
+  the run's discovery `moodboard_slug` plus every Kimi-assigned
+  `global_moodboard_references.moodboard_slug` created or activated with
+  `source_run_id = run_id`.
+- For each impacted slug, finalization must recount active global references,
+  update that slug's readiness fields, and inspect ready, nonfailed clones in
+  `waiting_for_global_library` for users who selected that slug through
+  `clone_pool_waiting_moodboards`, not by scanning JSON.
+- Finalization must reserve/enqueue `BuildCloneReferencePool` wakeup messages
+  when the global library has at least one active reference for the current
+  selected moodboards. The wakeup resumes the existing current pool run when it
+  is still nonstale, current, and has the same selected moodboard hash; it
+  supersedes only when the waiting run is stale, no longer current, or selection
+  changed.
+- Cross-routed wakeups are required. If an A run creates a reference assigned to
+  B, waiting clone pools registered for B must be considered even if B did not
+  own the source run.
 - If `FinalizeGlobalMoodboardLibrary` finds waiting ready clones but the global
   library still has zero active references for selected moodboards and no
   currently retryable global discovery work remains, including when all missing
@@ -902,17 +966,52 @@ Idempotent queue reservations:
 - All queue nudges that may be emitted by duplicate kickoff/finalize messages
   must reserve a row in `queue_message_reservations` before enqueueing.
 - Use `UNIQUE(queue_name, message_kind, dedupe_key)` to collapse duplicates.
+- Reservation lifecycle:
+  - create `reserved` in the same transaction that decides the work is eligible
+  - update to `enqueued` after the queue send succeeds
+  - update to `handling` when a handler starts work
+  - update to `handled` when the handler succeeds or intentionally no-ops
+  - update to `failed` for retryable handler failures
+  - update to `cancelled` when the run or pool is superseded before handling
+  - update to `expired` only when replacing an active row whose `expires_at` is
+    in the past
+- Active reservations (`reserved`, `enqueued`, `handling`) suppress duplicate
+  enqueue only until `expires_at`. Terminal reservations (`handled`, `failed`,
+  `expired`, `cancelled`) never suppress future legitimate work after the normal
+  eligibility gate passes again.
+- Required `expires_at` policy:
+  - kickoff, wakeup, ensure, and finalize reservations: `now + 5 minutes`
+  - downstream global run reservations: `now +
+    global_discovery_run_stale_after_minutes + 15 minutes`
+  - downstream clone pool reservations: `now +
+    clone_pool_run_stale_after_minutes + 15 minutes`
+  - review batch reservations: `now + 10 minutes`
+- Because `global:ensure:<moodboard_slug>` is intentionally not run-scoped, its
+  active reservation TTL must stay short, and the handler must mark it terminal
+  before exit. A stale or terminal ensure reservation must not suppress a later
+  legitimate ensure after eligibility is re-evaluated.
 - Suggested dedupe keys:
   - `global:ensure:<moodboard_slug>`
   - `global:<run_id>:discover:<moodboard_slug>:<term>:<date_window>:<page>`
   - `global:<run_id>:profile:<moodboard_slug>:<handle>:<related_depth>`
   - `global:<run_id>:posts:<moodboard_slug>:<handle>:<page>:<next_max_id>`
   - `global:<run_id>:post-detail:<source_url>`
-  - `global:<run_id>:review:<candidate_id>`
+  - `global:<run_id>:review-batch:<moodboard_slug>`
   - `global:<run_id>:cleanup:<candidate_id>`
   - `global:<run_id>:finalize:<moodboard_slug>`
   - `clone:<pool_run_id>:compat:<global_reference_id>`
   - `clone:<pool_run_id>:finalize`
+- `ReviewGlobalVisualCandidates` is a batch selector message. Its reservation
+  key is batch-shaped, not candidate-shaped.
+- Before calling Kimi, the review handler must atomically claim candidate rows
+  for that `run_id` by setting `review_status = 'reviewing'`,
+  `review_run_id`, `review_claim_id`, and `review_locked_until`, or by an
+  equivalent compare-and-swap status transition. Review results may be written
+  only by the holder of the current nonexpired claim and only while the source
+  run is still current for the discovery moodboard.
+- If review is later split into per-candidate queue messages, those messages may
+  use `global:<run_id>:review:<candidate_id>`, but the batch-shaped
+  `ReviewGlobalVisualCandidates` message must not use that key.
 - Global source fetch idempotency also uses the existing source/search/handle
   uniqueness rules. Reference creation idempotency uses
   `UNIQUE(platform, source_image_key)`, `global_visual_candidate_discoveries`
@@ -1108,6 +1207,10 @@ Global run behavior:
 - Downstream global messages update global-visible status only when their
   `run_id` still matches `global_moodboard_reference_state.current_run_id` for
   that moodboard slug.
+- Cross-routed assigned-slug recounts may update active counts, ready timestamps,
+  and wakeup decisions for the assigned slug even though the source `run_id`
+  belongs to another slug. They must not replace the assigned slug's
+  `current_run_id` or overwrite a nonstale active assigned-slug run status.
 - If a newer global run supersedes an older run, old messages may finish
   per-candidate audit writes, but they must not mark the current global library
   `library_ready`, `underfilled`, `underfilled_exhausted`,
@@ -1129,11 +1232,12 @@ Clone pool behavior:
   their `pool_run_id` still matches
   `clone_reference_state.current_pool_run_id`.
 - If a user changes moodboard selection while older compatibility messages are
-  still running, old messages may finish per-reference compatibility audit
-  writes, but they must not mark the current clone pool `pool_ready`,
-  `partial_pool_ready`, `waiting_for_global_library`, `insufficient_refs`, or
-  `pool_failed`, and they must not insert active clone-scoped
-  `visual_references` or `user_inspiration_pool` rows.
+  still running, old messages may write audit-only rows to
+  `clone_reference_compatibility_attempts`, but they must not mark the current
+  clone pool `pool_ready`, `partial_pool_ready`, `waiting_for_global_library`,
+  `insufficient_refs`, or `pool_failed`, must not insert or update canonical
+  `clone_visual_reference_compatibility` rows, and must not insert active
+  clone-scoped `visual_references` or `user_inspiration_pool` rows.
 
 ## Clone-Specific Pool Build
 
@@ -1197,7 +1301,8 @@ global discovery as background top-up and continue compatibility work.
 
 Outputs:
 
-- insert compatibility attempts into `clone_visual_reference_compatibility`
+- insert current, nonstale compatibility attempts into
+  `clone_visual_reference_compatibility`
 - insert only compatible rows into clone-scoped `visual_references`
 - copy or reference Kimi visual tags from `global_moodboard_references`
 - set `visual_references.media_asset_id` to the compatible cleaned reference
@@ -1208,6 +1313,10 @@ Outputs:
   selection
 
 Compatibility retry transitions:
+
+These transitions apply only when the message `pool_run_id` is still the
+current nonstale pool run for the clone. Stale or superseded pool messages must
+write only to `clone_reference_compatibility_attempts` audit rows.
 
 - missing row -> insert `queued` with `attempt_count = 0`
 - `queued` -> provider call starts by incrementing `attempt_count` and setting
@@ -1405,6 +1514,8 @@ Unit and domain tests should cover:
   candidates
 - duplicate rediscovery writes `global_visual_candidate_discoveries` rows tied
   to the current run
+- `global_visual_candidate_discoveries` uses non-null `source_key` for
+  uniqueness and does not rely on nullable SQLite unique-index columns
 - Kimi review accepts only one likely adult with safe content
 - Kimi review rejects moodboards, screenshots, product shots, tutorials, generic
   images, no-human images, multi-human images, minors, and unsafe images
@@ -1414,6 +1525,8 @@ Unit and domain tests should cover:
 - Kimi review does not hard reject solely because one Soul2 quality score is
   moderate when overall reference value is acceptable
 - off-style but strong images are assigned to another app moodboard
+- cross-routed approvals update the assigned moodboard slug's reference state
+  and wake waiting clone pools for that slug
 - Seedream cleanup prompt matches the exact text-only prompt
 - expired or forbidden external source image URLs mark candidates
   `source_unavailable` and search continues
@@ -1452,7 +1565,15 @@ Unit and domain tests should cover:
   global media assets
 - stale clone pool messages cannot create active clone-scoped visual references
   or user inspiration rows
+- stale clone pool messages cannot insert or update canonical
+  `clone_visual_reference_compatibility` rows
+- stale clone pool messages may write only audit rows to
+  `clone_reference_compatibility_attempts`
 - duplicate queue nudges are collapsed by `queue_message_reservations`
+- `queue_message_reservations` status lifecycle and `expires_at` TTLs prevent
+  stale non-run-scoped ensure reservations from suppressing later eligible work
+- `ReviewGlobalVisualCandidates` uses a batch-shaped reservation key and
+  candidate-level review claims before Kimi calls
 - clone compatibility checks body proportions, hair length, and facial hair
 - clone compatibility does not reject only because of gender
 - clone compatibility retry state records `attempt_count`, last error, and
