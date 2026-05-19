@@ -249,6 +249,7 @@ fn clone_pool_messages_serialize_with_pool_run_only_after_kickoff() {
         user_id: "user_1".to_string(),
         clone_id: "clone_1".to_string(),
         reason: "soul_ready".to_string(),
+        wakeup_moodboard_slug: None,
     })
     .unwrap();
 
@@ -441,6 +442,44 @@ fn clone_pool_candidate_query_uses_global_refs_and_terminal_compatibility_rules(
 }
 
 #[test]
+fn clone_pool_actionable_count_ignores_inactive_visual_references() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let count_helper = source
+        .split("pub fn compatibility_actionable_global_reference_count_for_current_selection_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn reserve_reference_pipeline_message_sql").next())
+        .expect("actionable global reference count helper");
+
+    assert!(count_helper.contains("LEFT JOIN visual_references vr"));
+    assert!(count_helper.contains("AND vr.status = 'active'"));
+    assert!(count_helper.contains("cvr.status = 'accepted' AND vr.id IS NULL"));
+}
+
+#[test]
+fn accepted_global_reference_repair_reactivates_inactive_visual_references() {
+    let source = include_str!("../src/services/clone_reference_pool.rs");
+    let count_helper = source
+        .split("pub fn compatibility_actionable_global_reference_count_for_current_selection_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn reserve_reference_pipeline_message_sql").next())
+        .expect("actionable global reference count helper");
+    let insert_helper = source
+        .split("fn insert_clone_visual_reference_sql()")
+        .nth(1)
+        .and_then(|section| {
+            section.split("fn active_clone_visual_reference_for_accepted_global_reference_sql")
+                .next()
+        })
+        .expect("accepted global reference visual reference insert helper");
+
+    assert!(count_helper.contains("AND vr.status = 'active'"));
+    assert!(insert_helper.contains("ON CONFLICT(clone_id, global_reference_id) DO UPDATE SET"));
+    assert!(insert_helper.contains("status = 'active'"));
+    assert!(insert_helper.contains("updated_at = excluded.updated_at"));
+    assert!(!insert_helper.contains("vr.id IS NULL"));
+}
+
+#[test]
 fn clone_compatibility_handler_is_current_pool_guarded_and_audited() {
     let source = include_str!("../src/services/clone_reference_pool.rs");
     assert!(source.contains("current_pool_run_allows_side_effects_sql"));
@@ -469,7 +508,8 @@ fn clone_compatibility_handler_writes_terminal_rejected_and_accepted_rows() {
 fn accepted_global_reference_insert_creates_clone_scoped_visual_reference_only_through_global_asset(
 ) {
     let source = include_str!("../src/services/clone_reference_pool.rs");
-    assert!(source.contains("INSERT OR IGNORE INTO visual_references"));
+    assert!(source.contains("INSERT INTO visual_references"));
+    assert!(source.contains("ON CONFLICT(clone_id, global_reference_id) DO UPDATE SET"));
     assert!(source.contains("clone_visual_reference_id"));
     assert!(source.contains("gmr.status = 'active'"));
     assert!(source.contains("cvr.status = 'accepted'"));
@@ -6429,4 +6469,114 @@ fn global_source_failure_updates_are_sql_guarded_by_current_active_run() {
     assert!(handle_enqueue_body.contains("record_global_handle_fetch_failure("));
     assert!(handle_enqueue_body.contains("run_id,"));
     assert!(handle_enqueue_body.contains("record_global_source_run_failure("));
+}
+
+#[test]
+fn global_finalization_wakes_waiting_and_passive_insufficient_pools_by_index() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    assert!(queue.contains("clone_pool_wakeup_candidates_sql"));
+    assert!(queue.contains("FROM clone_pool_waiting_moodboards cpwm"));
+    assert!(queue.contains("cpwm.status IN ('waiting', 'insufficient')"));
+    assert!(queue.contains("cpwm.moodboard_slug = ?"));
+    assert!(queue.contains("ReferencePipelineMessage::BuildCloneReferencePool"));
+    assert!(queue.contains("global_library_wakeup"));
+    assert!(!queue.contains("json_each(crs.waiting_moodboard_slugs_json"));
+}
+
+#[test]
+fn global_finalization_marks_waiting_rows_resumed_insufficient_or_superseded() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    assert!(queue.contains("mark_waiting_rows_resumed_sql"));
+    assert!(queue.contains("status = 'resumed'"));
+    assert!(queue.contains("mark_waiting_rows_insufficient_sql"));
+    assert!(queue.contains("status = 'insufficient'"));
+    assert!(queue.contains("mark_waiting_rows_superseded_sql"));
+    assert!(queue.contains("status = 'superseded'"));
+}
+
+#[test]
+fn cross_routed_global_finalization_wakes_assigned_slug_pools() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    assert!(queue.contains("impacted_global_moodboard_slugs_sql"));
+    assert!(queue.contains("source_run_id = ?"));
+    assert!(queue.contains("UNION"));
+    assert!(queue.contains("wake_clone_pools_for_impacted_slug"));
+}
+
+#[test]
+fn global_finalization_retryable_work_excludes_current_finalizing_source_run() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let finalize_body =
+        reference_pipeline_function_body(queue, "async fn finalize_global_moodboard_library");
+    let retryable_helper = reference_pipeline_function_body(
+        queue,
+        "async fn retryable_global_work_exists_for_user_selection",
+    );
+    let retryable_sql = queue
+        .split("fn retryable_global_work_for_user_selection_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn earliest_global_retry_at_sql").next())
+        .expect("retryable selected global work SQL");
+
+    assert!(finalize_body.contains("wake_clone_pools_for_impacted_slug"));
+    assert!(finalize_body.contains("run_id,"));
+    assert!(retryable_helper.contains("excluded_run_id: &str"));
+    assert!(retryable_helper.contains("json!(excluded_run_id)"));
+    assert!(retryable_sql.contains("gsr.id != ?"));
+    assert!(retryable_sql.contains("gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')"));
+}
+
+#[test]
+fn global_wakeup_reservation_key_matches_consumer_wakeup_messages() {
+    let messages = include_str!("../src/queues/messages.rs");
+    let reservations = include_str!("../src/services/queue_reservations.rs");
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let build_message = messages
+        .split("BuildCloneReferencePool")
+        .nth(1)
+        .and_then(|section| section.split("RefreshPool").next())
+        .expect("build clone reference pool message fields");
+    let build_reservation = reservations
+        .split("ReferencePipelineMessage::BuildCloneReferencePool")
+        .nth(1)
+        .and_then(|section| section.split("ReferencePipelineMessage::RefreshPool").next())
+        .expect("build clone reference pool reservation key");
+    let wakeup_body =
+        reference_pipeline_function_body(queue, "async fn wake_clone_pools_for_impacted_slug");
+
+    assert!(build_message.contains("#[serde(default)]"));
+    assert!(build_message.contains("wakeup_moodboard_slug: Option<String>"));
+    assert!(build_reservation.contains("wakeup_moodboard_slug"));
+    assert!(build_reservation.contains("clone:wakeup:{}:{}:{}"));
+    assert!(build_reservation.contains("clone:kickoff:{}:{}"));
+    assert!(wakeup_body.contains("wakeup_moodboard_slug: Some(row.moodboard_slug.clone())"));
+    assert!(wakeup_body.contains("ReservationOutcome::Reserved"));
+    assert!(wakeup_body.contains("mark_waiting_rows_resumed"));
+}
+
+#[test]
+fn global_wakeup_candidates_are_not_inner_filtered_before_supersession() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let wakeup_sql = queue
+        .split("fn clone_pool_wakeup_candidates_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn selected_active_moodboard_slugs_for_user_sql").next())
+        .expect("clone pool wakeup candidate SQL");
+    let wakeup_body =
+        reference_pipeline_function_body(queue, "async fn wake_clone_pools_for_impacted_slug");
+
+    assert!(wakeup_sql.contains("LEFT JOIN clone_profiles cp"));
+    assert!(wakeup_sql.contains("LEFT JOIN moodboards mb"));
+    assert!(wakeup_sql.contains("LEFT JOIN global_moodboard_definitions gmd"));
+    assert!(!wakeup_sql.contains("INNER JOIN clone_profiles cp"));
+    assert!(!wakeup_sql.contains("INNER JOIN moodboards mb"));
+    assert!(!wakeup_sql.contains("INNER JOIN global_moodboard_definitions gmd"));
+    assert!(wakeup_sql.contains("cpr.selected_moodboard_hash AS pool_selected_moodboard_hash"));
+    assert!(wakeup_sql.contains("clone_is_ready"));
+    assert!(wakeup_sql.contains("moodboard_is_selected"));
+    assert!(wakeup_sql.contains("global_definition_is_active"));
+    assert!(queue.contains("selected_moodboard_hash(&current_selected_slugs)"));
+    assert!(wakeup_body.contains("pool_selected_moodboard_hash"));
+    assert!(wakeup_body.contains("current_selected_moodboard_hash"));
+    assert!(wakeup_body.contains("mark_waiting_rows_superseded"));
 }

@@ -215,6 +215,38 @@ fn select_actionable_global_references_sql(selected_slug_params: &str) -> String
     )
 }
 
+pub fn compatibility_actionable_global_reference_count_for_current_selection_sql() -> &'static str {
+    r#"
+    SELECT COUNT(*) AS count
+    FROM global_moodboard_references gmr
+    INNER JOIN moodboards mb
+      ON mb.user_id = ?
+     AND mb.slug = gmr.moodboard_slug
+     AND mb.selected = 1
+    INNER JOIN global_moodboard_definitions gmd
+      ON gmd.slug = mb.slug
+     AND gmd.status = 'active'
+    LEFT JOIN clone_visual_reference_compatibility cvr
+      ON cvr.clone_id = ?
+     AND cvr.global_reference_id = gmr.id
+    LEFT JOIN visual_references vr
+      ON vr.clone_id = ?
+     AND vr.global_reference_id = gmr.id
+     AND vr.status = 'active'
+    WHERE gmr.status = 'active'
+      AND (
+        cvr.status IS NULL
+        OR cvr.status = 'queued'
+        OR (cvr.status = 'accepted' AND vr.id IS NULL)
+        OR (
+          cvr.status = 'failed'
+          AND cvr.next_retry_at IS NOT NULL
+          AND cvr.next_retry_at <= ?
+        )
+      )
+    "#
+}
+
 fn reserve_reference_pipeline_message_sql() -> &'static str {
     r#"
     INSERT INTO queue_message_reservations (
@@ -499,7 +531,7 @@ fn mark_clone_compatibility_failed_sql() -> &'static str {
 // visual_references has UNIQUE(clone_id, global_reference_id).
 fn insert_clone_visual_reference_sql() -> &'static str {
     r#"
-    INSERT OR IGNORE INTO visual_references (
+    INSERT INTO visual_references (
       id, user_id, clone_id, global_reference_id, media_asset_id,
       source_platform, source_image_key, source_handle, source_post_id,
       source_post_code, source_url, source_published_at, image_width,
@@ -544,12 +576,38 @@ fn insert_clone_visual_reference_sql() -> &'static str {
     INNER JOIN global_moodboard_definitions gmd
       ON gmd.slug = mb.slug
      AND gmd.status = 'active'
-    LEFT JOIN visual_references vr
-      ON vr.clone_id = ?
-     AND vr.global_reference_id = gmr.id
     WHERE gmr.id = ?
       AND gmr.status = 'active'
-      AND vr.id IS NULL
+    ON CONFLICT(clone_id, global_reference_id) DO UPDATE SET
+      user_id = excluded.user_id,
+      media_asset_id = excluded.media_asset_id,
+      source_platform = excluded.source_platform,
+      source_image_key = excluded.source_image_key,
+      source_handle = excluded.source_handle,
+      source_post_id = excluded.source_post_id,
+      source_post_code = excluded.source_post_code,
+      source_url = excluded.source_url,
+      source_published_at = excluded.source_published_at,
+      image_width = excluded.image_width,
+      image_height = excluded.image_height,
+      moodboard_id = excluded.moodboard_id,
+      moodboard_slug = excluded.moodboard_slug,
+      niche_cluster = excluded.niche_cluster,
+      human_presence_type = excluded.human_presence_type,
+      human_presence_score = excluded.human_presence_score,
+      organic_photo_score = excluded.organic_photo_score,
+      freshness_visual_score = excluded.freshness_visual_score,
+      visual_fit_score = excluded.visual_fit_score,
+      pose = excluded.pose,
+      scene = excluded.scene,
+      lighting = excluded.lighting,
+      framing = excluded.framing,
+      camera_feel = excluded.camera_feel,
+      styling_direction = excluded.styling_direction,
+      aesthetic_tags_json = excluded.aesthetic_tags_json,
+      source_caption_removed = excluded.source_caption_removed,
+      status = 'active',
+      updated_at = excluded.updated_at
     "#
 }
 
@@ -1198,7 +1256,6 @@ pub async fn insert_clone_visual_reference_for_accepted_global_reference(
             json!(now),
             json!(clone_id),
             json!(user_id),
-            json!(clone_id),
             json!(global_reference_id),
         ],
     )

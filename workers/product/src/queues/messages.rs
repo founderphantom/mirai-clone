@@ -106,6 +106,9 @@ pub enum ReferencePipelineMessage {
         user_id: String,
         clone_id: String,
         reason: String,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wakeup_moodboard_slug: Option<String>,
     },
     RefreshPool {
         user_id: String,

@@ -3,7 +3,7 @@ use crate::db;
 use crate::domain::global_reference::{
     accept_global_visual_review, instagram_source_image_key, GlobalVisualReferenceReview,
 };
-use crate::domain::moodboards::default_moodboards;
+use crate::domain::moodboards::{default_moodboards, selected_moodboard_hash};
 use crate::domain::visual_reference::MoodboardBrief;
 use crate::instagram_references::{
     build_instagram_post_url, build_instagram_profile_url,
@@ -30,7 +30,9 @@ use crate::services::global_reference_discovery::{
     upsert_global_candidate_if_current_sql, upsert_global_handle_if_current_sql,
     GLOBAL_DISCOVERY_RUN_STALE_AFTER_MINUTES_CONFIG_KEY,
 };
-use crate::services::queue_reservations::{now_iso_string, QueueHandlingOutcome};
+use crate::services::queue_reservations::{
+    now_iso_string, QueueHandlingOutcome, ReservationOutcome,
+};
 use crate::services::visual_reference_cache::{
     fetch_visual_reference_image, global_visual_reference_storage_key, CachedVisualReference,
 };
@@ -240,6 +242,7 @@ async fn handle_message(
             user_id,
             clone_id,
             reason,
+            ..
         }
         | ReferencePipelineMessage::RefreshPool {
             user_id,
@@ -1495,7 +1498,7 @@ async fn cleanup_global_moodboard_reference(
 
 async fn finalize_global_moodboard_library(
     db: &D1Database,
-    _env: &Env,
+    env: &Env,
     moodboard_slug: &str,
     run_id: &str,
     reason: &str,
@@ -1597,6 +1600,7 @@ async fn finalize_global_moodboard_library(
             &now,
         )
         .await?;
+        wake_clone_pools_for_impacted_slug(db, env, &impacted_slug, run_id, &now).await?;
     }
 
     if source_slug_work_exists {
@@ -2057,6 +2061,213 @@ fn eligible_global_source_work_sql() -> &'static str {
       WHERE moodboard_slug = ?
         AND status IN ('active', 'cooldown')
         AND (cooldown_until IS NULL OR cooldown_until <= ?)
+    )
+    "#
+}
+
+fn clone_pool_wakeup_candidates_sql() -> &'static str {
+    r#"
+    SELECT DISTINCT
+      cpwm.user_id,
+      cpwm.clone_id,
+      cpwm.pool_run_id,
+      cpwm.status AS waiting_status,
+      cpwm.moodboard_slug,
+      crs.current_pool_run_id,
+      crs.selected_moodboard_hash,
+      cpr.selected_moodboard_hash AS pool_selected_moodboard_hash,
+      cpr.status AS pool_status,
+      cpr.updated_at AS pool_updated_at,
+      CASE
+        WHEN cp.id IS NOT NULL
+         AND cp.deleted_at IS NULL
+         AND cp.status = 'active'
+         AND cp.soul_status IN ('ready', 'completed')
+         AND cp.provider_soul_id IS NOT NULL
+         AND TRIM(cp.provider_soul_id) <> ''
+        THEN 1 ELSE 0
+      END AS clone_is_ready,
+      CASE
+        WHEN mb.id IS NOT NULL
+         AND mb.selected = 1
+        THEN 1 ELSE 0
+      END AS moodboard_is_selected,
+      CASE
+        WHEN gmd.slug IS NOT NULL
+         AND gmd.status = 'active'
+        THEN 1 ELSE 0
+      END AS global_definition_is_active
+    FROM clone_pool_waiting_moodboards cpwm
+    LEFT JOIN clone_reference_state crs
+      ON crs.user_id = cpwm.user_id
+     AND crs.clone_id = cpwm.clone_id
+    LEFT JOIN clone_pool_runs cpr
+      ON cpr.id = cpwm.pool_run_id
+     AND cpr.clone_id = cpwm.clone_id
+    LEFT JOIN clone_profiles cp
+      ON cp.user_id = cpwm.user_id
+     AND cp.id = cpwm.clone_id
+    LEFT JOIN moodboards mb
+      ON mb.user_id = cpwm.user_id
+     AND mb.slug = cpwm.moodboard_slug
+    LEFT JOIN global_moodboard_definitions gmd
+      ON gmd.slug = cpwm.moodboard_slug
+    WHERE cpwm.moodboard_slug = ?
+      AND cpwm.status IN ('waiting', 'insufficient')
+    ORDER BY cpwm.created_at ASC
+    "#
+}
+
+fn selected_active_moodboard_slugs_for_user_sql() -> &'static str {
+    r#"
+    SELECT mb.slug AS moodboard_slug
+    FROM moodboards mb
+    INNER JOIN global_moodboard_definitions gmd
+      ON gmd.slug = mb.slug
+     AND gmd.status = 'active'
+    WHERE mb.user_id = ?
+      AND mb.selected = 1
+    ORDER BY mb.slug ASC
+    "#
+}
+
+fn mark_waiting_rows_resumed_sql() -> &'static str {
+    r#"
+    UPDATE clone_pool_waiting_moodboards
+    SET status = 'resumed',
+        resolved_at = ?
+    WHERE user_id = ?
+      AND clone_id = ?
+      AND pool_run_id = ?
+      AND moodboard_slug = ?
+      AND status IN ('waiting', 'insufficient')
+    "#
+}
+
+fn mark_waiting_rows_insufficient_sql() -> &'static str {
+    r#"
+    UPDATE clone_pool_waiting_moodboards
+    SET status = 'insufficient',
+        resolved_at = NULL
+    WHERE user_id = ?
+      AND clone_id = ?
+      AND pool_run_id = ?
+      AND moodboard_slug = ?
+      AND status IN ('waiting', 'insufficient')
+    "#
+}
+
+fn mark_waiting_rows_superseded_sql() -> &'static str {
+    r#"
+    UPDATE clone_pool_waiting_moodboards
+    SET status = 'superseded',
+        resolved_at = ?
+    WHERE user_id = ?
+      AND clone_id = ?
+      AND pool_run_id = ?
+      AND status IN ('waiting', 'insufficient')
+    "#
+}
+
+fn mark_clone_pool_insufficient_from_global_finalization_sql() -> &'static str {
+    r#"
+    UPDATE clone_reference_state
+    SET status = 'insufficient_refs',
+        last_insufficient_at = ?,
+        updated_at = ?
+    WHERE user_id = ?
+      AND clone_id = ?
+      AND current_pool_run_id = ?
+    "#
+}
+
+fn retryable_global_work_for_user_selection_sql() -> &'static str {
+    r#"
+    SELECT COUNT(*) AS count
+    FROM (
+      SELECT gms.id AS work_id
+      FROM moodboards mb
+      INNER JOIN global_moodboard_definitions gmd
+        ON gmd.slug = mb.slug
+       AND gmd.status = 'active'
+      INNER JOIN global_moodboard_search_state gms
+        ON gms.moodboard_slug = mb.slug
+      WHERE mb.user_id = ?
+        AND mb.selected = 1
+        AND gms.status IN ('active', 'cooldown')
+        AND (gms.next_eligible_at IS NULL OR gms.next_eligible_at <= ?)
+      UNION ALL
+      SELECT gmh.id AS work_id
+      FROM moodboards mb
+      INNER JOIN global_moodboard_definitions gmd
+        ON gmd.slug = mb.slug
+       AND gmd.status = 'active'
+      INNER JOIN global_moodboard_handles gmh
+        ON gmh.moodboard_slug = mb.slug
+      WHERE mb.user_id = ?
+        AND mb.selected = 1
+        AND gmh.status IN ('active', 'cooldown')
+        AND (gmh.cooldown_until IS NULL OR gmh.cooldown_until <= ?)
+      UNION ALL
+      SELECT gvc.id AS work_id
+      FROM moodboards mb
+      INNER JOIN global_moodboard_definitions gmd
+        ON gmd.slug = mb.slug
+       AND gmd.status = 'active'
+      INNER JOIN global_visual_reference_candidates gvc
+        ON gvc.assigned_moodboard_slug = mb.slug
+        OR (
+          gvc.assigned_moodboard_slug IS NULL
+          AND gvc.discovery_moodboard_slug = mb.slug
+        )
+      WHERE mb.user_id = ?
+        AND mb.selected = 1
+        AND gvc.candidate_status = 'active'
+        AND (
+          gvc.review_status = 'queued'
+          OR (
+            gvc.review_status = 'reviewing'
+            AND gvc.review_locked_until IS NOT NULL
+            AND gvc.review_locked_until <= ?
+            AND gvc.review_attempt_count < ?
+          )
+          OR (
+            gvc.review_status = 'failed'
+            AND gvc.review_attempt_count < ?
+            AND (gvc.review_next_retry_at IS NULL OR gvc.review_next_retry_at <= ?)
+          )
+          OR (
+            gvc.review_status = 'approved'
+            AND gvc.cleanup_status = 'queued'
+          )
+          OR (
+            gvc.review_status = 'approved'
+            AND gvc.cleanup_status = 'cleaning'
+            AND (gvc.cleanup_next_retry_at IS NULL OR gvc.cleanup_next_retry_at <= ?)
+          )
+          OR (
+            gvc.review_status = 'approved'
+            AND gvc.cleanup_status = 'failed'
+            AND gvc.cleanup_attempt_count < ?
+            AND (gvc.cleanup_next_retry_at IS NULL OR gvc.cleanup_next_retry_at <= ?)
+          )
+        )
+      UNION ALL
+      SELECT gsr.id AS work_id
+      FROM moodboards mb
+      INNER JOIN global_moodboard_definitions gmd
+        ON gmd.slug = mb.slug
+       AND gmd.status = 'active'
+      INNER JOIN global_moodboard_reference_state gmrs
+        ON gmrs.moodboard_slug = mb.slug
+      INNER JOIN global_moodboard_source_runs gsr
+        ON gsr.id = gmrs.current_run_id
+       AND gsr.moodboard_slug = mb.slug
+      WHERE mb.user_id = ?
+        AND mb.selected = 1
+        AND gsr.id != ?
+        AND gsr.status IN ('queued', 'refreshing', 'scraping', 'reviewing', 'cleaning')
+        AND gsr.updated_at > ?
     )
     "#
 }
@@ -3251,6 +3462,270 @@ async fn eligible_global_source_work_count(
     Ok(row.map(|row| row.count).unwrap_or(0))
 }
 
+async fn wake_clone_pools_for_impacted_slug(
+    db: &D1Database,
+    env: &Env,
+    moodboard_slug: &str,
+    excluded_run_id: &str,
+    now: &str,
+) -> WorkerResult<()> {
+    let clone_pool_stale_after_minutes =
+        config_value_i64(db, "clone_pool_run_stale_after_minutes", 30)
+            .await?
+            .max(1);
+    let stale_cutoff =
+        crate::services::queue_reservations::add_minutes_iso(now, -clone_pool_stale_after_minutes);
+    let mut selected_hashes_by_user = HashMap::<String, String>::new();
+    let rows = db::all::<ClonePoolWakeupCandidateRow>(
+        db,
+        clone_pool_wakeup_candidates_sql(),
+        vec![json!(moodboard_slug)],
+    )
+    .await?;
+
+    for row in rows {
+        let _ = (
+            &row.waiting_status,
+            &row.selected_moodboard_hash,
+            &row.pool_status,
+            &row.pool_updated_at,
+        );
+        let current_selected_moodboard_hash =
+            match selected_hashes_by_user.get(row.user_id.as_str()) {
+                Some(hash) => hash.clone(),
+                None => {
+                    let current_selected_slugs =
+                        selected_active_moodboard_slugs_for_user(db, &row.user_id).await?;
+                    let hash = selected_moodboard_hash(&current_selected_slugs);
+                    selected_hashes_by_user.insert(row.user_id.clone(), hash.clone());
+                    hash
+                }
+            };
+
+        let pool_is_stale = row
+            .pool_updated_at
+            .as_deref()
+            .map(|updated_at| updated_at <= stale_cutoff.as_str())
+            .unwrap_or(true);
+        let pool_is_active = row
+            .pool_status
+            .as_deref()
+            .map(|status| {
+                matches!(
+                    status,
+                    "queued" | "waiting_for_global_library" | "compatibility_reviewing"
+                )
+            })
+            .unwrap_or(false);
+
+        if row.current_pool_run_id.as_deref() != Some(row.pool_run_id.as_str())
+            || row.clone_is_ready == 0
+            || row.moodboard_is_selected == 0
+            || row.global_definition_is_active == 0
+            || row.pool_selected_moodboard_hash.as_deref()
+                != Some(current_selected_moodboard_hash.as_str())
+            || !pool_is_active
+            || pool_is_stale
+        {
+            mark_waiting_rows_superseded(db, &row, now).await?;
+            continue;
+        }
+
+        let actionable_count = db::first::<CountRow>(
+            db,
+            crate::services::clone_reference_pool::compatibility_actionable_global_reference_count_for_current_selection_sql(),
+            vec![
+                json!(row.user_id.as_str()),
+                json!(row.clone_id.as_str()),
+                json!(row.clone_id.as_str()),
+                json!(now),
+            ],
+        )
+        .await?
+        .map(|row| row.count)
+        .unwrap_or(0);
+
+        if actionable_count > 0 {
+            let reservation = crate::services::queue_reservations::QueueReservation::new(
+                "build_clone_reference_pool",
+                format!(
+                    "clone:wakeup:{}:{}:{}",
+                    row.user_id, row.clone_id, row.moodboard_slug
+                ),
+                None,
+                Some(row.pool_run_id.clone()),
+                crate::services::queue_reservations::ReservationTtl::FiveMinutes,
+            );
+            let outcome =
+                crate::services::queue_reservations::reserve_and_send_reference_pipeline_message(
+                db,
+                env,
+                reservation,
+                ReferencePipelineMessage::BuildCloneReferencePool {
+                    user_id: row.user_id.clone(),
+                    clone_id: row.clone_id.clone(),
+                    reason: "global_library_wakeup".to_string(),
+                    wakeup_moodboard_slug: Some(row.moodboard_slug.clone()),
+                },
+                now,
+            )
+            .await?;
+            if outcome == ReservationOutcome::Reserved {
+                mark_waiting_rows_resumed(db, &row, now).await?;
+            }
+        } else if !retryable_global_work_exists_for_user_selection(
+            db,
+            &row.user_id,
+            excluded_run_id,
+            now,
+        )
+        .await?
+        {
+            mark_clone_pool_insufficient_from_global_finalization(db, &row, now).await?;
+            mark_waiting_rows_insufficient(db, &row).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn mark_waiting_rows_resumed(
+    db: &D1Database,
+    row: &ClonePoolWakeupCandidateRow,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        mark_waiting_rows_resumed_sql(),
+        vec![
+            json!(now),
+            json!(row.user_id.as_str()),
+            json!(row.clone_id.as_str()),
+            json!(row.pool_run_id.as_str()),
+            json!(row.moodboard_slug.as_str()),
+        ],
+    )
+    .await
+}
+
+async fn mark_waiting_rows_insufficient(
+    db: &D1Database,
+    row: &ClonePoolWakeupCandidateRow,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        mark_waiting_rows_insufficient_sql(),
+        vec![
+            json!(row.user_id.as_str()),
+            json!(row.clone_id.as_str()),
+            json!(row.pool_run_id.as_str()),
+            json!(row.moodboard_slug.as_str()),
+        ],
+    )
+    .await
+}
+
+async fn mark_waiting_rows_superseded(
+    db: &D1Database,
+    row: &ClonePoolWakeupCandidateRow,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        mark_waiting_rows_superseded_sql(),
+        vec![
+            json!(now),
+            json!(row.user_id.as_str()),
+            json!(row.clone_id.as_str()),
+            json!(row.pool_run_id.as_str()),
+        ],
+    )
+    .await
+}
+
+async fn mark_clone_pool_insufficient_from_global_finalization(
+    db: &D1Database,
+    row: &ClonePoolWakeupCandidateRow,
+    now: &str,
+) -> WorkerResult<()> {
+    db::exec(
+        db,
+        mark_clone_pool_insufficient_from_global_finalization_sql(),
+        vec![
+            json!(now),
+            json!(now),
+            json!(row.user_id.as_str()),
+            json!(row.clone_id.as_str()),
+            json!(row.pool_run_id.as_str()),
+        ],
+    )
+    .await
+}
+
+async fn selected_active_moodboard_slugs_for_user(
+    db: &D1Database,
+    user_id: &str,
+) -> WorkerResult<Vec<String>> {
+    let rows = db::all::<MoodboardSlugRow>(
+        db,
+        selected_active_moodboard_slugs_for_user_sql(),
+        vec![json!(user_id)],
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.moodboard_slug)
+        .filter(|slug| !slug.trim().is_empty())
+        .collect())
+}
+
+async fn retryable_global_work_exists_for_user_selection(
+    db: &D1Database,
+    user_id: &str,
+    excluded_run_id: &str,
+    now: &str,
+) -> WorkerResult<bool> {
+    let stale_after_minutes = config_value_i64(
+        db,
+        GLOBAL_DISCOVERY_RUN_STALE_AFTER_MINUTES_CONFIG_KEY,
+        60,
+    )
+    .await?
+    .max(1);
+    let stale_cutoff =
+        crate::services::queue_reservations::add_minutes_iso(now, -stale_after_minutes);
+    let review_retry_limit = config_value_u32(db, "visual_reference_review_retry_limit", 2)
+        .await?
+        .max(1);
+    let cleanup_retry_limit = config_value_u32(db, "visual_reference_cleanup_retry_limit", 3)
+        .await?
+        .max(1);
+
+    let row = db::first::<CountRow>(
+        db,
+        retryable_global_work_for_user_selection_sql(),
+        vec![
+            json!(user_id),
+            json!(now),
+            json!(user_id),
+            json!(now),
+            json!(user_id),
+            json!(now),
+            json!(review_retry_limit),
+            json!(review_retry_limit),
+            json!(now),
+            json!(now),
+            json!(cleanup_retry_limit),
+            json!(now),
+            json!(user_id),
+            json!(excluded_run_id),
+            json!(stale_cutoff),
+        ],
+    )
+    .await?;
+    Ok(row.map(|row| row.count).unwrap_or(0) > 0)
+}
+
 async fn earliest_global_retry_at(
     db: &D1Database,
     source_moodboard_slug: &str,
@@ -4249,6 +4724,23 @@ struct GlobalSourceRunFinalizeRow {
 #[derive(Debug, Deserialize)]
 struct MoodboardSlugRow {
     moodboard_slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClonePoolWakeupCandidateRow {
+    user_id: String,
+    clone_id: String,
+    pool_run_id: String,
+    waiting_status: String,
+    moodboard_slug: String,
+    current_pool_run_id: Option<String>,
+    selected_moodboard_hash: Option<String>,
+    pool_selected_moodboard_hash: Option<String>,
+    pool_status: Option<String>,
+    pool_updated_at: Option<String>,
+    clone_is_ready: u8,
+    moodboard_is_selected: u8,
+    global_definition_is_active: u8,
 }
 
 #[derive(Debug, Deserialize)]

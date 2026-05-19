@@ -36,6 +36,7 @@ pub async fn enqueue_after_moodboard_save(
                 user_id: user_id.to_string(),
                 clone_id: clone.id,
                 reason: "moodboard_selection_changed".to_string(),
+                wakeup_moodboard_slug: None,
             })
             .await?;
     }

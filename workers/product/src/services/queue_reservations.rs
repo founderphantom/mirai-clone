@@ -498,7 +498,7 @@ pub fn reservation_key_for_reference_message(
                 None,
                 ReservationTtl::FiveMinutes,
             )
-        }
+        },
         ReferencePipelineMessage::DiscoverGlobalInstagramHandles {
             moodboard_slug,
             run_id,
@@ -617,18 +617,29 @@ pub fn reservation_key_for_reference_message(
             ReservationTtl::FiveMinutes,
         ),
         ReferencePipelineMessage::BuildCloneReferencePool {
-            user_id, clone_id, ..
-        } => QueueReservation::new(
-            "build_clone_reference_pool",
-            format!(
-                "clone:kickoff:{}:{}",
-                stable_dedupe_segment(user_id),
-                stable_dedupe_segment(clone_id)
-            ),
-            None,
-            None,
-            ReservationTtl::FiveMinutes,
-        ),
+            user_id,
+            clone_id,
+            wakeup_moodboard_slug,
+            ..
+        } => {
+            let dedupe_key = wakeup_moodboard_slug.as_ref().map_or_else(
+                || {
+                    format!(
+                        "clone:kickoff:{}:{}",
+                        stable_dedupe_segment(user_id),
+                        stable_dedupe_segment(clone_id)
+                    )
+                },
+                |slug| format!("clone:wakeup:{}:{}:{}", user_id, clone_id, slug),
+            );
+            QueueReservation::new(
+                "build_clone_reference_pool",
+                dedupe_key,
+                None,
+                None,
+                ReservationTtl::FiveMinutes,
+            )
+        }
         ReferencePipelineMessage::RefreshPool {
             user_id, clone_id, ..
         } => QueueReservation::new(
