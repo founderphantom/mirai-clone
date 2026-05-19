@@ -87,6 +87,7 @@ export type BlitzImage = {
   outputId: string;
   mediaUrl: string;
   visualReferenceId: string | null;
+  globalReferenceId: string | null;
   swipeIndex: number;
   swiped: boolean;
 };

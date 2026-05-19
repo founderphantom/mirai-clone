@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { canAdvanceSwipeDeckAfterAwait, swipeDeckKeyForCards } from "../../src/client/components/SwipeDeck";
-import { isLoadedBlitzStateForClone } from "../../src/client/screens/BlitzScreen";
+import { blitzImageToSwipeCard, isLoadedBlitzStateForClone } from "../../src/client/screens/BlitzScreen";
 import { dailyGenerationMeterValue } from "../../src/client/screens/MeScreen";
 import type { BlitzCurrent } from "../../src/client/types";
 
@@ -32,6 +32,23 @@ describe("SwipeDeck async advancement guard", () => {
 
   it("uses a non-ambiguous deck key for card ids containing delimiters", () => {
     expect(swipeDeckKeyForCards([{ id: "a|b" }, { id: "c" }])).not.toBe(swipeDeckKeyForCards([{ id: "a" }, { id: "b|c" }]));
+  });
+
+  it("keeps global reference id in swipe card metadata when present", () => {
+    const card = blitzImageToSwipeCard({
+      image: {
+        outputId: "output_1",
+        mediaUrl: "https://cdn.example/output.webp",
+        visualReferenceId: "vref_1",
+        globalReferenceId: "gref_1",
+        swipeIndex: 0,
+        swiped: false
+      },
+      title: "Clone A",
+      batchNumber: 2
+    });
+
+    expect(card.metadata.globalReferenceId).toBe("gref_1");
   });
 });
 

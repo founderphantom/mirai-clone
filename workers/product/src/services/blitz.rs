@@ -34,6 +34,7 @@ pub struct BlitzImageResponse {
     pub output_id: String,
     pub media_url: String,
     pub visual_reference_id: Option<String>,
+    pub global_reference_id: Option<String>,
     pub swipe_index: u32,
     pub swiped: bool,
 }
@@ -155,6 +156,7 @@ struct OutputResponseRow {
     output_id: String,
     media_url: String,
     visual_reference_id: Option<String>,
+    global_reference_id: Option<String>,
     swipe_index: u32,
     swiped: u32,
 }
@@ -1190,11 +1192,14 @@ async fn load_batch_images(
           go.id AS output_id,
           COALESCE('/api/media/' || go.media_asset_id, go.raw_url, '') AS media_url,
           gj.input_visual_reference_id AS visual_reference_id,
+          vr.global_reference_id,
           CAST(ROW_NUMBER() OVER (ORDER BY go.output_index ASC, go.created_at ASC) - 1 AS INTEGER) AS swipe_index,
           CASE WHEN bs.id IS NULL THEN 0 ELSE 1 END AS swiped
         FROM generation_outputs go
         INNER JOIN generation_jobs gj
           ON gj.id = go.job_id
+        LEFT JOIN visual_references vr
+          ON vr.id = gj.input_visual_reference_id
         LEFT JOIN blitz_swipes bs
           ON bs.generation_output_id = go.id
          AND bs.batch_id = gj.blitz_batch_id
@@ -1213,6 +1218,7 @@ async fn load_batch_images(
             output_id: row.output_id,
             media_url: row.media_url,
             visual_reference_id: row.visual_reference_id,
+            global_reference_id: row.global_reference_id,
             swipe_index: row.swipe_index,
             swiped: row.swiped != 0,
         })

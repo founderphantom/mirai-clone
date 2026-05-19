@@ -6027,6 +6027,28 @@ fn blitz_swipe_metadata_snapshots_global_reference_id() {
 }
 
 #[test]
+fn blitz_current_response_images_include_global_reference_id() {
+    let source = include_str!("../src/services/blitz.rs");
+    let response_struct = source
+        .split("pub struct BlitzImageResponse")
+        .nth(1)
+        .and_then(|section| section.split("#[derive").next())
+        .expect("Blitz image response struct");
+    let row_struct = source
+        .split("struct OutputResponseRow")
+        .nth(1)
+        .and_then(|section| section.split("#[derive").next())
+        .expect("Blitz output response row struct");
+    let load_images_body = reference_pipeline_function_body(source, "async fn load_batch_images");
+
+    assert!(response_struct.contains("pub global_reference_id: Option<String>"));
+    assert!(row_struct.contains("global_reference_id: Option<String>"));
+    assert!(load_images_body.contains("vr.global_reference_id"));
+    assert!(load_images_body.contains("LEFT JOIN visual_references vr"));
+    assert!(load_images_body.contains("global_reference_id: row.global_reference_id"));
+}
+
+#[test]
 fn influence_accumulates_likes_and_dislikes_from_metadata() {
     let influence = accumulate_influence(&[
         SwipeMetadata {
@@ -7395,4 +7417,80 @@ fn clone_pool_stops_new_waves_after_ready_and_cancels_unstarted_reservations() {
     assert!(source.contains("active_clone_reference_count_for_current_selection_sql"));
     assert!(source.contains("clone_pool_global_reference_review_limit"));
     assert!(source.contains("clone_pool_compatibility_wave_size"));
+}
+
+#[test]
+fn part_four_scheduler_wakeup_and_stale_guard_surface_is_implemented() {
+    let lib = include_str!("../src/lib.rs");
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let reservations = include_str!("../src/services/queue_reservations.rs");
+    let scheduler = include_str!("../src/services/global_reference_scheduler.rs");
+    let clone_pool = include_str!("../src/services/clone_reference_pool.rs");
+
+    for required in [
+        "enqueue_due_global_moodboard_libraries",
+        "reservation_key_for_reference_message",
+        "wake_clone_pools_for_impacted_slug",
+        "insert_clone_pool_waiting_moodboard_sql",
+        "current_clone_pool_run_guard_sql",
+        "current_global_run_guard_sql",
+        "global_next_retry_gate_sql",
+        "cancel_unstarted_pool_reservations",
+    ] {
+        assert!(
+            lib.contains(required)
+                || queue.contains(required)
+                || reservations.contains(required)
+                || scheduler.contains(required)
+                || clone_pool.contains(required),
+            "{required}"
+        );
+    }
+}
+
+#[test]
+fn failed_clone_retry_reuses_user_moodboards_without_copying_clone_references() {
+    let onboarding = include_str!("../src/routes/onboarding.rs");
+    let messages = include_str!("../src/queues/messages.rs");
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let clone_pool = include_str!("../src/services/clone_reference_pool.rs");
+    let build_message = messages
+        .split("BuildCloneReferencePool")
+        .nth(1)
+        .and_then(|section| section.split("RefreshPool").next())
+        .expect("build clone reference pool message fields");
+    let build_handler = queue
+        .split("ReferencePipelineMessage::BuildCloneReferencePool")
+        .nth(1)
+        .and_then(|section| section.split("ReferencePipelineMessage::RefreshPool").next())
+        .expect("build clone reference pool handler");
+
+    assert!(onboarding.contains("user_reference_state"));
+    assert!(onboarding.contains("moodboards"));
+    assert!(!clone_pool.contains("INSERT INTO visual_references SELECT"));
+    assert!(!clone_pool.contains("failed_clone"));
+    assert!(clone_pool.contains("provider_soul_id IS NOT NULL"));
+    assert!(build_message.contains("user_id: String"));
+    assert!(build_message.contains("clone_id: String"));
+    assert!(build_message.contains("wakeup_moodboard_slug: Option<String>"));
+    assert!(build_handler.contains("crate::services::clone_reference_pool::build_or_refresh_clone_pool"));
+    assert!(build_handler.contains("wakeup_moodboard_slug.as_deref()"));
+}
+
+#[test]
+fn global_and_clone_pipeline_failures_record_state_instead_of_panicking() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let clone_pool = include_str!("../src/services/clone_reference_pool.rs");
+    let source_failure_body =
+        reference_pipeline_function_body(queue, "async fn record_global_source_run_failure");
+
+    assert!(queue.contains("review_error_code"));
+    assert!(queue.contains("cleanup_error_code"));
+    assert!(source_failure_body.contains("UPDATE global_moodboard_source_runs"));
+    assert!(source_failure_body.contains("SET error_code = ?"));
+    assert!(source_failure_body.contains("error_message = ?"));
+    assert!(queue.contains("record_stale_global_message"));
+    assert!(clone_pool.contains("last_error_code"));
+    assert!(clone_pool.contains("next_retry_at"));
+    assert!(clone_pool.contains("record_stale_clone_compatibility_attempt_sql"));
 }

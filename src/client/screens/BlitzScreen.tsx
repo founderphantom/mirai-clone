@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { SwipeDeck, type SwipeCard } from "../components/SwipeDeck";
 import { track } from "../lib/analytics";
 import { api } from "../lib/api";
-import type { BlitzCurrent, Clone } from "../types";
+import type { BlitzCurrent, BlitzImage, Clone } from "../types";
 
 export type LoadedBlitzState = {
   cloneId: string;
@@ -15,6 +15,34 @@ export function isLoadedBlitzStateForClone(
   cloneId: string | undefined
 ): loaded is LoadedBlitzState {
   return Boolean(loaded && cloneId && loaded.cloneId === cloneId);
+}
+
+export type BlitzSwipeCard = SwipeCard & {
+  metadata: {
+    visualReferenceId: string | null;
+    globalReferenceId: string | null;
+  };
+};
+
+export function blitzImageToSwipeCard({
+  image,
+  title,
+  batchNumber
+}: {
+  image: BlitzImage;
+  title: string;
+  batchNumber: number;
+}): BlitzSwipeCard {
+  return {
+    id: image.outputId,
+    title,
+    subtitle: `Batch ${batchNumber}`,
+    imageUrl: image.mediaUrl,
+    metadata: {
+      visualReferenceId: image.visualReferenceId ?? null,
+      globalReferenceId: image.globalReferenceId ?? null
+    }
+  };
 }
 
 function loadBlitzCurrent(cloneId: string) {
@@ -73,16 +101,17 @@ export function BlitzScreen({
 
   const activeState = isLoadedBlitzStateForClone(loaded, selectedCloneIdForRender) ? loaded.data : null;
 
-  const cards: SwipeCard[] = useMemo(
+  const cards: BlitzSwipeCard[] = useMemo(
     () =>
       (activeState?.batch?.images || [])
         .filter((image) => !image.swiped)
-        .map((image) => ({
-          id: image.outputId,
-          title: selectedClone?.display_name || "Mirai Soul",
-          subtitle: `Batch ${activeState?.batch?.batchNumber || 1}`,
-          imageUrl: image.mediaUrl
-        })),
+        .map((image) =>
+          blitzImageToSwipeCard({
+            image,
+            title: selectedClone?.display_name || "Mirai Soul",
+            batchNumber: activeState?.batch?.batchNumber || 1
+          })
+        ),
     [activeState?.batch, selectedClone?.display_name]
   );
 

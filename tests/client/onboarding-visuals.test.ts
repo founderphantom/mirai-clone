@@ -68,6 +68,11 @@ describe("onboarding moodboard selection rules", () => {
     expect(canPickMoodboardSelection(1)).toBe(true);
   });
 
+  it("keeps moodboard selection enabled without an active clone", () => {
+    expect(canPickMoodboardSelection(1)).toBe(true);
+    expect(canSubmitMoodboardSelection(1)).toBe(true);
+  });
+
   it("allows up to ten selected moodboards", () => {
     const current = Array.from({ length: 9 }, (_, index) => `moodboard_${index}`);
 
