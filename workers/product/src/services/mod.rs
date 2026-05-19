@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod blitz;
 pub mod clones;
 pub mod generation_usage;
+pub mod global_reference_discovery;
 pub mod media;
 pub mod provider_accounts;
 pub mod reference_pipeline;

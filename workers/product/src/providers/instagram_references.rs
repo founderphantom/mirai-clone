@@ -68,6 +68,15 @@ pub fn build_instagram_reels_search_url(
     query: &str,
     page: Option<u32>,
 ) -> Result<String, &'static str> {
+    build_instagram_reels_search_url_with_date_window(base_url, query, page, None)
+}
+
+pub fn build_instagram_reels_search_url_with_date_window(
+    base_url: &str,
+    query: &str,
+    page: Option<u32>,
+    date_window: Option<&str>,
+) -> Result<String, &'static str> {
     let query = query.trim();
     if query.is_empty() {
         return Err("missing_instagram_reels_search_query");
@@ -80,6 +89,10 @@ pub fn build_instagram_reels_search_url(
     if let Some(page) = page.filter(|page| *page > 1) {
         url.push_str("&page=");
         url.push_str(&page.to_string());
+    }
+    if let Some(date_window) = date_window.map(str::trim).filter(|value| !value.is_empty()) {
+        url.push_str("&date_posted=");
+        url.push_str(&url_encode(date_window));
     }
     url.push_str("&trim=true");
     Ok(url)

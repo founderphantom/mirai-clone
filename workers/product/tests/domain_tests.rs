@@ -62,6 +62,11 @@ use mirai_product_worker::services::clones::{handle_with_suffix, slugify_handle}
 use mirai_product_worker::services::generation_usage::{
     generation_limits_from_config_values, GenerationLimits,
 };
+use mirai_product_worker::services::global_reference_discovery::{
+    audit_global_candidate_discovery_sql, bootstrap_global_search_state_sql,
+    select_global_handle_work_sql, select_global_search_work_sql, source_key_for_instagram_handle,
+    source_key_for_reels_search, upsert_global_candidate_sql,
+};
 use mirai_product_worker::services::media::{media_storage_key, normalize_extension, safe_segment};
 use mirai_product_worker::services::provider_accounts::{
     choose_provider_account, ProviderAccountCandidate,
@@ -776,6 +781,99 @@ fn reels_search_url_uses_query_and_optional_page() {
         .unwrap(),
         "https://api.scrapecreators.com/v2/instagram/reels/search?query=flash%20fashion&page=2&trim=true"
     );
+}
+
+#[test]
+fn instagram_reels_search_url_supports_date_window_without_changing_existing_wrapper() {
+    assert_eq!(
+        build_instagram_reels_search_url(
+            "https://api.scrapecreators.com/",
+            "flash fashion",
+            Some(2)
+        )
+        .unwrap(),
+        "https://api.scrapecreators.com/v2/instagram/reels/search?query=flash%20fashion&page=2&trim=true"
+    );
+
+    assert_eq!(
+        mirai_product_worker::instagram_references::build_instagram_reels_search_url_with_date_window(
+            "https://api.scrapecreators.com/",
+            "flash fashion",
+            Some(2),
+            Some("last-month"),
+        )
+        .unwrap(),
+        "https://api.scrapecreators.com/v2/instagram/reels/search?query=flash%20fashion&page=2&date_posted=last-month&trim=true"
+    );
+}
+
+#[test]
+fn instagram_global_source_image_key_excludes_handle() {
+    let mut candidate = instagram_candidate_fixture();
+    candidate.source_handle = "first_handle".to_string();
+    candidate.source_post_id = "media_123".to_string();
+    candidate.source_post_code = "SHORT123".to_string();
+    candidate.source_image_index = 2;
+    let first = instagram_source_image_key(&candidate);
+
+    candidate.source_handle = "second_handle".to_string();
+    let second = instagram_source_image_key(&candidate);
+
+    assert_eq!(first, "instagram:media_123:2");
+    assert_eq!(first, second);
+    assert!(!first.contains("first_handle"));
+    assert!(!first.contains("second_handle"));
+}
+
+#[test]
+fn global_source_rotation_sql_is_moodboard_scoped_not_user_or_clone_scoped() {
+    for sql in [
+        bootstrap_global_search_state_sql(),
+        select_global_search_work_sql(),
+        select_global_handle_work_sql(),
+        upsert_global_candidate_sql(),
+        audit_global_candidate_discovery_sql(),
+    ] {
+        assert!(sql.contains("moodboard_slug"));
+        assert!(!sql.contains("user_id ="));
+        assert!(!sql.contains("clone_id ="));
+    }
+
+    assert!(select_global_search_work_sql().contains("status IN ('active', 'cooldown')"));
+    assert!(
+        select_global_search_work_sql()
+            .contains("next_eligible_at IS NULL OR next_eligible_at <= ?")
+    );
+    assert!(select_global_handle_work_sql().contains("accepted_count"));
+    assert!(select_global_handle_work_sql().contains("last_fetched_at IS NULL DESC"));
+    assert!(upsert_global_candidate_sql().contains("UNIQUE(platform, source_image_key)"));
+    assert!(
+        audit_global_candidate_discovery_sql()
+            .contains("UNIQUE(candidate_id, run_id, moodboard_slug, source_key)")
+    );
+}
+
+#[test]
+fn global_source_keys_are_unambiguous_and_normalized() {
+    let reels_from_colon_term = source_key_for_reels_search(" A:B ", "c", 0);
+    let reels_from_colon_window = source_key_for_reels_search("a", " B:C ", 1);
+
+    assert_ne!(reels_from_colon_term, reels_from_colon_window);
+    assert_eq!(reels_from_colon_term, source_key_for_reels_search("a:b", "C", 1));
+    assert!(reels_from_colon_term.contains("a:b"));
+    assert!(reels_from_colon_term.contains("c"));
+    assert!(reels_from_colon_term.ends_with(":p=1"));
+
+    let handle_from_colon_handle = source_key_for_instagram_handle(" @A:B ", "post");
+    let handle_from_colon_post = source_key_for_instagram_handle("a", "b:post");
+
+    assert_ne!(handle_from_colon_handle, handle_from_colon_post);
+    assert_eq!(
+        handle_from_colon_handle,
+        source_key_for_instagram_handle("a:b", "post")
+    );
+    assert!(handle_from_colon_handle.contains("a:b"));
+    assert!(handle_from_colon_handle.contains("post"));
 }
 
 #[test]
