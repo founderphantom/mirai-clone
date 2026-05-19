@@ -1,20 +1,15 @@
 use crate::auth_client::verify_session;
 use crate::db;
+use crate::domain::moodboards::{
+    default_moodboards, deterministic_user_moodboard_id, selected_moodboard_count_is_valid,
+};
 use crate::http::error::ApiError;
 use crate::queues::niche_research::NicheResearchMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use worker::{Request, Response, Result as WorkerResult, RouteContext};
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MoodboardSeed {
-    pub slug: String,
-    pub title: String,
-    pub vibe_summary: String,
-    pub search_queries: Vec<String>,
-}
+pub use crate::domain::moodboards::MoodboardSeed;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CloneSummary {
@@ -95,57 +90,6 @@ struct CountRow {
 #[derive(Debug, Deserialize)]
 struct IdRow {
     id: String,
-}
-
-pub fn default_moodboards() -> Vec<MoodboardSeed> {
-    vec![
-        moodboard_seed("warm-ambient", "Warm ambient", "Soft tungsten warmth, calm rooms, skin glow, and relaxed editorial framing."),
-        moodboard_seed("y2k-studio", "Y2K studio", "Glossy flash studio portraits, chrome accents, playful styling, and polished social poses."),
-        moodboard_seed("swag-era", "Swag era", "Bold accessories, confident casual poses, bright flash, and early social-era outfit energy."),
-        moodboard_seed("theatrical-light", "Theatrical light", "Dramatic spotlights, sculpted shadows, stage color, and cinematic portrait contrast."),
-        moodboard_seed("y2k-street", "Y2K street", "Street snapshots, low-rise layers, compact cameras, and saturated city color."),
-        moodboard_seed("flash-editorial", "Flash editorial", "Direct flash, crisp styling, strong makeup, studio walls, and magazine energy."),
-        moodboard_seed("old-smartphone", "Old smartphone", "Soft phone-camera grain, imperfect framing, casual mirror shots, and nostalgic texture."),
-        moodboard_seed("street-photography", "Street photography", "Candid sidewalks, real city motion, natural outfits, and documentary framing."),
-        moodboard_seed("asian-nostalgia", "Asian nostalgia", "Warm city evenings, intimate cafes, retro interiors, and soft nostalgic styling."),
-        moodboard_seed("retro-bw", "Retro BW", "High-grain black and white portraits, strong contrast, and vintage editorial attitude."),
-        moodboard_seed("subtle-flash", "Subtle flash", "Low-key direct flash, soft shadows, realistic skin, and understated nightlife polish."),
-        moodboard_seed("surreal-solarization", "Surreal solarization", "Experimental color inversions, glowing edges, and dreamlike fashion portrait effects."),
-        moodboard_seed("digital-camera", "Digital camera", "Compact-camera sharpness, glossy highlights, dated timestamps, and candid creator snaps."),
-        moodboard_seed("siren", "Siren", "Sleek glam, moody nightlife, sharp silhouettes, and magnetic editorial confidence."),
-        moodboard_seed("mystique-city", "Mystique city", "Dark urban atmosphere, reflective streets, elegant styling, and secretive cinematic light."),
-        moodboard_seed("candy-pop", "Candy pop", "Bright color blocking, playful beauty details, glossy styling, and upbeat studio energy."),
-        moodboard_seed("double-exposure", "Double exposure", "Layered portraits, ghosted motion, city overlays, and experimental photographic texture."),
-        moodboard_seed("2000s-band", "2000s band", "Indie band flash, backstage styling, instrument-room texture, and casual group-photo attitude."),
-        moodboard_seed("frutiger-aero", "Frutiger aero", "Glossy blue-green futurism, water reflections, glassy surfaces, and optimistic digital polish."),
-        moodboard_seed("drain", "Drain", "Washed-out cool tones, underground styling, stark flash, and melancholic street energy."),
-        moodboard_seed("extraterrestrial", "Extraterrestrial", "Alien color casts, metallic styling, unusual poses, and otherworldly editorial light."),
-        moodboard_seed("nature-light", "Nature light", "Clean daylight, greenery, soft skin tones, and organic outdoor portrait calm."),
-        moodboard_seed("editorial-street-style", "Editorial street style", "Runway-informed street outfits, confident full-body framing, and crisp city polish."),
-        moodboard_seed("new-indie", "New Indie", "Modern indie styling, casual interiors, soft flash, and intimate music-scene energy."),
-        moodboard_seed("underwater", "Underwater", "Blue cast light, floating fabric, softened movement, and submerged dreamlike portraits."),
-        moodboard_seed("80s-horror", "80s horror", "Hard colored light, suspenseful shadows, retro styling, and cinematic genre tension."),
-        moodboard_seed("disposable-camera", "Disposable camera", "Warm film grain, party flash, imperfect framing, and spontaneous memory-card texture."),
-        moodboard_seed("neutral-pastel-film", "Neutral pastel film", "Soft muted pastels, low contrast, delicate grain, and gentle daylight portraits."),
-        moodboard_seed("warm-vivid-film", "Warm vivid film", "Saturated warm film color, sunny skin tones, and energetic analog contrast."),
-        moodboard_seed("bw-film", "BW film", "Classic black and white film grain, silver highlights, and timeless portrait contrast."),
-        moodboard_seed("warm-contrast-film", "Warm contrast film", "Golden highlights, deep shadows, rich analog color, and confident editorial warmth."),
-        moodboard_seed("muted-cool-film", "Muted cool film", "Cool gray-green film tones, restrained contrast, and quiet cinematic mood."),
-    ]
-}
-
-fn moodboard_seed(slug: &str, title: &str, vibe_summary: &str) -> MoodboardSeed {
-    let search_base = title.to_ascii_lowercase();
-    MoodboardSeed {
-        slug: slug.to_string(),
-        title: title.to_string(),
-        vibe_summary: vibe_summary.to_string(),
-        search_queries: vec![
-            format!("{search_base} creator aesthetic"),
-            format!("{search_base} fashion portrait"),
-            format!("{search_base} social photo style"),
-        ],
-    }
 }
 
 pub async fn onboarding_state(req: Request, ctx: RouteContext<()>) -> WorkerResult<Response> {
@@ -250,7 +194,7 @@ pub async fn save_moodboards(mut req: Request, ctx: RouteContext<()>) -> WorkerR
     };
 
     let requested_moodboard_ids = unique_selected_moodboard_ids(input.moodboard_ids);
-    if !valid_selected_moodboard_count(requested_moodboard_ids.len()) {
+    if !selected_moodboard_count_is_valid(requested_moodboard_ids.len()) {
         return ApiError::bad_request("invalid_moodboard_selection", "Choose 1 to 10 moodboards.")
             .to_response();
     }
@@ -399,7 +343,7 @@ async fn ensure_default_moodboards(
         .into_iter()
         .enumerate()
         .map(|(index, seed)| {
-            let id = deterministic_moodboard_id(user_id, clone_id, &seed.slug);
+            let id = deterministic_user_moodboard_id(user_id, &seed.slug);
             let search_queries_json =
                 serde_json::to_string(&seed.search_queries).unwrap_or_else(|_| "[]".to_string());
             (
@@ -515,10 +459,6 @@ fn all_requested_moodboards_matched(matched_ids: &[String], requested_ids: &[Str
     matched_ids.len() == requested_ids.len()
 }
 
-fn valid_selected_moodboard_count(count: usize) -> bool {
-    (1..=10).contains(&count)
-}
-
 async fn count_inspiration_pool(db: &worker::D1Database, user_id: &str) -> WorkerResult<u32> {
     let row = db::first::<CountRow>(
         db,
@@ -551,17 +491,6 @@ impl From<MoodboardRow> for MoodboardResponse {
     }
 }
 
-fn deterministic_moodboard_id(user_id: &str, clone_id: Option<&str>, slug: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(user_id.as_bytes());
-    hasher.update(b":");
-    hasher.update(clone_id.unwrap_or("user"));
-    hasher.update(b":");
-    hasher.update(slug.as_bytes());
-    let hash = hex::encode(hasher.finalize());
-    format!("moodboard_{}", &hash[..24])
-}
-
 fn now_iso_string() -> String {
     js_sys::Date::new_0().to_iso_string().into()
 }
@@ -569,8 +498,8 @@ fn now_iso_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_requested_moodboards_matched, unique_selected_moodboard_ids,
-        valid_selected_moodboard_count, CloneSummary, MoodboardResponse, SaveMoodboardsRequest,
+        all_requested_moodboards_matched, selected_moodboard_count_is_valid,
+        unique_selected_moodboard_ids, CloneSummary, MoodboardResponse, SaveMoodboardsRequest,
     };
     use serde_json::json;
 
@@ -603,11 +532,11 @@ mod tests {
 
     #[test]
     fn selected_moodboard_count_accepts_one_to_ten_for_research() {
-        assert!(!valid_selected_moodboard_count(0));
-        assert!(valid_selected_moodboard_count(1));
-        assert!(valid_selected_moodboard_count(5));
-        assert!(valid_selected_moodboard_count(10));
-        assert!(!valid_selected_moodboard_count(11));
+        assert!(!selected_moodboard_count_is_valid(0));
+        assert!(selected_moodboard_count_is_valid(1));
+        assert!(selected_moodboard_count_is_valid(5));
+        assert!(selected_moodboard_count_is_valid(10));
+        assert!(!selected_moodboard_count_is_valid(11));
     }
 
     #[test]
@@ -622,8 +551,8 @@ mod tests {
         ]);
 
         assert_eq!(selected.len(), 5);
-        assert!(valid_selected_moodboard_count(selected.len()));
-        assert!(valid_selected_moodboard_count(selected.len() - 1));
+        assert!(selected_moodboard_count_is_valid(selected.len()));
+        assert!(selected_moodboard_count_is_valid(selected.len() - 1));
     }
 
     #[test]

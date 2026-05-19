@@ -15,11 +15,16 @@ use mirai_product_worker::domain::idempotency::clone_upload_key;
 use mirai_product_worker::domain::media_validation::{
     is_supported_reference_content_type, validate_reference_count, ReferenceCountError,
 };
+use mirai_product_worker::domain::moodboards::{
+    active_selected_slugs, default_moodboards, deterministic_user_moodboard_id,
+    selected_moodboard_count_is_valid, selected_moodboard_hash,
+};
 use mirai_product_worker::domain::status::{can_transition_soul_status, SoulStatus};
 use mirai_product_worker::domain::visual_reference::{
     accept_clone_compatibility, accept_visual_review, rank_candidates_for_review,
-    selected_moodboard_count_is_valid, visual_review_tags, CandidateDiversityCaps, MoodboardBrief,
-    VisualCandidateForRanking, VisualReferenceReview,
+    selected_moodboard_count_is_valid as visual_reference_selected_moodboard_count_is_valid,
+    visual_review_tags, CandidateDiversityCaps, MoodboardBrief, VisualCandidateForRanking,
+    VisualReferenceReview,
 };
 use mirai_product_worker::instagram_references::{
     build_instagram_post_url, build_instagram_profile_url, build_instagram_reels_search_url,
@@ -31,7 +36,6 @@ use mirai_product_worker::instagram_references::{
 use mirai_product_worker::routes::blitz::{
     map_blitz_service_error, parse_history_limit, read_required_query_param,
 };
-use mirai_product_worker::routes::onboarding::default_moodboards;
 use mirai_product_worker::scrapecreators::{
     build_scrape_request, normalize_instagram_reels_search, normalize_tiktok_keyword_search,
     scrape_platform_from_str, ScrapePlatform,
@@ -157,9 +161,8 @@ fn visual_reference_pipeline_schema_has_required_columns_and_config() {
 
 #[test]
 fn global_moodboard_reference_pipeline_schema_has_required_tables_and_constraints() {
-    let migration = include_str!(
-        "../../../config/d1/migrations/1009_global_moodboard_reference_pipeline.sql"
-    );
+    let migration =
+        include_str!("../../../config/d1/migrations/1009_global_moodboard_reference_pipeline.sql");
 
     for table in [
         "CREATE TABLE IF NOT EXISTS global_moodboard_definitions",
@@ -207,9 +210,8 @@ fn visual_reference_pipeline_append_migration_updates_existing_d1_databases() {
     assert!(migration.contains(
         "ALTER TABLE visual_reference_candidates ADD COLUMN cleanup_json TEXT NOT NULL DEFAULT '{}'"
     ));
-    assert!(migration.contains(
-        "ALTER TABLE visual_reference_candidates ADD COLUMN cleaned_image_url TEXT"
-    ));
+    assert!(migration
+        .contains("ALTER TABLE visual_reference_candidates ADD COLUMN cleaned_image_url TEXT"));
     assert!(migration.contains(
         "ALTER TABLE visual_reference_candidates ADD COLUMN compatibility_json TEXT NOT NULL DEFAULT '{}'"
     ));
@@ -2822,10 +2824,10 @@ fn visual_review_deserializes_kimi_human_count_and_default_text_fields() {
 
 #[test]
 fn visual_review_helpers_validate_counts_and_tags() {
-    assert!(!selected_moodboard_count_is_valid(0));
-    assert!(selected_moodboard_count_is_valid(1));
-    assert!(selected_moodboard_count_is_valid(10));
-    assert!(!selected_moodboard_count_is_valid(11));
+    assert!(!visual_reference_selected_moodboard_count_is_valid(0));
+    assert!(visual_reference_selected_moodboard_count_is_valid(1));
+    assert!(visual_reference_selected_moodboard_count_is_valid(10));
+    assert!(!visual_reference_selected_moodboard_count_is_valid(11));
 
     let mut review = approved_review_fixture();
     review.pose = " Direct Flash ".to_string();
@@ -2842,6 +2844,54 @@ fn visual_review_helpers_validate_counts_and_tags() {
             "editorial fashion".to_string(),
         ]
     );
+}
+
+#[test]
+fn user_moodboard_id_is_deterministic_by_user_and_slug_only() {
+    let first = deterministic_user_moodboard_id("user_1", "warm-ambient");
+    let second = deterministic_user_moodboard_id("user_1", "warm-ambient");
+    let other_slug = deterministic_user_moodboard_id("user_1", "y2k-studio");
+    let other_user = deterministic_user_moodboard_id("user_2", "warm-ambient");
+
+    assert_eq!(first, second);
+    assert_ne!(first, other_slug);
+    assert_ne!(first, other_user);
+    assert!(first.starts_with("moodboard_"));
+    assert_eq!(first.len(), "moodboard_".len() + 24);
+}
+
+#[test]
+fn selected_moodboard_hash_uses_sorted_active_slugs() {
+    let left = selected_moodboard_hash(&["y2k-studio".to_string(), "warm-ambient".to_string()]);
+    let right = selected_moodboard_hash(&["warm-ambient".to_string(), "y2k-studio".to_string()]);
+
+    assert_eq!(left, right);
+    assert_eq!(
+        left,
+        "ecb83edeb9181a4f13503a05ed45cfd036e9347e9a586e7bdbdedd72f2381ce8"
+    );
+}
+
+#[test]
+fn active_selected_slugs_excludes_disabled_definitions() {
+    let selected = vec![
+        ("warm-ambient".to_string(), true, "active".to_string()),
+        ("disabled-one".to_string(), true, "disabled".to_string()),
+        ("unselected".to_string(), false, "active".to_string()),
+    ];
+
+    assert_eq!(
+        active_selected_slugs(selected),
+        vec!["warm-ambient".to_string()]
+    );
+}
+
+#[test]
+fn moodboard_count_validation_accepts_one_to_ten() {
+    assert!(!selected_moodboard_count_is_valid(0));
+    assert!(selected_moodboard_count_is_valid(1));
+    assert!(selected_moodboard_count_is_valid(10));
+    assert!(!selected_moodboard_count_is_valid(11));
 }
 
 #[test]
