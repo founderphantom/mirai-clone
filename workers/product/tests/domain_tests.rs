@@ -300,6 +300,157 @@ fn reference_pipeline_request_kickoff_only_enqueues_queue_messages() {
 }
 
 #[test]
+fn reference_pipeline_queue_is_bound_in_worker_config() {
+    let wrangler = include_str!("../wrangler.product.jsonc");
+    assert!(wrangler.contains("\"binding\": \"REFERENCE_PIPELINE_QUEUE\""));
+    assert!(wrangler.contains("\"queue\": \"mirai-reference-pipeline\""));
+    assert!(wrangler.contains("\"dead_letter_queue\": \"mirai-reference-pipeline-dlq\""));
+
+    let env_source = include_str!("../src/env.rs");
+    assert!(env_source.contains("pub reference_pipeline_queue: Queue"));
+    assert!(env_source.contains("env.queue(\"REFERENCE_PIPELINE_QUEUE\")?"));
+}
+
+#[test]
+fn reference_pipeline_queue_handler_owns_global_messages_only_in_part_two() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    for message in [
+        "EnsureGlobalMoodboardLibrary",
+        "DiscoverGlobalInstagramHandles",
+        "FetchGlobalInstagramProfile",
+        "FetchGlobalInstagramPosts",
+        "FetchGlobalInstagramPostDetail",
+        "ReviewGlobalVisualCandidates",
+        "CleanupGlobalMoodboardReference",
+        "FinalizeGlobalMoodboardLibrary",
+    ] {
+        assert!(source.contains(message), "{message}");
+    }
+    assert!(source.contains("clone_pool_messages_are_enabled_in_part_three"));
+}
+
+#[test]
+fn reference_pipeline_source_fetch_rechecks_current_run_after_provider_calls() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+
+    assert!(
+        source
+            .matches(
+                "ensure_current_global_run_after_provider_fetch(db, moodboard_slug, run_id).await?"
+            )
+            .count()
+            >= 4
+    );
+
+    for handler in [
+        "async fn discover_global_instagram_handles",
+        "async fn fetch_global_instagram_profile",
+        "async fn fetch_global_instagram_posts",
+        "async fn fetch_global_instagram_post_detail",
+    ] {
+        let body = reference_pipeline_function_body(source, handler);
+        let fetch = body.find("fetch_scrapecreators_json").expect(handler);
+        let recheck = body
+            .find("ensure_current_global_run_after_provider_fetch")
+            .expect(handler);
+        assert!(recheck > fetch, "{handler}");
+    }
+
+    for (handler, failure_helper) in [
+        (
+            "async fn discover_global_instagram_handles",
+            "record_scrapecreators_search_failure_and_enqueue_finalize",
+        ),
+        (
+            "async fn fetch_global_instagram_profile",
+            "record_scrapecreators_handle_failure_and_enqueue_finalize",
+        ),
+        (
+            "async fn fetch_global_instagram_posts",
+            "record_scrapecreators_handle_failure_and_enqueue_finalize",
+        ),
+        (
+            "async fn fetch_global_instagram_post_detail",
+            "record_scrapecreators_handle_failure_and_enqueue_finalize",
+        ),
+    ] {
+        let body = reference_pipeline_function_body(source, handler);
+        let fetch = body.find("fetch_scrapecreators_json").expect(handler);
+        let after_fetch = &body[fetch..];
+        let error_arm = after_fetch.find("Err(error) => {").expect(handler);
+        let after_error = &after_fetch[error_arm..];
+        let failure = after_error.find(failure_helper).expect(handler);
+        let before_failure = &after_error[..failure];
+        assert!(
+            before_failure.contains("global_run_is_current(db, moodboard_slug, run_id).await?"),
+            "{handler}"
+        );
+    }
+}
+
+#[test]
+fn reference_pipeline_source_failures_are_recorded_before_ack() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+
+    for helper in [
+        "record_global_search_fetch_failure",
+        "record_global_handle_fetch_failure",
+        "record_global_source_run_failure",
+        "record_scrapecreators_search_failure_and_enqueue_finalize",
+        "record_scrapecreators_handle_failure_and_enqueue_finalize",
+    ] {
+        assert!(source.contains(helper), "{helper}");
+    }
+
+    for snippet in [
+        "failure_count = failure_count + 1",
+        "last_error_code = ?",
+        "last_error_message = ?",
+        "next_eligible_at = ?",
+        "status = 'cooldown'",
+        "cooldown_until = ?",
+        "error_code = ?",
+        "error_message = ?",
+    ] {
+        assert!(source.contains(snippet), "{snippet}");
+    }
+}
+
+#[test]
+fn reference_pipeline_ensure_reuses_current_nonterminal_global_run() {
+    let source = include_str!("../src/queues/reference_pipeline.rs");
+    let body = reference_pipeline_function_body(source, "async fn ensure_global_moodboard_library");
+
+    for snippet in [
+        "load_reusable_current_global_source_run",
+        "enqueue_global_source_work_for_run",
+        "status IN ('queued', 'refreshing')",
+        "current_run_id",
+    ] {
+        assert!(source.contains(snippet), "{snippet}");
+    }
+
+    let reusable = body
+        .find("load_reusable_current_global_source_run")
+        .expect("ensure should check reusable run");
+    let new_run = body
+        .find("new_global_run_id")
+        .expect("ensure should still create new runs when needed");
+    assert!(reusable < new_run);
+}
+
+fn reference_pipeline_function_body<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source.find(marker).expect(marker);
+    let rest = &source[start..];
+    let next = rest[marker.len()..]
+        .find("\nasync fn ")
+        .or_else(|| rest[marker.len()..].find("\nfn "))
+        .map(|offset| marker.len() + offset)
+        .unwrap_or(rest.len());
+    &rest[..next]
+}
+
+#[test]
 fn visual_reference_pipeline_append_migration_updates_existing_d1_databases() {
     let migration = include_str!(
         "../../../config/d1/migrations/1008_visual_reference_cleanup_compatibility.sql"

@@ -90,6 +90,13 @@
         "max_batch_timeout": 30,
         "max_retries": 2,
         "dead_letter_queue": "mirai-niche-research-dlq"
+      },
+      {
+        "queue": "mirai-reference-pipeline",
+        "max_batch_size": 2,
+        "max_batch_timeout": 30,
+        "max_retries": 2,
+        "dead_letter_queue": "mirai-reference-pipeline-dlq"
       }
     ]
   }
