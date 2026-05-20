@@ -31,7 +31,8 @@ use crate::services::global_reference_discovery::{
     GLOBAL_DISCOVERY_RUN_STALE_AFTER_MINUTES_CONFIG_KEY,
 };
 use crate::services::queue_reservations::{
-    now_iso_string, QueueHandlingOutcome, ReservationOutcome,
+    now_iso_string, reservation_key_for_reference_message,
+    reserve_and_send_reference_pipeline_message, QueueHandlingOutcome, ReservationOutcome,
 };
 use crate::services::visual_reference_cache::{
     fetch_visual_reference_image, global_visual_reference_storage_key, CachedVisualReference,
@@ -44,7 +45,6 @@ use worker::{
     D1Database, Env, Error, HttpMetadata, MessageBatch, MessageExt, Result as WorkerResult,
 };
 
-const REFERENCE_PIPELINE_QUEUE_BINDING: &str = "REFERENCE_PIPELINE_QUEUE";
 const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_FOUNDER";
 const HIGGSFIELD_PROVIDER_ACCOUNT_ID: &str = "pa_higgsfield_founder";
 const HIGGSFIELD_CLEANUP_TOOL_VAR: &str = "HIGGSFIELD_MCP_CLEANUP_TOOL";
@@ -318,6 +318,7 @@ async fn ensure_global_moodboard_library(
     let target = config_value_u32(db, "global_refs_per_moodboard_target", 25).await?;
     if active_global_reference_count(db, &definition.slug).await? >= target {
         return enqueue_finalize_global_moodboard_library(
+            db,
             env,
             &definition.slug,
             "",
@@ -660,15 +661,18 @@ async fn discover_global_instagram_handles(
     .await?;
 
     for handle in handles {
-        env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
-            .send(ReferencePipelineMessage::FetchGlobalInstagramProfile {
+        reserve_and_send_reference_message(
+            db,
+            env,
+            ReferencePipelineMessage::FetchGlobalInstagramProfile {
                 moodboard_slug: moodboard_slug.to_string(),
                 run_id: run_id.to_string(),
                 handle,
                 discovered_via: source_key.clone(),
                 related_depth: 0,
-            })
-            .await?;
+            },
+        )
+        .await?;
     }
 
     Ok(())
@@ -766,16 +770,19 @@ async fn fetch_global_instagram_profile(
         }
     }
 
-    env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
-        .send(ReferencePipelineMessage::FetchGlobalInstagramPosts {
+    reserve_and_send_reference_message(
+        db,
+        env,
+        ReferencePipelineMessage::FetchGlobalInstagramPosts {
             moodboard_slug: moodboard_slug.to_string(),
             run_id: run_id.to_string(),
             handle: handle.to_string(),
             discovered_via: discovered_via.to_string(),
             next_max_id: None,
             page: 1,
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -894,15 +901,18 @@ async fn fetch_global_instagram_posts(
         .await?
         .max(1) as usize;
     for target in instagram_post_detail_targets(&raw, &candidates, images_per_post, detail_limit) {
-        env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
-            .send(ReferencePipelineMessage::FetchGlobalInstagramPostDetail {
+        reserve_and_send_reference_message(
+            db,
+            env,
+            ReferencePipelineMessage::FetchGlobalInstagramPostDetail {
                 moodboard_slug: moodboard_slug.to_string(),
                 run_id: run_id.to_string(),
                 handle: handle.to_string(),
                 discovered_via: discovered_via.to_string(),
                 source_url: target.source_url,
-            })
-            .await?;
+            },
+        )
+        .await?;
     }
 
     let pages_per_profile = config_value_u32(db, "instagram_pages_per_profile", 1)
@@ -910,21 +920,25 @@ async fn fetch_global_instagram_posts(
         .max(1) as u8;
     if page < pages_per_profile {
         if let Some(cursor) = next_max_id_from(&raw) {
-            env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
-                .send(ReferencePipelineMessage::FetchGlobalInstagramPosts {
+            reserve_and_send_reference_message(
+                db,
+                env,
+                ReferencePipelineMessage::FetchGlobalInstagramPosts {
                     moodboard_slug: moodboard_slug.to_string(),
                     run_id: run_id.to_string(),
                     handle: handle.to_string(),
                     discovered_via: discovered_via.to_string(),
                     next_max_id: Some(cursor),
                     page: page.saturating_add(1),
-                })
-                .await?;
+                },
+            )
+            .await?;
         }
     }
 
-    enqueue_review_global_visual_candidates(env, moodboard_slug, run_id, 60).await?;
-    enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "posts_fetched").await
+    enqueue_review_global_visual_candidates(db, env, moodboard_slug, run_id, 60).await?;
+    enqueue_finalize_global_moodboard_library(db, env, moodboard_slug, run_id, "posts_fetched")
+        .await
 }
 
 async fn fetch_global_instagram_post_detail(
@@ -1027,9 +1041,15 @@ async fn fetch_global_instagram_post_detail(
     )
     .await?;
 
-    enqueue_review_global_visual_candidates(env, moodboard_slug, run_id, 60).await?;
-    enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "post_detail_fetched")
-        .await
+    enqueue_review_global_visual_candidates(db, env, moodboard_slug, run_id, 60).await?;
+    enqueue_finalize_global_moodboard_library(
+        db,
+        env,
+        moodboard_slug,
+        run_id,
+        "post_detail_fetched",
+    )
+    .await
 }
 
 async fn review_global_visual_candidates(
@@ -1185,13 +1205,16 @@ async fn review_global_visual_candidates(
                 )
                 .await?;
                 if changed_rows(&result)? > 0 {
-                    env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
-                        .send(ReferencePipelineMessage::CleanupGlobalMoodboardReference {
+                    reserve_and_send_reference_message(
+                        db,
+                        env,
+                        ReferencePipelineMessage::CleanupGlobalMoodboardReference {
                             moodboard_slug: moodboard_slug.to_string(),
                             run_id: run_id.to_string(),
                             candidate_id: candidate.id,
-                        })
-                        .await?;
+                        },
+                    )
+                    .await?;
                 }
             }
             Err(_) => {
@@ -1222,9 +1245,10 @@ async fn review_global_visual_candidates(
         return Ok(());
     }
     if global_review_has_eligible_rows(db, moodboard_slug, run_id, review_retry_limit).await? {
-        enqueue_review_global_visual_candidates(env, moodboard_slug, run_id, review_limit).await
+        enqueue_review_global_visual_candidates(db, env, moodboard_slug, run_id, review_limit).await
     } else {
         enqueue_finalize_global_moodboard_library(
+            db,
             env,
             moodboard_slug,
             run_id,
@@ -1310,6 +1334,7 @@ async fn cleanup_global_moodboard_reference(
                 return Ok(());
             }
             enqueue_finalize_global_moodboard_library(
+                db,
                 env,
                 moodboard_slug,
                 run_id,
@@ -1476,6 +1501,7 @@ async fn cleanup_global_moodboard_reference(
             return Ok(());
         }
         enqueue_finalize_global_moodboard_library(
+            db,
             env,
             moodboard_slug,
             run_id,
@@ -1794,35 +1820,47 @@ async fn enqueue_global_source_work_for_run(
             .await?
             .max(1);
     for work in select_global_search_work(db, moodboard_slug, &now, search_limit).await? {
-        env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
-            .send(ReferencePipelineMessage::DiscoverGlobalInstagramHandles {
+        reserve_and_send_reference_message(
+            db,
+            env,
+            ReferencePipelineMessage::DiscoverGlobalInstagramHandles {
                 moodboard_slug: work.moodboard_slug,
                 run_id: run_id.to_string(),
                 search_term: work.search_term,
                 date_window: work.date_window,
                 page: work.page,
-            })
-            .await?;
+            },
+        )
+        .await?;
     }
 
     let handle_limit = config_value_u32(db, "instagram_max_profiles_per_run", 20)
         .await?
         .max(1);
     for work in select_global_handle_work(db, moodboard_slug, &now, handle_limit).await? {
-        env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
-            .send(ReferencePipelineMessage::FetchGlobalInstagramProfile {
+        reserve_and_send_reference_message(
+            db,
+            env,
+            ReferencePipelineMessage::FetchGlobalInstagramProfile {
                 moodboard_slug: work.moodboard_slug,
                 run_id: run_id.to_string(),
                 handle: work.handle,
                 discovered_via: work.discovered_via,
                 related_depth: work.related_depth,
-            })
-            .await?;
+            },
+        )
+        .await?;
     }
 
-    enqueue_review_global_visual_candidates(env, moodboard_slug, run_id, 60).await?;
-    enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "source_fetch_started")
-        .await
+    enqueue_review_global_visual_candidates(db, env, moodboard_slug, run_id, 60).await?;
+    enqueue_finalize_global_moodboard_library(
+        db,
+        env,
+        moodboard_slug,
+        run_id,
+        "source_fetch_started",
+    )
+    .await
 }
 
 async fn set_current_global_source_run(
@@ -3156,8 +3194,14 @@ async fn record_scrapecreators_search_failure_and_enqueue_finalize(
     )
     .await?;
     record_global_source_run_failure(db, moodboard_slug, run_id, error_code, &detail, &now).await?;
-    enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "source_fetch_failed")
-        .await
+    enqueue_finalize_global_moodboard_library(
+        db,
+        env,
+        moodboard_slug,
+        run_id,
+        "source_fetch_failed",
+    )
+    .await
 }
 
 async fn record_scrapecreators_handle_failure_and_enqueue_finalize(
@@ -3180,8 +3224,14 @@ async fn record_scrapecreators_handle_failure_and_enqueue_finalize(
     record_global_handle_fetch_failure(db, moodboard_slug, run_id, handle, &cooldown_until, &now)
         .await?;
     record_global_source_run_failure(db, moodboard_slug, run_id, error_code, &detail, &now).await?;
-    enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "source_fetch_failed")
-        .await
+    enqueue_finalize_global_moodboard_library(
+        db,
+        env,
+        moodboard_slug,
+        run_id,
+        "source_fetch_failed",
+    )
+    .await
 }
 
 async fn record_global_search_fetch_failure(
@@ -3649,9 +3699,9 @@ async fn wake_clone_pools_for_impacted_slug(
                 )
             })
             .unwrap_or(false);
-        let passive_insufficient_waiting_row_is_wakeable =
-            row.waiting_status.as_str() == "insufficient"
-                && row.pool_status.as_deref() == Some("insufficient_refs");
+        let passive_insufficient_waiting_row_is_wakeable = row.waiting_status.as_str()
+            == "insufficient"
+            && row.pool_status.as_deref() == Some("insufficient_refs");
 
         if row.current_pool_run_id.as_deref() != Some(row.pool_run_id.as_str())
             || row.clone_is_ready == 0
@@ -3695,18 +3745,18 @@ async fn wake_clone_pools_for_impacted_slug(
             );
             let outcome =
                 crate::services::queue_reservations::reserve_and_send_reference_pipeline_message(
-                db,
-                env,
-                reservation,
-                ReferencePipelineMessage::BuildCloneReferencePool {
-                    user_id: row.user_id.clone(),
-                    clone_id: row.clone_id.clone(),
-                    reason: "global_library_wakeup".to_string(),
-                    wakeup_moodboard_slug: Some(row.moodboard_slug.clone()),
-                },
-                now,
-            )
-            .await?;
+                    db,
+                    env,
+                    reservation,
+                    ReferencePipelineMessage::BuildCloneReferencePool {
+                        user_id: row.user_id.clone(),
+                        clone_id: row.clone_id.clone(),
+                        reason: "global_library_wakeup".to_string(),
+                        wakeup_moodboard_slug: Some(row.moodboard_slug.clone()),
+                    },
+                    now,
+                )
+                .await?;
             if outcome == ReservationOutcome::Reserved {
                 mark_waiting_rows_resumed(db, &row, &current_selected_moodboard_hash, now).await?;
             }
@@ -3898,13 +3948,10 @@ async fn retryable_global_work_exists_for_user_selection(
     excluded_run_id: &str,
     now: &str,
 ) -> WorkerResult<bool> {
-    let stale_after_minutes = config_value_i64(
-        db,
-        GLOBAL_DISCOVERY_RUN_STALE_AFTER_MINUTES_CONFIG_KEY,
-        60,
-    )
-    .await?
-    .max(1);
+    let stale_after_minutes =
+        config_value_i64(db, GLOBAL_DISCOVERY_RUN_STALE_AFTER_MINUTES_CONFIG_KEY, 60)
+            .await?
+            .max(1);
     let stale_cutoff =
         crate::services::queue_reservations::add_minutes_iso(now, -stale_after_minutes);
     let review_retry_limit = config_value_u32(db, "visual_reference_review_retry_limit", 2)
@@ -4158,34 +4205,54 @@ fn selected_search_terms(
     terms
 }
 
+async fn reserve_and_send_reference_message(
+    db: &D1Database,
+    env: &Env,
+    message: ReferencePipelineMessage,
+) -> WorkerResult<ReservationOutcome> {
+    let now = now_iso_string();
+    let reservation = reservation_key_for_reference_message(&message, 0, 0);
+    reserve_and_send_reference_pipeline_message(db, env, reservation, message, &now).await
+}
+
 async fn enqueue_review_global_visual_candidates(
+    db: &D1Database,
     env: &Env,
     moodboard_slug: &str,
     run_id: &str,
     limit: u32,
 ) -> WorkerResult<()> {
-    env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
-        .send(ReferencePipelineMessage::ReviewGlobalVisualCandidates {
+    reserve_and_send_reference_message(
+        db,
+        env,
+        ReferencePipelineMessage::ReviewGlobalVisualCandidates {
             moodboard_slug: moodboard_slug.to_string(),
             run_id: run_id.to_string(),
             limit,
-        })
-        .await
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn enqueue_finalize_global_moodboard_library(
+    db: &D1Database,
     env: &Env,
     moodboard_slug: &str,
     run_id: &str,
     reason: &str,
 ) -> WorkerResult<()> {
-    env.queue(REFERENCE_PIPELINE_QUEUE_BINDING)?
-        .send(ReferencePipelineMessage::FinalizeGlobalMoodboardLibrary {
+    reserve_and_send_reference_message(
+        db,
+        env,
+        ReferencePipelineMessage::FinalizeGlobalMoodboardLibrary {
             moodboard_slug: moodboard_slug.to_string(),
             run_id: run_id.to_string(),
             reason: reason.to_string(),
-        })
-        .await
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn record_global_candidate_cleanup_failure_and_finalize(
@@ -4224,8 +4291,14 @@ async fn record_global_candidate_cleanup_failure_and_finalize(
         ],
     )
     .await?;
-    enqueue_finalize_global_moodboard_library(env, moodboard_slug, run_id, "global_cleanup_failed")
-        .await
+    enqueue_finalize_global_moodboard_library(
+        db,
+        env,
+        moodboard_slug,
+        run_id,
+        "global_cleanup_failed",
+    )
+    .await
 }
 
 async fn resume_or_finalize_cleaned_global_candidate(
@@ -4608,6 +4681,7 @@ async fn ensure_global_cleanup_followups(
     }
 
     enqueue_finalize_global_moodboard_library(
+        db,
         env,
         moodboard_slug,
         run_id,

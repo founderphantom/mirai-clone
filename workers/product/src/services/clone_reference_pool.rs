@@ -6,16 +6,16 @@ use crate::domain::clone_reference_pool::{
 };
 use crate::domain::moodboards::selected_moodboard_hash;
 use crate::queues::messages::ReferencePipelineMessage;
-use crate::services::queue_reservations::{QueueReservation, ReservationOutcome, ReservationTtl};
+use crate::services::queue_reservations::{
+    reservation_key_for_reference_message, reserve_and_send_reference_pipeline_message,
+    QueueReservation, ReservationOutcome, ReservationTtl,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 use wasm_bindgen::JsValue;
 use worker::{D1Database, Env, Error, Result as WorkerResult};
-
-const REFERENCE_QUEUE_NAME: &str = "REFERENCE_PIPELINE_QUEUE";
-const REFERENCE_QUEUE_STORAGE_NAME: &str = "mirai-reference-pipeline";
 
 #[derive(Debug, Deserialize)]
 struct ConfigRow {
@@ -396,49 +396,6 @@ pub fn compatibility_actionable_global_reference_count_for_current_selection_sql
           AND cvr.next_retry_at <= ?
         )
       )
-    "#
-}
-
-fn reserve_reference_pipeline_message_sql() -> &'static str {
-    r#"
-    INSERT INTO queue_message_reservations (
-      id, queue_name, message_kind, dedupe_key, pool_run_id,
-      status, created_at, updated_at, expires_at
-    )
-    VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?, ?)
-    ON CONFLICT(queue_name, message_kind, dedupe_key) DO UPDATE SET
-      id = excluded.id,
-      pool_run_id = excluded.pool_run_id,
-      status = 'reserved',
-      updated_at = excluded.updated_at,
-      expires_at = excluded.expires_at
-    WHERE queue_message_reservations.status = 'failed'
-       OR queue_message_reservations.status = 'reserved' AND queue_message_reservations.expires_at <= excluded.created_at
-    "#
-}
-
-fn mark_reserved_reference_pipeline_message_enqueued_sql() -> &'static str {
-    r#"
-    UPDATE queue_message_reservations
-    SET status = 'enqueued',
-        updated_at = ?
-    WHERE queue_name = ?
-      AND message_kind = ?
-      AND dedupe_key = ?
-      AND status = 'reserved'
-    "#
-}
-
-fn mark_reserved_reference_pipeline_message_failed_sql() -> &'static str {
-    r#"
-    UPDATE queue_message_reservations
-    SET status = 'failed',
-        updated_at = ?
-    WHERE queue_name = ?
-      AND message_kind = ?
-      AND dedupe_key = ?
-      AND id = ?
-      AND status = 'reserved'
     "#
 }
 
@@ -2473,9 +2430,6 @@ async fn schedule_compatibility_wave(
         reserve_and_send_clone_message(
             db,
             env,
-            "validate_clone_compatibility",
-            &format!("{pool_run_id}:{}", reference.id),
-            Some(pool_run_id),
             ReferencePipelineMessage::ValidateCloneCompatibility {
                 user_id: user_id.to_string(),
                 clone_id: clone_id.to_string(),
@@ -2539,77 +2493,12 @@ async fn repair_already_accepted_references(
 async fn reserve_and_send_clone_message(
     db: &D1Database,
     env: &Env,
-    message_kind: &str,
-    dedupe_key: &str,
-    pool_run_id: Option<&str>,
     message: ReferencePipelineMessage,
     now: &str,
 ) -> WorkerResult<()> {
-    let reservation_id = format!("queue_reservation_{}", Uuid::new_v4().simple());
-    let result = db::run(
-        db,
-        reserve_reference_pipeline_message_sql(),
-        vec![
-            json!(reservation_id),
-            json!(REFERENCE_QUEUE_STORAGE_NAME),
-            json!(message_kind),
-            json!(dedupe_key),
-            json!(pool_run_id),
-            json!(now),
-            json!(now),
-            json!(add_minutes_iso(now, 45)),
-        ],
-    )
-    .await?;
-
-    if changed_rows(&result)? == 0 {
-        return Ok(());
-    }
-
-    if let Err(error) = env.queue("REFERENCE_PIPELINE_QUEUE")?.send(message).await {
-        mark_reserved_reference_pipeline_message_failed(
-            db,
-            message_kind,
-            dedupe_key,
-            &reservation_id,
-            now,
-        )
-        .await?;
-        return Err(error);
-    }
-
-    db::exec(
-        db,
-        mark_reserved_reference_pipeline_message_enqueued_sql(),
-        vec![
-            json!(now),
-            json!(REFERENCE_QUEUE_STORAGE_NAME),
-            json!(message_kind),
-            json!(dedupe_key),
-        ],
-    )
-    .await
-}
-
-async fn mark_reserved_reference_pipeline_message_failed(
-    db: &D1Database,
-    message_kind: &str,
-    dedupe_key: &str,
-    reservation_id: &str,
-    now: &str,
-) -> WorkerResult<()> {
-    db::exec(
-        db,
-        mark_reserved_reference_pipeline_message_failed_sql(),
-        vec![
-            json!(now),
-            json!(REFERENCE_QUEUE_STORAGE_NAME),
-            json!(message_kind),
-            json!(dedupe_key),
-            json!(reservation_id),
-        ],
-    )
-    .await
+    let reservation = reservation_key_for_reference_message(&message, 0, 0);
+    reserve_and_send_reference_pipeline_message(db, env, reservation, message, now).await?;
+    Ok(())
 }
 
 async fn mark_unclaimed_clone_pool_run_superseded(
@@ -3028,11 +2917,6 @@ async fn enqueue_global_topups_for_underfilled_selected_slugs(
         }
         summary.underfilled_slug_count += 1;
 
-        if current_global_topup_run_is_active(db, slug, &stale_cutoff).await? {
-            summary.active_or_started_run_slugs.push(slug.clone());
-            continue;
-        }
-
         let eligible_global_work_exists = eligible_global_topup_work_exists(
             db,
             slug,
@@ -3042,14 +2926,20 @@ async fn enqueue_global_topups_for_underfilled_selected_slugs(
         )
         .await?;
 
+        if current_global_topup_run_is_active(db, slug, &stale_cutoff).await?
+            && !eligible_global_work_exists
+        {
+            summary.active_or_started_run_slugs.push(slug.clone());
+            continue;
+        }
+
         if !eligible_global_work_exists && global_topup_next_retry_is_blocked(db, slug, now).await?
         {
             summary.blocked_or_exhausted_slugs.push(slug.clone());
             continue;
         }
 
-        if current_global_topup_state_exists(db, slug).await? && !eligible_global_work_exists
-        {
+        if current_global_topup_state_exists(db, slug).await? && !eligible_global_work_exists {
             summary.blocked_or_exhausted_slugs.push(slug.clone());
             continue;
         }
@@ -3131,7 +3021,12 @@ async fn current_global_topup_run_is_active(
     let run_status_is_active = row
         .run_status
         .as_deref()
-        .map(|status| matches!(status, "queued" | "refreshing" | "scraping" | "reviewing" | "cleaning"))
+        .map(|status| {
+            matches!(
+                status,
+                "queued" | "refreshing" | "scraping" | "reviewing" | "cleaning"
+            )
+        })
         .unwrap_or(false);
     let fresh = row
         .run_updated_at
@@ -3394,7 +3289,7 @@ fn compact_error_detail(error: &str) -> String {
 }
 
 async fn enqueue_finalize_clone_pool(
-    _db: &D1Database,
+    db: &D1Database,
     env: &Env,
     user_id: &str,
     clone_id: &str,
@@ -3402,14 +3297,18 @@ async fn enqueue_finalize_clone_pool(
     reason: &str,
     _now: &str,
 ) -> WorkerResult<()> {
-    env.queue(REFERENCE_QUEUE_NAME)?
-        .send(ReferencePipelineMessage::FinalizeCloneReferencePool {
+    reserve_and_send_clone_message(
+        db,
+        env,
+        ReferencePipelineMessage::FinalizeCloneReferencePool {
             user_id: user_id.to_string(),
             clone_id: clone_id.to_string(),
             pool_run_id: pool_run_id.to_string(),
             reason: reason.to_string(),
-        })
-        .await
+        },
+        _now,
+    )
+    .await
 }
 
 fn changed_rows(result: &worker::D1Result) -> WorkerResult<usize> {

@@ -27,6 +27,7 @@ pub enum QueueHandlingOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReservationTtl {
     FiveMinutes,
+    QueueDelivery,
     ReviewBatch,
     GlobalRun { stale_after_minutes: i64 },
     ClonePool { stale_after_minutes: i64 },
@@ -147,7 +148,15 @@ fn insert_direct_handling_reservation_sql() -> &'static str {
       status, created_at, updated_at, expires_at
     )
     VALUES (?, ?, ?, ?, ?, ?, 'handling', ?, ?, ?)
-    ON CONFLICT(queue_name, message_kind, dedupe_key) DO NOTHING
+    ON CONFLICT(queue_name, message_kind, dedupe_key) DO UPDATE SET
+      id = excluded.id,
+      run_id = excluded.run_id,
+      pool_run_id = excluded.pool_run_id,
+      status = 'handling',
+      updated_at = excluded.updated_at,
+      expires_at = excluded.expires_at
+    WHERE queue_message_reservations.status IN ('handled', 'failed', 'expired', 'cancelled')
+       OR queue_message_reservations.expires_at <= excluded.created_at
     "#
 }
 
@@ -229,6 +238,7 @@ pub fn add_minutes_iso(now: &str, minutes: i64) -> String {
 pub fn expires_at_for_ttl(now: &str, ttl: ReservationTtl) -> String {
     let minutes = match ttl {
         ReservationTtl::FiveMinutes => 5,
+        ReservationTtl::QueueDelivery => 15,
         ReservationTtl::ReviewBatch => 10,
         ReservationTtl::GlobalRun {
             stale_after_minutes,
@@ -274,12 +284,9 @@ pub async fn claim_queue_message_handling(
         return Ok(QueueHandlingOutcome::Claimed);
     }
 
-    if let Some(status) = load_reservation_status(db, reservation).await? {
-        return Ok(handling_outcome_for_status(&status));
-    }
-
     // Direct-sent messages from older producers have no reservation row. Create
-    // a handling row here so success/failure transitions are still guarded.
+    // or reclaim a handling row here so success/failure transitions are still
+    // guarded and expired dedupe windows can be re-driven.
     let insert_result = db::run(
         db,
         insert_direct_handling_reservation_sql(),
@@ -486,8 +493,8 @@ pub async fn reserve_and_send_reference_pipeline_message(
 
 pub fn reservation_key_for_reference_message(
     message: &ReferencePipelineMessage,
-    global_run_stale_after_minutes: i64,
-    clone_pool_run_stale_after_minutes: i64,
+    _global_run_stale_after_minutes: i64,
+    _clone_pool_run_stale_after_minutes: i64,
 ) -> QueueReservation {
     match message {
         ReferencePipelineMessage::EnsureGlobalMoodboardLibrary { moodboard_slug, .. } => {
@@ -498,7 +505,7 @@ pub fn reservation_key_for_reference_message(
                 None,
                 ReservationTtl::FiveMinutes,
             )
-        },
+        }
         ReferencePipelineMessage::DiscoverGlobalInstagramHandles {
             moodboard_slug,
             run_id,
@@ -515,9 +522,7 @@ pub fn reservation_key_for_reference_message(
             ),
             Some(run_id.clone()),
             None,
-            ReservationTtl::GlobalRun {
-                stale_after_minutes: global_run_stale_after_minutes,
-            },
+            ReservationTtl::QueueDelivery,
         ),
         ReferencePipelineMessage::FetchGlobalInstagramProfile {
             moodboard_slug,
@@ -534,9 +539,7 @@ pub fn reservation_key_for_reference_message(
             ),
             Some(run_id.clone()),
             None,
-            ReservationTtl::GlobalRun {
-                stale_after_minutes: global_run_stale_after_minutes,
-            },
+            ReservationTtl::QueueDelivery,
         ),
         ReferencePipelineMessage::FetchGlobalInstagramPosts {
             moodboard_slug,
@@ -555,9 +558,7 @@ pub fn reservation_key_for_reference_message(
             ),
             Some(run_id.clone()),
             None,
-            ReservationTtl::GlobalRun {
-                stale_after_minutes: global_run_stale_after_minutes,
-            },
+            ReservationTtl::QueueDelivery,
         ),
         ReferencePipelineMessage::FetchGlobalInstagramPostDetail {
             run_id, source_url, ..
@@ -569,9 +570,7 @@ pub fn reservation_key_for_reference_message(
             ),
             Some(run_id.clone()),
             None,
-            ReservationTtl::GlobalRun {
-                stale_after_minutes: global_run_stale_after_minutes,
-            },
+            ReservationTtl::QueueDelivery,
         ),
         ReferencePipelineMessage::ReviewGlobalVisualCandidates {
             moodboard_slug,
@@ -584,7 +583,7 @@ pub fn reservation_key_for_reference_message(
                 .replace("<moodboard_slug>", moodboard_slug),
             Some(run_id.clone()),
             None,
-            ReservationTtl::ReviewBatch,
+            ReservationTtl::QueueDelivery,
         ),
         ReferencePipelineMessage::CleanupGlobalMoodboardReference {
             run_id,
@@ -598,9 +597,7 @@ pub fn reservation_key_for_reference_message(
             ),
             Some(run_id.clone()),
             None,
-            ReservationTtl::GlobalRun {
-                stale_after_minutes: global_run_stale_after_minutes,
-            },
+            ReservationTtl::QueueDelivery,
         ),
         ReferencePipelineMessage::FinalizeGlobalMoodboardLibrary {
             moodboard_slug,
@@ -614,7 +611,7 @@ pub fn reservation_key_for_reference_message(
             ),
             Some(run_id.clone()),
             None,
-            ReservationTtl::FiveMinutes,
+            ReservationTtl::QueueDelivery,
         ),
         ReferencePipelineMessage::BuildCloneReferencePool {
             user_id,
@@ -662,9 +659,7 @@ pub fn reservation_key_for_reference_message(
             clone_compatibility_dedupe_key(pool_run_id, global_reference_id),
             None,
             Some(pool_run_id.clone()),
-            ReservationTtl::ClonePool {
-                stale_after_minutes: clone_pool_run_stale_after_minutes,
-            },
+            ReservationTtl::QueueDelivery,
         ),
         ReferencePipelineMessage::FinalizeCloneReferencePool { pool_run_id, .. } => {
             QueueReservation::new(
@@ -672,7 +667,7 @@ pub fn reservation_key_for_reference_message(
                 format!("clone:{pool_run_id}:finalize"),
                 None,
                 Some(pool_run_id.clone()),
-                ReservationTtl::FiveMinutes,
+                ReservationTtl::QueueDelivery,
             )
         }
     }

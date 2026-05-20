@@ -35,7 +35,8 @@ pub async fn current(req: Request, ctx: RouteContext<()>) -> WorkerResult<Respon
         limits.pro_daily_limit,
     )
     .await?;
-    let response = match blitz::current_batch(&db, &auth.user_id, &clone_id, usage).await {
+    let response = match blitz::current_batch(&db, &ctx.env, &auth.user_id, &clone_id, usage).await
+    {
         Ok(response) => response,
         Err(error) => return map_or_return_blitz_error(error),
     };

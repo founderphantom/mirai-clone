@@ -4,6 +4,9 @@ use crate::domain::blitz::{
 };
 use crate::queues::messages::{GenerationMessage, ReferencePipelineMessage};
 use crate::services::generation_usage::GenerationUsageSnapshot;
+use crate::services::queue_reservations::{
+    reservation_key_for_reference_message, reserve_and_send_reference_pipeline_message,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -132,6 +135,20 @@ struct VisualReferenceRow {
 #[derive(Debug, Deserialize)]
 struct CloneRow {
     provider_config_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloneReferenceProgressRow {
+    state_status: String,
+    pool_status: Option<String>,
+    active_reference_count: u32,
+    target_reference_count: u32,
+    underfilled_moodboard_count: u32,
+}
+
+struct CloneReferenceProgress {
+    status: String,
+    progress: BlitzProgressResponse,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,7 +325,7 @@ pub async fn create_next_batch(
     .await?;
 
     if selected.is_empty() {
-        enqueue_refresh_pool(env, user_id, clone_id, "pool_depleted").await?;
+        enqueue_refresh_pool(db, env, user_id, clone_id, "pool_depleted").await?;
         return Ok(None);
     }
 
@@ -525,6 +542,7 @@ pub async fn reconcile_stale_batches(env: &Env) -> WorkerResult<()> {
 
 pub async fn current_batch(
     db: &D1Database,
+    env: &Env,
     user_id: &str,
     clone_id: &str,
     usage: GenerationUsageSnapshot,
@@ -568,6 +586,20 @@ pub async fn current_batch(
             });
         }
 
+        ensure_clone_pool_kickoff(db, env, user_id, clone_id).await?;
+
+        if let Some(reference_progress) =
+            load_clone_reference_progress(db, user_id, clone_id).await?
+        {
+            return Ok(BlitzCurrentResponse {
+                batch: None,
+                status: Some(reference_progress.status.clone()),
+                progress: Some(reference_progress.progress),
+                usage,
+                next_batch_status: Some(reference_progress.status),
+            });
+        }
+
         let status = provider_niche_research_status(&clone.provider_config_json)
             .unwrap_or_else(|| "generating".to_string());
         return Ok(BlitzCurrentResponse {
@@ -604,6 +636,23 @@ pub async fn current_batch(
         usage,
         next_batch_status,
     })
+}
+
+async fn ensure_clone_pool_kickoff(
+    db: &D1Database,
+    env: &Env,
+    user_id: &str,
+    clone_id: &str,
+) -> WorkerResult<()> {
+    crate::services::clone_reference_pool::build_or_refresh_clone_pool(
+        db,
+        env,
+        user_id,
+        clone_id,
+        "blitz_current_missing_pool",
+        None,
+    )
+    .await
 }
 
 pub async fn record_swipe(
@@ -802,7 +851,7 @@ async fn ensure_batch_generation_enqueued(
     .await?;
 
     if selected.is_empty() {
-        enqueue_refresh_pool(env, user_id, clone_id, "pool_depleted").await?;
+        enqueue_refresh_pool(db, env, user_id, clone_id, "pool_depleted").await?;
         return Ok(());
     }
 
@@ -885,18 +934,21 @@ async fn enqueue_generation_batch(
 }
 
 async fn enqueue_refresh_pool(
+    db: &D1Database,
     env: &Env,
     user_id: &str,
     clone_id: &str,
     reason: &str,
 ) -> WorkerResult<()> {
-    env.queue("REFERENCE_PIPELINE_QUEUE")?
-        .send(ReferencePipelineMessage::RefreshPool {
-            user_id: user_id.to_string(),
-            clone_id: clone_id.to_string(),
-            reason: reason.to_string(),
-        })
-        .await
+    let message = ReferencePipelineMessage::RefreshPool {
+        user_id: user_id.to_string(),
+        clone_id: clone_id.to_string(),
+        reason: reason.to_string(),
+    };
+    let now = now_iso_string();
+    let reservation = reservation_key_for_reference_message(&message, 0, 0);
+    reserve_and_send_reference_pipeline_message(db, env, reservation, message, &now).await?;
+    Ok(())
 }
 
 async fn load_batch_by_number(
@@ -1160,6 +1212,105 @@ fn progress_for_provider_status(status: &str) -> BlitzProgressResponse {
     BlitzProgressResponse {
         phase: "niche_research".to_string(),
         detail: detail.to_string(),
+    }
+}
+
+async fn load_clone_reference_progress(
+    db: &D1Database,
+    user_id: &str,
+    clone_id: &str,
+) -> WorkerResult<Option<CloneReferenceProgress>> {
+    let row = db::first::<CloneReferenceProgressRow>(
+        db,
+        r#"
+        SELECT crs.status AS state_status,
+               cpr.status AS pool_status,
+               COALESCE(SUM(
+                 CASE
+                   WHEN gmd.slug IS NOT NULL THEN COALESCE(gmrs.active_reference_count, 0)
+                   ELSE 0
+                 END
+               ), 0) AS active_reference_count,
+               COALESCE(SUM(
+                 CASE
+                   WHEN gmd.slug IS NOT NULL THEN COALESCE(gmrs.target_reference_count, 25)
+                   ELSE 0
+                 END
+               ), 0) AS target_reference_count,
+               COALESCE(SUM(
+                 CASE
+                   WHEN gmd.slug IS NOT NULL
+                    AND COALESCE(gmrs.active_reference_count, 0) < COALESCE(gmrs.target_reference_count, 25)
+                   THEN 1
+                   ELSE 0
+                 END
+               ), 0) AS underfilled_moodboard_count
+        FROM clone_reference_state crs
+        LEFT JOIN clone_pool_runs cpr
+          ON cpr.id = crs.current_pool_run_id
+         AND cpr.user_id = crs.user_id
+         AND cpr.clone_id = crs.clone_id
+        LEFT JOIN moodboards mb
+          ON mb.user_id = crs.user_id
+         AND mb.selected = 1
+        LEFT JOIN global_moodboard_definitions gmd
+          ON gmd.slug = mb.slug
+         AND gmd.status = 'active'
+        LEFT JOIN global_moodboard_reference_state gmrs
+          ON gmrs.moodboard_slug = mb.slug
+        WHERE crs.user_id = ?
+          AND crs.clone_id = ?
+        GROUP BY crs.status, cpr.status
+        LIMIT 1
+        "#,
+        vec![json!(user_id), json!(clone_id)],
+    )
+    .await?;
+
+    Ok(row.and_then(progress_for_clone_reference_state))
+}
+
+fn progress_for_clone_reference_state(
+    row: CloneReferenceProgressRow,
+) -> Option<CloneReferenceProgress> {
+    let status = row
+        .pool_status
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| row.state_status.clone());
+    let progress = match status.as_str() {
+        "waiting_for_global_library" => BlitzProgressResponse {
+            phase: "global_library".to_string(),
+            detail: global_library_progress_detail(&row),
+        },
+        "queued" => BlitzProgressResponse {
+            phase: "reference_pool".to_string(),
+            detail: "Preparing visual reference pool...".to_string(),
+        },
+        "compatibility_reviewing" => BlitzProgressResponse {
+            phase: "reference_pool".to_string(),
+            detail: "Reviewing references for clone compatibility...".to_string(),
+        },
+        "insufficient_refs" => BlitzProgressResponse {
+            phase: "global_library".to_string(),
+            detail: global_library_progress_detail(&row),
+        },
+        _ => return None,
+    };
+
+    Some(CloneReferenceProgress { status, progress })
+}
+
+fn global_library_progress_detail(row: &CloneReferenceProgressRow) -> String {
+    if row.target_reference_count > 0 {
+        format!(
+            "Building global moodboard library ({}/{} references across {} underfilled moodboards).",
+            row.active_reference_count,
+            row.target_reference_count,
+            row.underfilled_moodboard_count
+        )
+    } else {
+        "Building global moodboard library...".to_string()
     }
 }
 

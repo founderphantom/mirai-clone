@@ -1,10 +1,12 @@
 use crate::db;
 use crate::queues::messages::ReferencePipelineMessage;
+use crate::services::queue_reservations::{
+    now_iso_string, reservation_key_for_reference_message,
+    reserve_and_send_reference_pipeline_message,
+};
 use serde::Deserialize;
 use serde_json::json;
 use worker::{D1Database, Env, Result as WorkerResult};
-
-const REFERENCE_QUEUE_NAME: &str = "REFERENCE_PIPELINE_QUEUE";
 
 #[derive(Debug, Deserialize)]
 struct ConfigRow {
@@ -27,19 +29,22 @@ pub async fn enqueue_after_moodboard_save(
     user_id: &str,
     selected_slugs: &[String],
 ) -> WorkerResult<()> {
-    enqueue_global_topups_for_underfilled_slugs(db, env, selected_slugs, "onboarding_selection")
-        .await?;
-
     if let Some(clone) = load_ready_active_clone(db, user_id).await? {
-        env.queue(REFERENCE_QUEUE_NAME)?
-            .send(ReferencePipelineMessage::BuildCloneReferencePool {
+        reserve_and_send_reference_message(
+            db,
+            env,
+            ReferencePipelineMessage::BuildCloneReferencePool {
                 user_id: user_id.to_string(),
                 clone_id: clone.id,
                 reason: "moodboard_selection_changed".to_string(),
                 wakeup_moodboard_slug: None,
-            })
-            .await?;
+            },
+        )
+        .await?;
     }
+
+    enqueue_global_topups_for_underfilled_slugs(db, env, selected_slugs, "onboarding_selection")
+        .await?;
 
     Ok(())
 }
@@ -53,14 +58,28 @@ pub async fn enqueue_global_topups_for_underfilled_slugs(
     let target = global_refs_per_moodboard_target(db).await?;
     for slug in selected_slugs {
         if active_global_reference_count(db, slug).await? < target {
-            env.queue(REFERENCE_QUEUE_NAME)?
-                .send(ReferencePipelineMessage::EnsureGlobalMoodboardLibrary {
+            reserve_and_send_reference_message(
+                db,
+                env,
+                ReferencePipelineMessage::EnsureGlobalMoodboardLibrary {
                     moodboard_slug: slug.clone(),
                     reason: reason.to_string(),
-                })
-                .await?;
+                },
+            )
+            .await?;
         }
     }
+    Ok(())
+}
+
+async fn reserve_and_send_reference_message(
+    db: &D1Database,
+    env: &Env,
+    message: ReferencePipelineMessage,
+) -> WorkerResult<()> {
+    let now = now_iso_string();
+    let reservation = reservation_key_for_reference_message(&message, 0, 0);
+    reserve_and_send_reference_pipeline_message(db, env, reservation, message, &now).await?;
     Ok(())
 }
 
