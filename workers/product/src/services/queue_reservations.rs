@@ -121,7 +121,8 @@ fn claim_queue_message_handling_sql() -> &'static str {
     r#"
     UPDATE queue_message_reservations
     SET status = 'handling',
-        updated_at = ?
+        updated_at = ?,
+        expires_at = ?
     WHERE queue_name = ?
       AND message_kind = ?
       AND dedupe_key = ?
@@ -239,7 +240,7 @@ pub fn expires_at_for_ttl(now: &str, ttl: ReservationTtl) -> String {
     let minutes = match ttl {
         ReservationTtl::FiveMinutes => 5,
         ReservationTtl::QueueDelivery => 15,
-        ReservationTtl::ReviewBatch => 10,
+        ReservationTtl::ReviewBatch => 60,
         ReservationTtl::GlobalRun {
             stale_after_minutes,
         } => stale_after_minutes + 15,
@@ -273,6 +274,7 @@ pub async fn claim_queue_message_handling(
         claim_queue_message_handling_sql(),
         vec![
             json!(now),
+            json!(expires_at_for_ttl(now, reservation.ttl)),
             json!(reservation.queue_name),
             json!(reservation.message_kind),
             json!(reservation.dedupe_key),
@@ -583,7 +585,7 @@ pub fn reservation_key_for_reference_message(
                 .replace("<moodboard_slug>", moodboard_slug),
             Some(run_id.clone()),
             None,
-            ReservationTtl::QueueDelivery,
+            ReservationTtl::ReviewBatch,
         ),
         ReferencePipelineMessage::CleanupGlobalMoodboardReference {
             run_id,

@@ -1538,6 +1538,30 @@ fn direct_queue_message_claims_can_reclaim_expired_terminal_reservations() {
 }
 
 #[test]
+fn queued_message_claim_renews_handling_expiry_from_claim_time() {
+    let source = include_str!("../src/services/queue_reservations.rs");
+    let claim_sql = source
+        .split("fn claim_queue_message_handling_sql()")
+        .nth(1)
+        .and_then(|section| section.split("fn load_reservation_status_sql()").next())
+        .expect("claim handling sql");
+    let claim_body = source
+        .split("pub async fn claim_queue_message_handling")
+        .nth(1)
+        .and_then(|section| section.split("async fn load_reservation_status").next())
+        .expect("claim queue handling body");
+
+    assert!(claim_sql.contains("expires_at = ?"));
+    let renewal_bind = claim_body
+        .find("expires_at_for_ttl(now, reservation.ttl)")
+        .expect("claim path should bind renewed handling expiry");
+    let direct_insert_fallback = claim_body
+        .find("insert_direct_handling_reservation_sql")
+        .expect("direct handling insert fallback exists");
+    assert!(renewal_bind < direct_insert_fallback);
+}
+
+#[test]
 fn clone_pool_kickoff_claims_random_run_through_reusable_state_guard() {
     let source = include_str!("../src/services/clone_reference_pool.rs");
     let create_body = source
@@ -1668,6 +1692,24 @@ fn child_reference_pipeline_reservations_use_short_delivery_ttl() {
         assert!(!section.contains("ReservationTtl::GlobalRun"), "{variant}");
         assert!(!section.contains("ReservationTtl::ClonePool"), "{variant}");
     }
+}
+
+#[test]
+fn review_reference_pipeline_reservations_use_long_batch_ttl() {
+    let source = include_str!("../src/services/queue_reservations.rs");
+    let review_section = source
+        .split("ReferencePipelineMessage::ReviewGlobalVisualCandidates")
+        .nth(1)
+        .and_then(|section| section.split("ReferencePipelineMessage::").next())
+        .expect("review reservation section");
+    let ttl_section = source
+        .split("ReservationTtl::ReviewBatch =>")
+        .nth(1)
+        .and_then(|section| section.split(',').next())
+        .expect("review batch ttl");
+
+    assert!(review_section.contains("ReservationTtl::ReviewBatch"));
+    assert_eq!(ttl_section.trim(), "60");
 }
 
 #[test]
@@ -2363,6 +2405,31 @@ fn seedream_response_recursively_extracts_nested_text_payload_url() {
         extract_seedream_cleaned_image_url(&wrapped).as_deref(),
         Some("https://cdn.example.com/deep-cleaned.webp")
     );
+}
+
+#[test]
+fn seedream_response_extracts_generated_asset_output_urls() {
+    for pointer_payload in [
+        json!({ "result": { "assets": [{ "url": "https://cdn.example.com/asset.webp" }] } }),
+        json!({ "result": { "outputs": [{ "url": "https://cdn.example.com/output.webp" }] } }),
+        json!({ "result": { "generations": [{ "url": "https://cdn.example.com/generation.webp" }] } }),
+    ] {
+        assert!(
+            extract_seedream_cleaned_image_url(&pointer_payload).is_some(),
+            "{pointer_payload}"
+        );
+    }
+}
+
+#[test]
+fn global_seedream_cleanup_polls_job_status_when_submission_has_no_url() {
+    let queue = include_str!("../src/queues/reference_pipeline.rs");
+    let body = reference_pipeline_function_body(queue, "async fn call_global_seedream_cleanup");
+
+    assert!(body.contains("extract_provider_job_id"));
+    assert!(body.contains("HIGGSFIELD_JOB_STATUS_TOOL"));
+    assert!(body.contains("seedream_cleanup_poll_arguments"));
+    assert!(body.matches("extract_seedream_cleaned_image_url").count() >= 2);
 }
 
 #[test]

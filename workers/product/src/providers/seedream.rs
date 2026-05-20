@@ -28,6 +28,13 @@ pub fn seedream_cleanup_arguments_with_model(uploaded_reference_value: &str, mod
     arguments
 }
 
+pub fn seedream_cleanup_poll_arguments(provider_job_id: &str) -> Value {
+    json!({
+        "jobId": provider_job_id,
+        "sync": true,
+    })
+}
+
 pub fn extract_seedream_cleaned_image_url(raw_json: &Value) -> Option<String> {
     provider_payloads(raw_json)
         .iter()
@@ -44,12 +51,18 @@ fn cleaned_image_url_from_payload(payload: &Value) -> Option<String> {
         "/result/images/0/url",
         "/result/images/0/image_url",
         "/result/images/0/imageUrl",
+        "/result/assets/0/url",
+        "/result/outputs/0/url",
+        "/result/generations/0/url",
         "/url",
         "/image_url",
         "/imageUrl",
         "/output_url",
         "/outputUrl",
         "/images/0/url",
+        "/assets/0/url",
+        "/outputs/0/url",
+        "/generations/0/url",
     ] {
         if let Some(url) = json_string_at(payload, path).filter(|url| url.starts_with("http")) {
             return Some(url);

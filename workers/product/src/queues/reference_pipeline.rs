@@ -16,7 +16,7 @@ use crate::providers::higgsfield_auth::provider_account_access_token;
 use crate::providers::higgsfield_mcp::{call_tool, upload_media_files, HiggsfieldMcpMediaFile};
 use crate::providers::seedream::{
     extract_seedream_cleaned_image_url, seedream_cleanup_arguments_with_model,
-    SEEDREAM_CLEANUP_MODEL,
+    seedream_cleanup_poll_arguments, SEEDREAM_CLEANUP_MODEL,
 };
 use crate::queues::messages::ReferencePipelineMessage;
 use crate::scrapecreators::fetch_scrapecreators_json;
@@ -49,6 +49,8 @@ const HIGGSFIELD_REFRESH_SECRET_NAME: &str = "HIGGSFIELD_PROVIDER_REFRESH_TOKEN_
 const HIGGSFIELD_PROVIDER_ACCOUNT_ID: &str = "pa_higgsfield_founder";
 const HIGGSFIELD_CLEANUP_TOOL_VAR: &str = "HIGGSFIELD_MCP_CLEANUP_TOOL";
 const HIGGSFIELD_CLEANUP_MODEL_VAR: &str = "HIGGSFIELD_MCP_CLEANUP_MODEL";
+const HIGGSFIELD_JOB_STATUS_TOOL: &str = "job_status";
+const GLOBAL_SEEDREAM_CLEANUP_POLL_ATTEMPTS: u8 = 3;
 
 pub async fn handle_batch(batch: MessageBatch<Value>, env: Env) -> WorkerResult<()> {
     let db = env.d1("DB")?;
@@ -4764,12 +4766,60 @@ async fn call_global_seedream_cleanup(
     )
     .await
     .map_err(|error| Error::RustError(format!("seedream_cleanup_failed:{error}")))?;
-    let cleaned_url = extract_seedream_cleaned_image_url(&response.raw_json)
-        .ok_or_else(|| Error::RustError("seedream_cleanup_missing_output_url".to_string()))?;
     let provider_job_id =
         crate::providers::higgsfield_mcp::extract_provider_job_id(&response.raw_json)
             .unwrap_or_default();
-    Ok((cleaned_url, provider_job_id, response.raw_json))
+    if let Some(cleaned_url) = extract_seedream_cleaned_image_url(&response.raw_json) {
+        return Ok((cleaned_url, provider_job_id, response.raw_json));
+    }
+
+    if provider_job_id.trim().is_empty() {
+        return Err(Error::RustError(
+            "seedream_cleanup_missing_output_url".to_string(),
+        ));
+    }
+
+    for attempt in 1..=GLOBAL_SEEDREAM_CLEANUP_POLL_ATTEMPTS {
+        let poll_response = call_tool(
+            &request.access_token,
+            json!(format!("seedream-cleanup-poll:{candidate_id}:{attempt}")),
+            HIGGSFIELD_JOB_STATUS_TOOL,
+            seedream_cleanup_poll_arguments(&provider_job_id),
+        )
+        .await
+        .map_err(|error| Error::RustError(format!("seedream_cleanup_poll_failed:{error}")))?;
+        if let Some(cleaned_url) = extract_seedream_cleaned_image_url(&poll_response.raw_json) {
+            return Ok((
+                cleaned_url,
+                provider_job_id,
+                json!({
+                    "submission": response.raw_json,
+                    "poll": poll_response.raw_json,
+                    "pollAttempt": attempt,
+                }),
+            ));
+        }
+        if let Some(status) =
+            crate::providers::higgsfield_mcp::extract_provider_status(&poll_response.raw_json)
+        {
+            if seedream_cleanup_status_failed(&status) {
+                return Err(Error::RustError(format!(
+                    "seedream_cleanup_provider_failed:{status}"
+                )));
+            }
+        }
+    }
+
+    Err(Error::RustError(
+        "seedream_cleanup_missing_output_url".to_string(),
+    ))
+}
+
+fn seedream_cleanup_status_failed(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "failed" | "failure" | "error" | "errored" | "cancelled" | "canceled"
+    )
 }
 
 fn cleanup_extension(content_type: &str) -> &'static str {
